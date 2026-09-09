@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b1c17" />
+    <title>Nivesh AI — Paper Trading Desk</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="styles.css?v=strategy36b" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div><strong>Nivesh<span>.ai</span></strong><small>paper trading desk</small></div>
+        </div>
+
+        <nav class="side-nav" aria-label="Main navigation">
+          <p class="nav-label">Workspace</p>
+          <button class="nav-item active" data-view="dashboard"><i data-lucide="layout-dashboard"></i><span>Overview</span></button>
+          <button class="nav-item" data-view="positions"><i data-lucide="briefcase-business"></i><span>Positions</span><em>6</em></button>
+          <button class="nav-item" data-view="history"><i data-lucide="history"></i><span>Trade history</span></button>
+          <button class="nav-item" data-view="analysis"><i data-lucide="chart-candlestick"></i><span>AI analysis</span><em>1m</em></button>
+          <button class="nav-item" data-view="charts"><i data-lucide="chart-candlestick"></i><span>Charts</span></button>
+          <button class="nav-item" data-view="universe"><i data-lucide="database"></i><span>Stock universe</span><em>7K+</em></button>
+          <button class="nav-item" data-view="backtest"><i data-lucide="flask-conical"></i><span>Backtest lab</span><em>1Y</em></button>
+          <button class="nav-item" data-view="sentiment"><i data-lucide="activity"></i><span>Sentiment</span><em>Live</em></button>
+          <button class="nav-item" data-view="strategies"><i data-lucide="scan-line"></i><span>Strategies</span></button>
+          <p class="nav-label">System</p>
+          <button class="nav-item" data-view="settings"><i data-lucide="sliders-horizontal"></i><span>Settings</span></button>
+        </nav>
+
+        <div class="market-state">
+          <div class="pulse"></div>
+          <div><strong>Market is open</strong><small>NSE · closes in 2h 18m</small></div>
+        </div>
+
+        <div class="account">
+          <div class="avatar">AK</div>
+          <div><strong>Arjun Kapoor</strong><small>Balanced risk</small></div>
+          <button id="signOutBtn" aria-label="Sign out"><i data-lucide="log-out"></i></button>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="topbar-left">
+            <button class="icon-btn menu-btn" id="menuBtn" aria-label="Open menu"><i data-lucide="menu"></i></button>
+            <div><span class="eyebrow" id="pageEyebrow">Paper portfolio</span><h1 id="pageTitle">Good afternoon, Arjun.</h1></div>
+          </div>
+          <div class="top-actions">
+            <div class="market-clock"><span>IST</span><strong id="clock">12:42:18</strong></div>
+            <button class="icon-btn" aria-label="Search"><i data-lucide="search"></i></button>
+            <button class="icon-btn notification" aria-label="Notifications"><i data-lucide="bell"></i><span></span></button>
+            <button class="primary-btn compact" id="runAgentTop"><i data-lucide="sparkles"></i> Run agent</button>
+          </div>
+        </header>
+
+        <section class="ticker" aria-label="Live market indices">
+          <div class="live-label"><span></span>Live</div>
+          <div class="ticker-item"><b>NIFTY 50</b><strong>24,835.40</strong><em class="up"><i data-lucide="trending-up"></i>0.62%</em></div>
+          <div class="ticker-item"><b>SENSEX</b><strong>81,354.92</strong><em class="up"><i data-lucide="trending-up"></i>0.48%</em></div>
+          <div class="ticker-item"><b>BANKNIFTY</b><strong>56,124.15</strong><em class="down"><i data-lucide="trending-down"></i>0.17%</em></div>
+          <div class="ticker-item"><b>INDIA VIX</b><strong>13.72</strong><em class="down"><i data-lucide="trending-down"></i>2.04%</em></div>
+          <span class="data-delay">NSE · 1 min delayed</span>
+        </section>
+
+        <div class="content" id="content"></div>
+      </main>
+    </div>
+
+    <div class="toast" id="toast"><i data-lucide="check-circle-2"></i><div><strong>Agent run complete</strong><span>3 opportunities evaluated · 1 trade placed</span></div></div>
+
+    <div class="modal-backdrop" id="resetModal" aria-hidden="true">
+      <div class="modal">
+        <button class="icon-btn modal-close" data-close-modal aria-label="Close"><i data-lucide="x"></i></button>
+        <div class="modal-icon"><i data-lucide="rotate-ccw"></i></div>
+        <span class="eyebrow">Destructive action</span>
+        <h2>Reset paper capital?</h2>
+        <p>This will close all paper positions, clear trade history, and restore your starting balance to ₹10,00,000.</p>
+        <div class="modal-actions"><button class="secondary-btn" data-close-modal>Cancel</button><button class="danger-btn" id="confirmReset">Reset portfolio</button></div>
+      </div>
+    </div>
+
+    <section class="auth-screen" id="authScreen" aria-hidden="true">
+      <div class="auth-story">
+        <div class="auth-brand"><div class="brand-mark"><span></span><span></span><span></span></div><strong>Nivesh<span>.ai</span></strong></div>
+        <div class="auth-copy"><span class="eyebrow">Intelligence before execution</span><h2>A calmer way to learn the market.</h2><p>Test AI-guided strategies with virtual capital and a complete audit trail—before any real money is at risk.</p></div>
+        <div class="auth-proof"><span><b>214</b> NSE stocks scanned</span><span><b>6</b> active playbooks</span><span><b>₹0</b> real capital at risk</span></div>
+        <small>Paper trades are simulations. Market data may be delayed.</small>
+      </div>
+      <div class="auth-form-wrap">
+        <button class="icon-btn auth-close" id="authClose" aria-label="Return to dashboard"><i data-lucide="x"></i></button>
+        <form class="auth-form" id="authForm">
+          <span class="eyebrow" id="authEyebrow">Welcome back</span>
+          <h1 id="authTitle">Sign in to your desk</h1>
+          <p id="authDesc">Continue your paper-trading session.</p>
+          <label id="signupName" hidden>Full name<input id="authName" type="text" value="Arjun Kapoor"></label>
+          <label>Email address<input id="authEmail" type="email" value="arjun@example.com" required></label>
+          <label>Password<span class="label-row"><a href="#">Forgot password?</a></span><input id="authPassword" type="password" value="nivesh123" required></label>
+          <p class="auth-error" id="authError" role="alert"></p>
+          <button class="primary-btn auth-submit" type="submit">Continue <i data-lucide="arrow-right"></i></button>
+          <div class="auth-divider"><span>or continue with</span></div>
+          <button class="secondary-btn auth-broker" type="button"><i data-lucide="landmark"></i> Zerodha Kite</button>
+          <p class="auth-switch">New to Nivesh? <button type="button" id="authToggle">Create an account</button></p>
+          <small>By continuing, you agree to the Terms and acknowledge that this is a paper-trading product.</small>
+        </form>
+      </div>
+    </section>
+
+    <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+    <script src="app.js?v=strategy36b"></script>
+  </body>
+</html>

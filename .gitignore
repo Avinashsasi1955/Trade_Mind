@@ -1,0 +1,39 @@
+# Core credentials wall
+.env
+.env.*
+!.env.example
+terraform.tfvars
+terraform.tfvars.json
+*.tfvars
+*.tfvars.json
+
+# Cloud, cluster and application secrets
+.aws/
+.kube/
+secrets/
+config/secrets.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Databases, backups and runtime logs
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+backups/
+logs/
+*.log
+
+.venv/
+.DS_Store
+__pycache__/
+*.py[cod]
+data/*.db-shm
+data/*.db-wal
+data/backups/
+*.zip
+*.tfstate
+*.tfstate.*
+infra/aws-ha/backend.hcl

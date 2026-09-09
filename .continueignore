@@ -1,0 +1,34 @@
+# Defense-in-depth only: verify Continue privacy/indexing settings separately.
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.tfvars
+*.tfvars.json
+*.tfstate
+*.tfstate.*
+infra/aws-ha/backend.hcl
+.aws/
+.kube/
+secrets/
+config/secrets.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Market databases, transaction caches and backups
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+backups/
+data/backups/
+
+# Runtime output and generated artifacts
+logs/
+*.log
+outputs/
+.venv/
+infra/aws-ha/.terraform/

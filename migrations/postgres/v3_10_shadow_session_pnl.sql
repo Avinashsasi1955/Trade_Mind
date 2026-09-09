@@ -1,0 +1,15 @@
+BEGIN;
+
+ALTER TABLE forward_shadow_sessions
+    ADD COLUMN IF NOT EXISTS paper_realised_pnl NUMERIC(24,10) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS paper_unrealised_pnl NUMERIC(24,10) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS paper_net_pnl NUMERIC(24,10) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS paper_closed_trades BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS paper_open_trades BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS paper_rejected_trades BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS paper_win_rate_pct NUMERIC(12,6),
+    ADD COLUMN IF NOT EXISTS paper_profit_factor NUMERIC(18,8);
+
+INSERT INTO schema_migrations(version) VALUES('v3_10_shadow_session_pnl') ON CONFLICT DO NOTHING;
+
+COMMIT;

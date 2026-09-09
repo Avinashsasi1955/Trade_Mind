@@ -1,0 +1,18 @@
+services:
+  nivesh:
+    build: .
+    ports:
+      - "127.0.0.1:4173:4173"
+    env_file:
+      - .env
+    environment:
+      NIVESH_HOST: 0.0.0.0
+      NIVESH_LIVE_TRADING_ENABLED: "0"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD","python","-c","import urllib.request; urllib.request.urlopen('http://127.0.0.1:4173/api/health',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
