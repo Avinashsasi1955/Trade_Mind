@@ -61,6 +61,20 @@ def _get_engine():
         )
     return _shared_pg_engine
 
+_shared_redis = None
+
+def _get_redis():
+    global _shared_redis
+    redis_url = os.getenv("REDIS_URL", "")
+    if _shared_redis is None and redis_url:
+        try:
+            import redis
+            _shared_redis = redis.Redis.from_url(redis_url, decode_responses=True, socket_timeout=3)
+        except Exception:
+            return None
+    return _shared_redis
+
+
 SENTIMENT_INTELLIGENCE_SYMBOLS = [
     "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "SBIN", "LT", "ITC",
     "BHARTIARTL", "AXISBANK", "KOTAKBANK", "HINDUNILVR", "BAJFINANCE", "MARUTI",
@@ -201,6 +215,7 @@ def shadow_trade_book(limit: int = 200) -> Dict:
                    a.theoretical_fill_price,a.estimated_fees,a.realised_exit_price,a.net_pnl,a.audit_status,
                    a.rejection_reason,a.stop_loss_price,a.take_profit_price,a.exit_at,a.exit_reason,a.fill_source,
                    a.mistake_tags,a.improvement_note,
+                   COALESCE(a.trade_mode, 'INTRADAY') trade_mode, a.reasoning_chain, COALESCE(a.holding_days, 0) holding_days,
                    COALESCE(
                        NULLIF(NULLIF(NULLIF(atr.strategy, 'UNKNOWN_STRATEGY'), 'UNKNOWN'), 'NO_TRADE'),
                        (
@@ -287,6 +302,15 @@ def shadow_trade_book(limit: int = 200) -> Dict:
               "is_open":not realised,
               "strategy_tag":raw_strat,
               "strategy_label":clean_strat}
+        rc = row.get("reasoning_chain")
+        if isinstance(rc, str):
+            try:
+                rc = json.loads(rc)
+            except Exception:
+                pass
+        item["reasoning_chain"] = rc
+        item["trade_mode"] = str(row.get("trade_mode") or "INTRADAY")
+        item["holding_days"] = int(row.get("holding_days") or 0)
         item["quality"]=score_trade(item)
         item["senior_agent"]=review_shadow_trade(item)
         items.append(item)
@@ -2019,5 +2043,44 @@ def dismiss_coach_proposal_service(proposal_id: int, engine=None) -> Dict:
     eng = engine or _get_engine()
     from backend.brains.trading_coach import dismiss_coach_proposal
     return dismiss_coach_proposal(eng, int(proposal_id))
+
+
+def shadow_counterfactual_summary_service(trade_date_str: Optional[str] = None) -> Dict:
+    eng = _get_engine()
+    r_client = _get_redis()
+    from backend.brains.counterfactual_replay import get_latest_counterfactual_summary
+    t_date = None
+    if trade_date_str:
+        try:
+            from datetime import date
+            t_date = date.fromisoformat(trade_date_str)
+        except Exception:
+            pass
+    return get_latest_counterfactual_summary(eng, trade_date=t_date, redis_client=r_client)
+
+
+def trigger_counterfactual_replay_service(trade_date_str: Optional[str] = None) -> Dict:
+    eng = _get_engine()
+    r_client = _get_redis()
+    from backend.brains.counterfactual_replay import run_post_market_counterfactual_replay
+    t_date = None
+    if trade_date_str:
+        try:
+            from datetime import date
+            t_date = date.fromisoformat(trade_date_str)
+        except Exception:
+            pass
+    return run_post_market_counterfactual_replay(eng, trade_date=t_date, redis_client=r_client)
+
+
+def notifications_status_service() -> Dict:
+    from backend.notifications import get_notification_config
+    return get_notification_config()
+
+
+def notifications_test_service() -> Dict:
+    from backend.notifications import test_notification_dispatcher
+    return test_notification_dispatcher()
+
 
 

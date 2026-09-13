@@ -58,6 +58,9 @@
             <div><span class="eyebrow" id="pageEyebrow">Paper portfolio</span><h1 id="pageTitle">Good afternoon, Arjun.</h1></div>
           </div>
           <div class="top-actions">
+            <div id="sseBadge" class="sse-indicator sse-connecting" title="SSE Real-Time Push Stream">
+              <span class="sse-dot"></span><span id="sseLabel">CONNECTING…</span>
+            </div>
             <div class="market-clock"><span>IST</span><strong id="clock">12:42:18</strong></div>
             <button class="icon-btn" aria-label="Search"><i data-lucide="search"></i></button>
             <button class="icon-btn notification" aria-label="Notifications"><i data-lucide="bell"></i><span></span></button>
@@ -88,6 +91,17 @@
         <h2>Reset paper capital?</h2>
         <p>This will close all paper positions, clear trade history, and restore your starting balance to ₹10,00,000.</p>
         <div class="modal-actions"><button class="secondary-btn" data-close-modal>Cancel</button><button class="danger-btn" id="confirmReset">Reset portfolio</button></div>
+      </div>
+    </div>
+
+    <div class="modal-backdrop" id="thoughtModal" aria-hidden="true">
+      <div class="modal modal-large">
+        <button class="icon-btn modal-close" data-close-thought-modal aria-label="Close"><i data-lucide="x"></i></button>
+        <div class="modal-icon"><i data-lucide="brain"></i></div>
+        <span class="eyebrow" id="thoughtEyebrow">Multi-Agent Deliberation</span>
+        <h2 id="thoughtTitle">Deep Thinker Reasoning Chain</h2>
+        <div id="thoughtContent" class="thought-modal-chain"></div>
+        <div class="modal-actions"><button class="secondary-btn" data-close-thought-modal>Close</button></div>
       </div>
     </div>
 

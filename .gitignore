@@ -19,6 +19,7 @@ config/secrets.json
 
 # Databases, backups and runtime logs
 *.db
+
 *.sqlite
 *.sqlite3
 *.dump
@@ -37,3 +38,13 @@ data/backups/
 *.tfstate
 *.tfstate.*
 infra/aws-ha/backend.hcl
+
+data/
+outputs/
+work/
+tmp/
+tmp.db
+.terraform/
+**/.terraform/
+.vscode/
+**/.terraform/

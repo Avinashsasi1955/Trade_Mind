@@ -23,6 +23,11 @@ from .sentiment_brain import SentimentBrain
 from .risk_brain import RiskBrain
 from .execution_brain import ExecutionBrain
 from .report_brain import ReportBrain
+from .counterfactual_replay import (
+    run_post_market_counterfactual_replay,
+    get_latest_counterfactual_summary,
+    ensure_counterfactual_schema,
+)
 from .trading_coach import (
     run_coach_audit,
     get_coach_proposals,
@@ -46,6 +51,9 @@ __all__ = [
     "ReportBrain",
     "get_brain_pipeline",
     "run_brain_pipeline",
+    "run_post_market_counterfactual_replay",
+    "get_latest_counterfactual_summary",
+    "ensure_counterfactual_schema",
     "run_coach_audit",
     "get_coach_proposals",
     "get_latest_coach_audit",
@@ -69,6 +77,16 @@ def get_brain_pipeline() -> Dict[str, BaseBrain]:
         with _pipeline_lock:
             if _pipeline is None:
                 bus = get_bus()
+                try:
+                    from backend.notifications import register_bus_subscribers
+                    register_bus_subscribers(bus)
+                except Exception as notif_err:
+                    logger.debug("Notification subscribers notice: %s", notif_err)
+                try:
+                    from backend.sse_broadcaster import wire_bus_to_sse
+                    wire_bus_to_sse(bus)
+                except Exception as sse_err:
+                    logger.debug("SSE bus wiring notice: %s", sse_err)
                 _pipeline = {
                     "market_intel": MarketIntelBrain(bus=bus),   # Brain 1
                     "screener":     ScreenerBrain(bus=bus),       # Brain 2

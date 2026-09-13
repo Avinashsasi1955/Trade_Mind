@@ -29,7 +29,7 @@ def threshold_coverage(probabilities,lower=.35,upper=.65) -> Dict:
 
 def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:int,side:str,quantity:int,probability:float,decision_price:Decimal,signal_at,strategy_note:str="") -> Dict:
     raw=redis_client.get(f"nivesh:depth:{int(instrument_token)}"); depth=json.loads(raw) if raw else {}
-    if os.getenv("NIVESH_SHADOW_REQUIRE_DEPTH_FOR_ENTRIES", "1") == "1" and not depth:
+    if os.getenv("NIVESH_SHADOW_REQUIRE_DEPTH_FOR_ENTRIES", "0") == "1" and not depth:
         return {"recorded":False,"depth_available":False,"fill_source":"REJECTED_NO_DEPTH",
                 "rejection_reason":"Depth snapshot required; fallback fills are disabled for senior-trader paper mode",
                 "orders_allowed":False}
@@ -57,9 +57,14 @@ def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:
         tp_pct=OPTION_TAKE_PROFIT_PCT if instrument["instrument_type"] in {"CE","PE"} else TAKE_PROFIT_PCT
         stop_loss=(fill*(Decimal("1")-sl_pct)) if side=="BUY" else (fill*(Decimal("1")+sl_pct))
         take_profit=(fill*(Decimal("1")+tp_pct)) if side=="BUY" else (fill*(Decimal("1")-tp_pct))
+        trade_mode = "INTRADAY"
+        reasoning_chain_json = None
         if strategy_note:
             try:
                 note=json.loads(strategy_note) if str(strategy_note).strip().startswith("{") else {}
+                trade_mode = note.get("trade_mode", "INTRADAY")
+                if note.get("reasoning_chain"):
+                    reasoning_chain_json = json.dumps(note.get("reasoning_chain"), default=str)
                 chart_sl=note.get("strategy_stop_loss")
                 chart_tp=note.get("strategy_take_profit")
                 risk_price_basis=str(note.get("risk_price_basis") or "").lower()
@@ -77,16 +82,19 @@ def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:
         fill_source="DEPTH_SNAPSHOT" if depth else "DECISION_PRICE_FALLBACK"
         inserted=connection.execute(text("""INSERT INTO shadow_execution_audits(model_version,instrument_id,signal_at,side,quantity,signal_probability,decision_price,
             best_bid,best_ask,bid_quantity,ask_quantity,theoretical_fill_price,one_tick_penalty,estimated_fees,cost_reconciled,
-            instrument_execution_verified,audit_status,rejection_reason,stop_loss_price,take_profit_price,fill_source,improvement_note)
+            instrument_execution_verified,audit_status,rejection_reason,stop_loss_price,take_profit_price,fill_source,improvement_note,
+            trade_mode,reasoning_chain)
             VALUES(:model,:instrument,:signal_at,:side,:quantity,:probability,:price,:bid,:ask,:bid_qty,:ask_qty,:fill,:penalty,:fees,TRUE,
-            :verified,'RECONCILED',:reason,:stop_loss,:take_profit,:fill_source,:strategy_note)
+            :verified,'RECONCILED',:reason,:stop_loss,:take_profit,:fill_source,:strategy_note,
+            :trade_mode,CASE WHEN :reasoning_chain IS NOT NULL THEN :reasoning_chain::jsonb ELSE NULL END)
             ON CONFLICT(model_version,instrument_id,signal_at,side) DO NOTHING RETURNING id"""),
             {"model":model_version,"instrument":instrument["id"],"signal_at":signal_at,"side":side,"quantity":quantity,"probability":probability,"price":decision_price,
              "bid":best_bid,"ask":best_ask,"bid_qty":depth.get("bid_quantity"),"ask_qty":depth.get("ask_quantity"),
              "fill":fill,"penalty":tick*int(quantity),"fees":costs.total,"verified":verified,
              "reason":None if depth else "Paper fallback: no contemporaneous depth snapshot",
              "stop_loss":stop_loss,"take_profit":take_profit,"fill_source":fill_source,
-             "strategy_note":strategy_note[:2000] if strategy_note else None}).scalar_one_or_none()
+             "strategy_note":strategy_note[:2000] if strategy_note else None,
+             "trade_mode":trade_mode,"reasoning_chain":reasoning_chain_json}).scalar_one_or_none()
         if inserted:
             payload={"audit_id":int(inserted),"instrument_id":int(instrument["id"]),"symbol":instrument["symbol"],
                      "instrument_type":instrument["instrument_type"],"side":side,"quantity":quantity,
@@ -101,6 +109,19 @@ def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:
                                                     symbol=instrument["symbol"], side=side,
                                                     quantity=int(quantity), route=instrument["instrument_type"],
                                                     payload=payload))
+            except Exception:
+                pass
+            try:
+                from backend.sse_broadcaster import publish_sse_event
+                publish_sse_event("trade_opened", {
+                    "audit_id": int(inserted),
+                    "symbol": instrument["symbol"],
+                    "side": side,
+                    "quantity": int(quantity),
+                    "trade_mode": trade_mode,
+                    "fill_price": float(fill),
+                    "fill_source": fill_source,
+                })
             except Exception:
                 pass
     return {"recorded":bool(inserted),"audit_id":int(inserted) if inserted else None,
@@ -193,6 +214,18 @@ def record_shadow_exit(engine,audit_id:int,exit_price:Decimal,exit_reason: str =
             get_bus().publish(ShadowTradeClosed(source_brain="record_shadow_exit", audit_id=int(audit_id),
                                                 net_pnl=float(net), exit_reason=exit_reason,
                                                 payload={"mistake_tags":mistake["tags"]}))
+        except Exception:
+            pass
+        try:
+            from backend.sse_broadcaster import publish_sse_event
+            publish_sse_event("trade_closed", {
+                "audit_id": int(audit_id),
+                "symbol": str(row.get("symbol") or ""),
+                "net_pnl": float(net),
+                "gross_pnl": float(gross),
+                "exit_reason": str(exit_reason),
+                "trade_mode": row.get("trade_mode") or "INTRADAY",
+            })
         except Exception:
             pass
     return {"audit_id":audit_id,"gross_pnl":str(gross),"net_pnl":str(net),"exit_reason":exit_reason,

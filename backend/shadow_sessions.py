@@ -133,7 +133,7 @@ def paper_pnl_summary(engine, session_date: date = None) -> Dict:
             SELECT a.id,a.instrument_id,a.side,a.quantity,a.theoretical_fill_price,a.estimated_fees,a.signal_at
             FROM shadow_execution_audits a
             WHERE a.audit_status='RECONCILED' AND a.net_pnl IS NULL
-              AND (a.signal_at AT TIME ZONE 'Asia/Kolkata')::date=:day
+              AND (a.signal_at AT TIME ZONE 'Asia/Kolkata')::date<=:day
         ), marked AS (
             SELECT a.*,
                 (SELECT b.close_price FROM live_market_bars b
@@ -180,6 +180,19 @@ def paper_pnl_summary(engine, session_date: date = None) -> Dict:
             feedback_rows=connection.execute(text("SELECT COUNT(*) FROM model_quality_feedback")).scalar_one()
         except Exception:
             feedback_rows=0
+        try:
+            mode_rows = connection.execute(text("""
+                SELECT COALESCE(trade_mode, 'INTRADAY') mode, COUNT(*) total,
+                       COUNT(*) FILTER(WHERE net_pnl IS NOT NULL) closed,
+                       COUNT(*) FILTER(WHERE net_pnl IS NULL) open,
+                       COALESCE(SUM(net_pnl), 0) realised_pnl
+                FROM shadow_execution_audits
+                WHERE (signal_at AT TIME ZONE 'Asia/Kolkata')::date = :day
+                GROUP BY COALESCE(trade_mode, 'INTRADAY')
+            """), {"day": day}).mappings().all()
+            dual_mode = {r["mode"]: dict(r) for r in mode_rows}
+        except Exception:
+            dual_mode = {}
     closed=int(realised["closed_trades"] or 0)
     wins=int(realised["winning_trades"] or 0)
     losses=int(realised["losing_trades"] or 0)
@@ -205,6 +218,7 @@ def paper_pnl_summary(engine, session_date: date = None) -> Dict:
         return output
     base = {
         "session_date":day.isoformat(),
+        "dual_mode":dual_mode,
         "realised_pnl":round(realised_pnl,2),
         "unrealised_pnl":round(unrealised_pnl,2),
         "net_marked_pnl":round(realised_pnl+unrealised_pnl,2),

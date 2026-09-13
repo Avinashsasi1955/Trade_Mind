@@ -1025,6 +1025,8 @@ class LivePaperInference:
             rows=connection.execute(text("""
                 SELECT a.id,a.instrument_id,a.side,a.signal_at,a.stop_loss_price,a.take_profit_price,
                     a.theoretical_fill_price,a.quantity,a.estimated_fees,i.instrument_type,
+                    COALESCE(a.trade_mode, 'INTRADAY') trade_mode, COALESCE(a.holding_days, 0) holding_days,
+                    COALESCE(a.max_holding_days, 5) max_holding_days,
                     (SELECT b.close_price FROM live_market_bars b WHERE b.instrument_id=a.instrument_id
                      AND b.interval IN ('1second','1minute','5minute') AND b.bar_time<=:watermark
                      AND b.source = ANY(:trade_sources)
@@ -1133,11 +1135,24 @@ class LivePaperInference:
                     exit_reason="STAGNATION_GUARD"
                     exit_at=watermark
 
-            if exit_reason=="TIME_EXIT" and self._is_force_flat_time(watermark):
-                exit_reason="SESSION_FORCE_FLAT"
-            target_cutoff = opt_cutoff if is_option else eq_cutoff
-            if exit_reason=="TIME_EXIT" and row["signal_at"]>target_cutoff:
-                continue
+            trade_mode = str(row.get("trade_mode") or "INTRADAY").upper()
+            if trade_mode == "SWING":
+                # Multi-day swing trade: exempt from 15:20 intraday force-flat
+                # Only exit if SL or TP is hit, or max_holding_days reached
+                signal_date = row["signal_at"].astimezone(IST).date()
+                watermark_date = watermark.astimezone(IST).date()
+                days_held = (watermark_date - signal_date).days
+                if days_held >= int(row.get("max_holding_days") or 5):
+                    exit_reason = "SWING_MAX_DAYS_EXPIRED"
+                elif exit_reason == "TIME_EXIT":
+                    # Keep multi-day position open!
+                    continue
+            else:
+                if exit_reason=="TIME_EXIT" and self._is_force_flat_time(watermark):
+                    exit_reason="SESSION_FORCE_FLAT"
+                target_cutoff = opt_cutoff if is_option else eq_cutoff
+                if exit_reason=="TIME_EXIT" and row["signal_at"]>target_cutoff:
+                    continue
             record_shadow_exit(self.engine,int(row["id"]),exit_price,exit_reason,exit_at); closed+=1
         return closed
 
@@ -1333,19 +1348,16 @@ class LivePaperInference:
                   AND (a.signal_at AT TIME ZONE 'Asia/Kolkata')::date=(:watermark AT TIME ZONE 'Asia/Kolkata')::date
                   AND (a.net_pnl<0 OR a.exit_reason IN ('STOP_LOSS','TRAILING_STOP'))
             """),{"watermark":watermark,"cooldown":self.reentry_cooldown_minutes}).mappings().all()
-            sector_cooldown_rows=connection.execute(text("""
-                SELECT s.sector
-                FROM (
-                    SELECT COALESCE(NULLIF(i.sector,''),'OTHER') sector,
-                           COUNT(*) filter(where a.net_pnl < 0 OR a.exit_reason = 'STOP_LOSS') as losses
-                    FROM shadow_execution_audits a JOIN instrument_master i ON i.id=a.instrument_id
-                    WHERE a.exit_at IS NOT NULL
-                      AND a.exit_at>=:watermark-(:cooldown || ' minutes')::interval
-                      AND (a.signal_at AT TIME ZONE 'Asia/Kolkata')::date=(:watermark AT TIME ZONE 'Asia/Kolkata')::date
-                    GROUP BY COALESCE(NULLIF(i.sector,''),'OTHER')
-                    HAVING COUNT(*) filter(where a.net_pnl < 0 OR a.exit_reason = 'STOP_LOSS') >= 2
-                ) s
+            sector_loss_rows=connection.execute(text("""
+                SELECT COALESCE(i.underlying_symbol,i.symbol) as symbol
+                FROM shadow_execution_audits a JOIN instrument_master i ON i.id=a.instrument_id
+                WHERE a.exit_at IS NOT NULL
+                  AND a.exit_at>=:watermark-(:cooldown || ' minutes')::interval
+                  AND (a.signal_at AT TIME ZONE 'Asia/Kolkata')::date=(:watermark AT TIME ZONE 'Asia/Kolkata')::date
+                  AND (a.net_pnl<0 OR a.exit_reason = 'STOP_LOSS')
             """),{"watermark":watermark,"cooldown":max(60, self.reentry_cooldown_minutes)}).mappings().all()
+            sector_loss_counts=Counter(sector_for_symbol(str(r["symbol"] or "")) for r in sector_loss_rows)
+            cooldown_sectors={str(sector).upper() for sector, cnt in sector_loss_counts.items() if cnt >= 2}
             recent_closed=connection.execute(text("""
                 SELECT net_pnl,exit_reason
                 FROM shadow_execution_audits
@@ -1389,7 +1401,7 @@ class LivePaperInference:
                 "max_daily_trades":self.max_daily_trades,
                 "hard_kill_daily_loss":str(self.hard_kill_daily_loss),
                 "cooldown_underlyings":{str(item["underlying_symbol"] or "").upper() for item in cooldown_rows},
-                "cooldown_sectors":{str(item["sector"] or "").upper() for item in sector_cooldown_rows}}
+                "cooldown_sectors":cooldown_sectors}
 
     def _json_safe(self,value):
         if isinstance(value,Decimal):
@@ -2192,11 +2204,13 @@ class LivePaperInference:
                     INSERT INTO trade_candidate_audits(
                         observed_at,model_version,exchange,symbol,instrument_id,instrument_type,signal,probability,
                         decision_price,selector_stage,accepted,rejection_reason,chart_strategy,route,rr,
-                        expected_net_edge_bps,quality_score,selector_score,sector,details
+                        expected_net_edge_bps,quality_score,selector_score,sector,details,
+                        trade_mode,agent_deliberation
                     ) VALUES (
                         :observed_at,:model_version,:exchange,:symbol,:instrument_id,:instrument_type,:signal,:probability,
                         :decision_price,:selector_stage,:accepted,:rejection_reason,:chart_strategy,:route,:rr,
-                        :expected_net_edge_bps,:quality_score,:selector_score,:sector,CAST(:details AS jsonb)
+                        :expected_net_edge_bps,:quality_score,:selector_score,:sector,CAST(:details AS jsonb),
+                        :trade_mode,CASE WHEN :agent_deliberation IS NOT NULL THEN :agent_deliberation::jsonb ELSE NULL END
                     )
                     ON CONFLICT DO NOTHING
                 """), rows[:1000])
@@ -2268,6 +2282,8 @@ class LivePaperInference:
                 "quality_score":Decimal(str((quality or {}).get("score") or 0)),
                 "selector_score":Decimal(str(selector_score or 0)),
                 "sector":sector or sector_for_symbol(item.get("symbol"), item.get("instrument_type")),
+                "trade_mode":str(item.get("_trade_mode") or "INTRADAY"),
+                "agent_deliberation":json.dumps(item.get("_agent_deliberation"), default=str) if item.get("_agent_deliberation") else None,
                 "details":json.dumps({
                     "chart_gate":chart,
                     "instrument_local_direction":item.get("_instrument_local_direction") or chart.get("local_direction") or {},
@@ -2881,9 +2897,36 @@ class LivePaperInference:
             basket_seed = f"{strategy_name}:{sym_tag}:{causal_watermark.isoformat()}".encode()
             spread_basket_id = item.get("spread_basket_id") or (f"spread_{hashlib.sha256(basket_seed).hexdigest()[:12]}" if "SPREAD" in str(strategy_name).upper() else None)
 
+            # Agentic Multi-Agent Deliberation & Dual-Mode Routing
+            agent_eval = {"accepted": True, "trade_mode": "INTRADAY", "sizing_factor": Decimal("1.0"), "reasoning_chain": None}
+            try:
+                from .brains.orchestrator import get_orchestrator
+                orch = get_orchestrator(self.engine, self.redis)
+                candidate_ctx = {
+                    "symbol": item.get("symbol"),
+                    "side": target["side"],
+                    "probability": item.get("probability"),
+                    "entry_quality": item.get("_entry_quality"),
+                    "quality_score": (item.get("_entry_quality") or {}).get("score"),
+                    "strategy": strategy_name,
+                    "instrument_type": target.get("kind"),
+                    "expected_net_edge_bps": (item.get("policy_candidate") or {}).get("expected_net_edge_bps", 40.0),
+                    "multi_timeframe": consistency.get("multi_timeframe"),
+                    "spread_basket_id": spread_basket_id
+                }
+                agent_eval = orch.evaluate_candidate(candidate_ctx, {"session_case": session_case})
+                if not agent_eval.get("accepted"):
+                    rejected += 1
+                    continue
+                quantity = max(1, int(Decimal(str(quantity)) * Decimal(str(agent_eval.get("sizing_factor", 1.0)))))
+            except Exception:
+                pass
+
             result=record_shadow_signal(self.engine,self.redis,model["version"],int(target["instrument_token"]),target["side"],quantity,
                                         item["probability"],target["price"],item["session"]["timestamp"],
                                         strategy_note=json.dumps({"strategy":strategy_name,
+                                                                  "trade_mode":agent_eval.get("trade_mode","INTRADAY"),
+                                                                  "reasoning_chain":agent_eval.get("reasoning_chain"),
                                                                   "spread_basket_id":spread_basket_id,
                                                                   "candidate_grade":assigned_grade,
                                                                   "reason":item.get("chart_gate",{}).get("reason"),

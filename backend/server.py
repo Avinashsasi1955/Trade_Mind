@@ -15,7 +15,7 @@ from .config import (ADMIN_EMAILS, ALLOWED_ORIGINS, COOKIE_SECURE, DEMO_MODE, HO
                      validate_runtime_security)
 from .database import connect, create_user, find_user_by_email, initialize
 from .security import create_token, decode_token, hash_password, password_needs_rehash, token_hash, verify_password
-from .service import ai_gateway_status, apply_coach_proposal_service, approve_order_intent, backtest_report, bot_chat, bot_conversation, bot_conversations, brain_memory_status, broker_disconnect, broker_login, create_order_intent, daily_executive_journal, dashboard, derivative_plan, derivative_plans, derivatives_greeks, derivatives_spreads, dismiss_coach_proposal_service, execution_status, exit_shadow_trade, get_coach_audit, get_coach_proposals_service, glossary, ingest_finnhub_webhook, latest_analysis, listed_securities, market_history_status, market_update, ml_alpha_fragility, ml_drift, ml_quant_models, ml_shadow, ml_status, ml_train, ml_validate, model_review_status, model_status, operations_copilot_status, pre_market_health_status, production_status, reconcile_orders, repair_today_missing_bars, reset_portfolio, run_agent, sentiment_dashboard, shadow_session_status_api, shadow_trade_book, stock_analysis, stock_chart, submit_order_intent, update_kill_switch, update_risk_policy, update_settings, update_shadow_trade_risk
+from .service import ai_gateway_status, apply_coach_proposal_service, approve_order_intent, backtest_report, bot_chat, bot_conversation, bot_conversations, brain_memory_status, broker_disconnect, broker_login, create_order_intent, daily_executive_journal, dashboard, derivative_plan, derivative_plans, derivatives_greeks, derivatives_spreads, dismiss_coach_proposal_service, execution_status, exit_shadow_trade, get_coach_audit, get_coach_proposals_service, glossary, ingest_finnhub_webhook, latest_analysis, listed_securities, market_history_status, market_update, ml_alpha_fragility, ml_drift, ml_quant_models, ml_shadow, ml_status, ml_train, ml_validate, model_review_status, model_status, notifications_status_service, notifications_test_service, operations_copilot_status, pre_market_health_status, production_status, reconcile_orders, repair_today_missing_bars, reset_portfolio, run_agent, sentiment_dashboard, shadow_counterfactual_summary_service, shadow_session_status_api, shadow_trade_book, stock_analysis, stock_chart, submit_order_intent, trigger_counterfactual_replay_service, update_kill_switch, update_risk_policy, update_settings, update_shadow_trade_risk
 from .broker_gateway import complete_login
 from .scheduler import start_scheduler
 
@@ -447,6 +447,33 @@ class Handler(BaseHTTPRequestHandler):
             data=self._body()
             target_date = data.get("date") or data.get("target_date") or None
             return self._json(200, repair_today_missing_bars(int(data.get("limit",100)), target_date_str=target_date))
+        if path == "/api/shadow/counterfactual/summary" and method == "GET":
+            self._require_admin()
+            query = parse_qs(urlparse(self.path).query)
+            date_val = query.get("date", [None])[0]
+            return self._json(200, shadow_counterfactual_summary_service(date_val))
+        if path == "/api/shadow/counterfactual/replay" and method == "POST":
+            self._require_admin()
+            data = self._body()
+            date_val = data.get("date") or data.get("target_date") or None
+            return self._json(200, trigger_counterfactual_replay_service(date_val))
+        if path == "/api/notifications/status" and method == "GET":
+            self._require_admin()
+            return self._json(200, notifications_status_service())
+        if path == "/api/notifications/test" and method == "POST":
+            self._require_admin()
+            return self._json(200, notifications_test_service())
+        if path == "/api/stream/events" and method == "GET":
+            user_id = self._user_id()
+            from backend.sse_broadcaster import handle_sse_connection
+            handle_sse_connection(self, user_id)
+            return
+        if path == "/api/stream/broadcast" and method == "POST":
+            self._require_admin()
+            data = self._body()
+            from backend.sse_broadcaster import publish_sse_event
+            publish_sse_event(data.get("event", "custom_event"), data.get("data", {}))
+            return self._json(200, {"status": "broadcast_queued"})
         if path == "/api/execution/status" and method == "GET":
             with connect() as db: return self._json(200,execution_status(db,self._user_id()))
         if path == "/api/execution/intent" and method == "POST":
@@ -585,6 +612,15 @@ def main():
     validate_runtime_security()
     initialize()
     start_scheduler()
+    try:
+        from backend.sse_broadcaster import start_redis_listener, start_metrics_ticker, wire_bus_to_sse
+        from backend.brains import get_bus
+        start_redis_listener()
+        start_metrics_ticker()
+        wire_bus_to_sse(get_bus())
+        print("[nivesh] SSE Broadcaster & Metrics Ticker initialized")
+    except Exception as sse_err:
+        print(f"[nivesh] SSE initialization notice: {sse_err}")
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Nivesh AI running at http://{HOST}:{PORT}")
     if DEMO_MODE: print("Demo login: arjun@example.com / nivesh123")

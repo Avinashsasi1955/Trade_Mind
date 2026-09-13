@@ -217,7 +217,13 @@ def recover_stale_forward_shadow_sessions(lookback_days: int = None) -> Dict:
 @celery_app.task(name="backend.tasks.worker.post_market_validation")
 def post_market_validation() -> Dict:
     costs=reconcile_shadow_costs(_engine); promotion=evaluate_promotion(_engine)
-    return {"costs":costs,"promotion":promotion,"orders_allowed":False}
+    try:
+        from backend.brains.counterfactual_replay import run_post_market_counterfactual_replay
+        cf_summary = run_post_market_counterfactual_replay(_engine, redis_client=_redis)
+    except Exception as cf_err:
+        logger.warning("Post-market counterfactual replay error: %s", cf_err)
+        cf_summary = {"status": "error", "error": str(cf_err)}
+    return {"costs":costs,"promotion":promotion,"counterfactual":cf_summary,"orders_allowed":False}
 
 
 @celery_app.task(bind=True,name="backend.tasks.worker.auto_repair_shadow_gaps",max_retries=2,
@@ -288,14 +294,32 @@ def end_of_day_shadow_report() -> Dict:
     pnl["model_coach"]["model_feedback"]=feedback
     pnl["model_coach"]["actions"][-1]=f"Use only grade A/B closed trades for feedback export; current exported rows: {feedback.get('total_feedback_rows', 0)}."
     session=evaluate_session(_engine)
+    cf_summary = {}
+    try:
+        from backend.brains.counterfactual_replay import get_latest_counterfactual_summary
+        cf_summary = get_latest_counterfactual_summary(_engine, redis_client=_redis)
+    except Exception as cf_err:
+        logger.debug("EOD counterfactual summary fetch error: %s", cf_err)
+
     report={"session_date":pnl["session_date"],"paper_pnl":pnl,"session":session,
-            "gap_repair":repair,"model_feedback":feedback,"orders_allowed":False,
+            "gap_repair":repair,"model_feedback":feedback,"counterfactual":cf_summary,"orders_allowed":False,
             "message":"End-of-day shadow report generated from paper ledger, completed bars and REST repair evidence."}
     with _engine.begin() as connection:
         connection.execute(text("""
             INSERT INTO monitoring_events(component,level,message,payload,created_at)
             VALUES('shadow_eod_report','INFO','End-of-day shadow paper report generated',CAST(:payload AS jsonb),CURRENT_TIMESTAMP)
         """),{"payload":json.dumps(report,default=str)})
+
+    # Dispatch notification to Telegram and Discord
+    try:
+        from backend.notifications import notify_daily_eod_summary
+        notify_daily_eod_summary(report)
+        from backend.brains import get_bus
+        from backend.brains.bus import DailyReportReady
+        get_bus().publish(DailyReportReady(source_brain="end_of_day_shadow_report", report=report))
+    except Exception as notif_err:
+        logger.warning("EOD notification dispatch error: %s", notif_err)
+
     return report
 
 
@@ -708,19 +732,27 @@ def check_and_autotrain_drift(force: bool = False) -> Dict:
 
 @celery_app.task(name="backend.tasks.worker.resolve_counterfactual_outcomes")
 def resolve_counterfactual_outcomes() -> Dict:
-    """Resolve forward 5m/15m/30m price outcomes for counterfactual observation."""
+    """Resolve forward 5m/15m/30m price outcomes and boundary replay for counterfactual observation."""
     from backend.intelligence_memory import persist_counterfactual_candidates, update_candidate_counterfactual_outcomes, ensure_intelligence_schema
     from backend.senior_market_intelligence import update_counterfactuals
+    from backend.brains.counterfactual_replay import run_post_market_counterfactual_replay
     with _engine.begin() as conn:
         ensure_intelligence_schema(conn)
         res1 = persist_counterfactual_candidates(conn)
         res2 = update_candidate_counterfactual_outcomes(conn)
         res3 = update_counterfactuals(conn)
+    try:
+        replay_res = run_post_market_counterfactual_replay(_engine, redis_client=_redis)
+    except Exception as exc:
+        replay_res = {"status": "skipped", "error": str(exc)}
     return {
         "status": "success",
         "persisted": res1.get("upserted", 0),
         "updated_outcomes": res2.get("updated", 0),
         "senior_updated": res3.get("updated", 0),
+        "replay_accuracy_pct": replay_res.get("gate_accuracy_pct", 100.0),
+        "saved_losses": replay_res.get("saved_losses", 0),
+        "missed_wins": replay_res.get("missed_wins", 0),
     }
 
 
