@@ -4023,4 +4023,4 @@ async function initializeApp(){
   }
   window._niveshReady = true;
 }
-initializeApp()
+initializeApp();
