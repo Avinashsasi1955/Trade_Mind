@@ -172,12 +172,11 @@ def start_metrics_ticker(engine=None, redis_client=None) -> None:
                     with eng.connect() as conn:
                         row = conn.execute(text("""
                             SELECT 
-                                COUNT(*) FILTER (WHERE exit_price IS NULL) AS open_count,
-                                COUNT(*) FILTER (WHERE exit_price IS NOT NULL) AS closed_count,
-                                COALESCE(SUM(net_pnl) FILTER (WHERE exit_price IS NOT NULL), 0.0) AS realised_pnl,
-                                COALESCE(SUM(unrealised_pnl) FILTER (WHERE exit_price IS NULL), 0.0) AS unrealised_pnl
+                                COUNT(*) FILTER (WHERE realised_exit_price IS NULL) AS open_count,
+                                COUNT(*) FILTER (WHERE realised_exit_price IS NOT NULL) AS closed_count,
+                                COALESCE(SUM(net_pnl) FILTER (WHERE realised_exit_price IS NOT NULL), 0.0) AS realised_pnl
                             FROM shadow_execution_audits
-                            WHERE session_date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
+                            WHERE (signal_at AT TIME ZONE 'Asia/Kolkata')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
                         """)).mappings().one()
 
                         # Fetch latest thought if present
@@ -197,8 +196,8 @@ def start_metrics_ticker(engine=None, redis_client=None) -> None:
                         "open_trades": int(row["open_count"] or 0),
                         "closed_trades": int(row["closed_count"] or 0),
                         "realised_pnl": round(float(row["realised_pnl"] or 0.0), 2),
-                        "unrealised_pnl": round(float(row["unrealised_pnl"] or 0.0), 2),
-                        "total_pnl": round(float(row["realised_pnl"] or 0.0) + float(row["unrealised_pnl"] or 0.0), 2),
+                        "unrealised_pnl": 0.0,
+                        "total_pnl": round(float(row["realised_pnl"] or 0.0), 2),
                         "latest_thought": str(thought_text)[:140],
                         "active_connections": get_connected_clients_count(),
                         "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),

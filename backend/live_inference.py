@@ -29,9 +29,10 @@ from .intelligence_memory import publish_brain_event, refresh_intelligence_memor
 from .senior_market_intelligence import record_opportunity_scan, update_counterfactuals
 
 
-LIVE_BAR_SOURCES = ("zerodha_kite", "kite_gap_backfill", "upstox_v3", "upstox_rest_5m")
+LIVE_BAR_SOURCES = ("zerodha_kite", "kite_gap_backfill", "upstox_v3", "upstox_rest_5m", "upstox_rest_intraday", "gap_repair_finalizer")
+DEFAULT_TRADE_BAR_SOURCES = "zerodha_kite,upstox_v3,upstox_rest_intraday,upstox_rest_5m,upstox_rest_history,gap_repair_finalizer,official_exchange_bhavcopy,yahoo_sample,kite_gap_backfill"
 TRADE_BAR_SOURCES = tuple(
-    item.strip() for item in os.getenv("NIVESH_SHADOW_TRADE_BAR_SOURCES", "zerodha_kite,upstox_v3").split(",") if item.strip()
+    item.strip() for item in os.getenv("NIVESH_SHADOW_TRADE_BAR_SOURCES", DEFAULT_TRADE_BAR_SOURCES).split(",") if item.strip()
 )
 OPTION_UNDERLYING_ALIASES = {"NIFTY 50": "NIFTY", "NIFTY50": "NIFTY", "NIFTY BANK": "BANKNIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
 IST = ZoneInfo("Asia/Kolkata")
@@ -380,16 +381,20 @@ def _chart_strategy_gate(item: Dict, signal: int) -> Dict:
     else:
         return {"accepted":False,"reason":"trade direction not confirmed by this stock's breakout/pullback/momentum chart structure",
                 "strategy":"NO_TRADE","local_direction":local_direction}
-    risk=max(atr*1.5,last*.006)
-    reward=max(atr*3.0,last*.012)
-    rr=reward/risk if risk else 0
-    if rr<2.0:
-        return {"accepted":False,"reason":f"risk/reward {rr:.2f} below 2.0","strategy":strategy}
-    return {"accepted":True,"reason":"fresh live feed, chart structure, BOS/CHoCH, volume and risk/reward passed",
-            "strategy":strategy,"option_type":route[0],"side":route[1],"rr":round(rr,2),
-            "signal":signal,"structure":structure,"local_direction":local_direction,
-            "stop_loss":round(last-risk,4) if signal>0 else round(last+risk,4),
-            "take_profit":round(last+reward,4) if signal>0 else round(last-reward,4)}
+    if signal > 0:
+        risk = max(atr * 1.5, last * .006)
+    else:
+        risk = max(atr * 1.2, last * .005)
+    reward = max(atr * 3.0, last * .012)
+    rr = reward / risk if risk else 0
+    if rr < 2.0:
+        return {"accepted": False, "reason": f"risk/reward {rr:.2f} below 2.0", "strategy": strategy}
+    return {"accepted": True, "reason": "fresh live feed, chart structure, BOS/CHoCH, volume and risk/reward passed",
+            "strategy": strategy, "option_type": route[0], "side": route[1], "rr": round(rr, 2),
+            "signal": signal, "structure": structure, "local_direction": local_direction,
+            "directional_intent": "BULLISH" if signal > 0 else "BEARISH",
+            "stop_loss": round(last - risk, 4) if signal > 0 else round(last + risk, 4),
+            "take_profit": round(last + reward, 4) if signal > 0 else round(last - reward, 4)}
 
 
 def _learning_strategy_gate(item: Dict, signal: int) -> Dict:
@@ -429,17 +434,21 @@ def _learning_strategy_gate(item: Dict, signal: int) -> Dict:
         strategy="LEARNING_MOMENTUM_PUT_BUY"; route=("PE","BUY")
     else:
         strategy="LEARNING_RANGE_CALL_SELL"; route=("CE","SELL")
-    risk=max(atr*1.5,last*.006)
-    reward=max(atr*3.0,last*.012)
-    rr=reward/risk if risk else 0
-    if structure.get("accepted") and signal and structure.get("direction") and structure["direction"]!=signal:
-        return {"accepted":False,"reason":"learning trade rejected because BOS/CHoCH structure conflicts with signal",
-                "strategy":"NO_TRADE","structure":structure}
-    return {"accepted":True,"reason":"learning paper trade: live candles, BOS/CHoCH context and non-zero range passed; not promotion evidence",
-            "strategy":strategy,"option_type":route[0],"side":route[1],"rr":round(rr,2),
-            "signal":signal,"learning_mode":True,"structure":structure,"local_direction":local_direction,
-            "stop_loss":round(last-risk,4) if signal>0 else round(last+risk,4),
-            "take_profit":round(last+reward,4) if signal>0 else round(last-reward,4)}
+    if signal > 0:
+        risk = max(atr * 1.5, last * .006)
+    else:
+        risk = max(atr * 1.2, last * .005)
+    reward = max(atr * 3.0, last * .012)
+    rr = reward / risk if risk else 0
+    if structure.get("accepted") and signal and structure.get("direction") and structure["direction"] != signal:
+        return {"accepted": False, "reason": "learning trade rejected because BOS/CHoCH structure conflicts with signal",
+                "strategy": "NO_TRADE", "structure": structure}
+    return {"accepted": True, "reason": "learning paper trade: live candles, BOS/CHoCH context and non-zero range passed; not promotion evidence",
+            "strategy": strategy, "option_type": route[0], "side": route[1], "rr": round(rr, 2),
+            "signal": signal, "learning_mode": True, "structure": structure, "local_direction": local_direction,
+            "directional_intent": "BULLISH" if signal > 0 else "BEARISH",
+            "stop_loss": round(last - risk, 4) if signal > 0 else round(last + risk, 4),
+            "take_profit": round(last + reward, 4) if signal > 0 else round(last - reward, 4)}
 
 
 class LivePaperInference:
@@ -571,6 +580,11 @@ class LivePaperInference:
         self.mtf_min_required_frames=max(2,int(os.getenv("NIVESH_SHADOW_MTF_MIN_REQUIRED_FRAMES","2")))
         self.mtf_strong_conflict_threshold=float(os.getenv("NIVESH_SHADOW_MTF_STRONG_CONFLICT_THRESHOLD","58"))
         self.max_signal_age_minutes=max(1,int(os.getenv("NIVESH_SHADOW_MAX_SIGNAL_AGE_MINUTES","6")))
+        self.morning_cooloff_ist=os.getenv("NIVESH_SHADOW_MORNING_COOLOFF_IST","10:15")
+        self.morning_min_bars=max(12,int(os.getenv("NIVESH_SHADOW_MORNING_MIN_BARS","18")))
+        self.morning_stop_widen_factor=Decimal(os.getenv("NIVESH_SHADOW_MORNING_STOP_WIDEN","1.5"))
+        self.min_profit_to_fee_ratio=Decimal(os.getenv("NIVESH_SHADOW_MIN_PROFIT_FEE_RATIO","2.5"))
+        self.max_directional_concentration=Decimal(os.getenv("NIVESH_SHADOW_MAX_DIRECTIONAL_CONCENTRATION","0.70"))
 
     def _is_force_flat_time(self,watermark: datetime) -> bool:
         try:
@@ -1318,14 +1332,19 @@ class LivePaperInference:
         for row in rows:
             side_counts[str(row["side"] or "").upper()]+=1
         sector_counts=defaultdict(int)
+        sector_directions=defaultdict(set)
         for row in rows:
-            sector_counts[sector_for_symbol(row["underlying_symbol"] or row["symbol"], row["instrument_type"])]+=1
+            sec=sector_for_symbol(row["underlying_symbol"] or row["symbol"], row["instrument_type"])
+            sector_counts[sec]+=1
+            side_val=1 if str(row["side"] or "").upper()=="BUY" else -1
+            sector_directions[sec].add(side_val)
         return {"count":len(rows),
                 "instrument_ids":{int(row["instrument_id"]) for row in rows},
                 "underlyings":blocked,
                 "underlying_counts":{key:sum(1 for row in rows if key in {str(row["symbol"] or "").upper(),str(row["underlying_symbol"] or "").upper()}) for key in blocked},
                 "side_counts":dict(side_counts),
-                "sector_counts":dict(sector_counts)}
+                "sector_counts":dict(sector_counts),
+                "sector_directions":{k: set(v) for k, v in sector_directions.items()}}
 
     def _open_trade_count(self) -> int:
         return int(self._open_trade_state()["count"])
@@ -2345,6 +2364,16 @@ class LivePaperInference:
             elif item.get("_quant_strategy"):
                 chart["strategy"] = str(item["_quant_strategy"])
 
+            ist_now = watermark.astimezone(IST).time()
+            try:
+                cooloff_time = datetime.strptime(self.morning_cooloff_ist, "%H:%M").time()
+                if ist_now < cooloff_time:
+                    rejected += 1; reject_reasons["morning_cooloff_active"] += 1
+                    audit(item, "morning_cooloff", False, f"morning cool-off active before {self.morning_cooloff_ist} IST", thresholds=thresholds)
+                    continue
+            except Exception:
+                pass
+
             freshness=self._freshness_gate(item,watermark)
             if not freshness.get("accepted"):
                 rejected+=1; reject_reasons["stale_signal_rejected"]+=1
@@ -2360,24 +2389,9 @@ class LivePaperInference:
             loss_info = loss_counts.get(key, {})
             losses = loss_info.get("losses", 0) if isinstance(loss_info, dict) else int(loss_info or 0)
             if losses >= self.max_losses_per_underlying:
-                latest_loss_at = loss_info.get("latest_loss_at") if isinstance(loss_info, dict) else None
-                elapsed_min = 999.0
-                if latest_loss_at:
-                    if latest_loss_at.tzinfo is None:
-                        latest_loss_at = latest_loss_at.replace(tzinfo=timezone.utc)
-                    w_utc = watermark if watermark.tzinfo else watermark.replace(tzinfo=timezone.utc)
-                    elapsed_min = max(0.0, (w_utc - latest_loss_at).total_seconds() / 60.0)
-                quality_score = float((item.get("chart_gate") or {}).get("quality_score") or 0.0)
-                if elapsed_min < 45.0:
-                    rejected+=1; reject_reasons["repeated_underlying_loss_cooldown"]+=1
-                    audit(item,"daily_risk",False,f"repeated_underlying_loss (in 45m cooldown: {round(elapsed_min, 1)}m elapsed)")
-                    continue
-                elif quality_score < 78.0:
-                    rejected+=1; reject_reasons["repeated_underlying_loss_low_quality"]+=1
-                    audit(item,"daily_risk",False,f"repeated_underlying_loss (cooldown elapsed but quality {quality_score:.1f} < 78)")
-                    continue
-                else:
-                    item["_loss_cooldown_override"] = True
+                rejected += 1; reject_reasons["repeated_underlying_loss_blocked"] += 1
+                audit(item, "daily_risk", False, f"underlying {key} already has {losses} session losses (max={self.max_losses_per_underlying})")
+                continue
             if key in open_underlyings and underlying_counts[key]>=self.max_trades_per_underlying:
                 rejected+=1; reject_reasons["underlying_limit"]+=1; audit(item,"portfolio_limits",False,"underlying_limit"); continue
             target=self._execution_target(item,watermark)
@@ -2389,9 +2403,28 @@ class LivePaperInference:
                 audit(item,"strategy_consistency",False,consistency.get("reason","strategy_consistency_rejected"),target=target,thresholds=thresholds,consistency=consistency)
                 continue
             item["_strategy_consistency"]=consistency
+            total_session = int(risk_state.get("closed_trades", 0)) + int(open_state.get("count", 0))
+            if total_session >= 5:
+                strat_dir = int(consistency.get("strategy_direction", 0) or 0)
+                dir_label = "BUY" if strat_dir > 0 else "SELL"
+                same_dir_count = side_counts.get(dir_label, 0) + sum(
+                    1 for c in eligible if int((c.get("_strategy_consistency") or {}).get("strategy_direction", 0) or 0) == strat_dir
+                )
+                if (same_dir_count + 1) / (total_session + 1) > float(self.max_directional_concentration):
+                    rejected += 1; reject_reasons["directional_imbalance_cap"] += 1
+                    audit(item, "directional_balance", False, f"{dir_label} concentration would exceed {self.max_directional_concentration}", target=target)
+                    continue
+
             sector=sector_for_symbol(item.get("symbol"), item.get("instrument_type"))
             if sector_counts[sector]>=self.max_open_per_sector:
                 rejected+=1; reject_reasons["sector_exposure_limit"]+=1; audit(item,"sector_limits",False,"sector_exposure_limit",target=target,sector=sector); continue
+            open_sector_dirs = open_state.get("sector_directions", {})
+            if sector in open_sector_dirs:
+                strat_dir = int(consistency.get("strategy_direction", 0) or 0)
+                if strat_dir and -strat_dir in open_sector_dirs[sector]:
+                    rejected += 1; reject_reasons["sector_direction_conflict"] += 1
+                    audit(item, "sector_correlation", False, f"sector {sector} already has opposite direction open", target=target, sector=sector)
+                    continue
             if sector in risk_state.get("cooldown_sectors", set()):
                 rejected+=1; reject_reasons["sector_cooldown_active"]+=1
                 audit(item,"sector_limits",False,f"sector {sector} in cooldown after repeated intraday losses",target=target,sector=sector)
@@ -2407,6 +2440,23 @@ class LivePaperInference:
             if policy and float(getattr(policy,"expected_net_edge_bps",0) or 0)<float(thresholds["min_edge_bps"]):
                 rejected+=1; reject_reasons["net_edge_below_effective_minimum"]+=1; audit(item,"net_edge",False,"net_edge_below_effective_minimum",target=target,market_quality=market_quality,sentiment=sentiment,sector=sector,thresholds=thresholds); continue
             quantity=self._target_quantity(target,"A")
+            tgt_price = float(target.get("price") or 0)
+            tp_price = float((item.get("chart_gate") or {}).get("take_profit") or 0)
+            if tgt_price > 0 and tp_price > 0 and quantity > 0:
+                try:
+                    seg = "OPTIONS" if str(target.get("kind")) in {"CE", "PE"} else "EQUITY_INTRADAY"
+                    side_str = str(target.get("side", "BUY")).upper()
+                    opp_side = "SELL" if side_str == "BUY" else "BUY"
+                    c_entry = estimate_zerodha_costs(seg, side_str, Decimal(str(tgt_price)), quantity).total
+                    c_exit = estimate_zerodha_costs(seg, opp_side, Decimal(str(tp_price)), quantity).total
+                    est_fees = float(c_entry + c_exit)
+                    exp_profit = abs(tp_price - tgt_price) * quantity
+                    if est_fees > 0 and exp_profit < est_fees * float(self.min_profit_to_fee_ratio):
+                        rejected += 1; reject_reasons["fee_ratio_too_low"] += 1
+                        audit(item, "fee_gate", False, f"expected profit {exp_profit:.1f} < {self.min_profit_to_fee_ratio}x fees {est_fees:.1f}", target=target, sector=sector)
+                        continue
+                except Exception:
+                    pass
             quality=self._candidate_quality(item,target,quantity)
             if float(quality.get("score") or 0)<float(thresholds["min_quality"]):
                 rejected+=1; reject_reasons["quality_below_effective_minimum"]+=1; audit(item,"quality_score",False,"quality_below_effective_minimum",target=target,quality=quality,market_quality=market_quality,sentiment=sentiment,sector=sector,thresholds=thresholds); continue
@@ -2925,6 +2975,7 @@ class LivePaperInference:
             result=record_shadow_signal(self.engine,self.redis,model["version"],int(target["instrument_token"]),target["side"],quantity,
                                         item["probability"],target["price"],item["session"]["timestamp"],
                                         strategy_note=json.dumps({"strategy":strategy_name,
+                                                                  "directional_intent":item.get("chart_gate",{}).get("directional_intent"),
                                                                   "trade_mode":agent_eval.get("trade_mode","INTRADAY"),
                                                                   "reasoning_chain":agent_eval.get("reasoning_chain"),
                                                                   "spread_basket_id":spread_basket_id,
@@ -3041,6 +3092,7 @@ class LivePaperInference:
                 result=record_shadow_signal(self.engine,self.redis,model["version"],int(target["instrument_token"]),target["side"],quantity,
                                             item["probability"],target["price"],item["session"]["timestamp"],
                                             strategy_note=json.dumps({"strategy":item.get("chart_gate",{}).get("strategy"),
+                                                                      "directional_intent":item.get("chart_gate",{}).get("directional_intent"),
                                                                       "reason":item.get("chart_gate",{}).get("reason"),
                                                                       "rr":item.get("chart_gate",{}).get("rr"),
                                                                       "strategy_stop_loss":risk_levels.get("stop_loss"),

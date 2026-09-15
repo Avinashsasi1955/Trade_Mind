@@ -86,7 +86,7 @@ def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:
             trade_mode,reasoning_chain)
             VALUES(:model,:instrument,:signal_at,:side,:quantity,:probability,:price,:bid,:ask,:bid_qty,:ask_qty,:fill,:penalty,:fees,TRUE,
             :verified,'RECONCILED',:reason,:stop_loss,:take_profit,:fill_source,:strategy_note,
-            :trade_mode,CASE WHEN :reasoning_chain IS NOT NULL THEN :reasoning_chain::jsonb ELSE NULL END)
+            :trade_mode,CASE WHEN :reasoning_chain IS NOT NULL THEN CAST(:reasoning_chain AS jsonb) ELSE NULL END)
             ON CONFLICT(model_version,instrument_id,signal_at,side) DO NOTHING RETURNING id"""),
             {"model":model_version,"instrument":instrument["id"],"signal_at":signal_at,"side":side,"quantity":quantity,"probability":probability,"price":decision_price,
              "bid":best_bid,"ask":best_ask,"bid_qty":depth.get("bid_quantity"),"ask_qty":depth.get("ask_quantity"),
