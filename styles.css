@@ -1204,5 +1204,26 @@ button { color: inherit; }
   background: var(--surface);
 }
 
-
-
+/* ═══════ Light Theme Refinements ═══════ */
+[data-theme="light"] .primary-btn {
+  color: #ffffff;
+}
+[data-theme="light"] .timeframe-tabs button.active,
+[data-theme="light"] .chart-view-tabs button.active,
+[data-theme="light"] .indicator-tabs button.active {
+  background: var(--lime);
+  color: #ffffff;
+}
+[data-theme="light"] .data-table tbody tr:hover {
+  background: rgba(0, 0, 0, 0.03);
+}
+[data-theme="light"] .price-label-text {
+  fill: #ffffff;
+}
+[data-theme="light"] .structure-callput text {
+  fill: #ffffff;
+}
+[data-theme="light"] .auth-form input {
+  background: #f8fafc;
+  color: #0f172a;
+}

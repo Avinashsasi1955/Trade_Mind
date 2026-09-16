@@ -157,7 +157,7 @@ class Handler(BaseHTTPRequestHandler):
             raise APIError(HTTPStatus.FORBIDDEN, "CSRF validation failed")
 
     def _security_headers(self):
-        self.send_header("X-Content-Type-Options","nosniff"); self.send_header("X-Frame-Options","DENY"); self.send_header("Referrer-Policy","no-referrer"); self.send_header("Permissions-Policy","camera=(), microphone=(), geolocation=(), payment=(), usb=()"); self.send_header("Cross-Origin-Opener-Policy","same-origin"); self.send_header("Cross-Origin-Resource-Policy","same-origin"); self.send_header("Content-Security-Policy","default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' https://unpkg.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data:")
+        self.send_header("X-Content-Type-Options","nosniff"); self.send_header("X-Frame-Options","DENY"); self.send_header("Referrer-Policy","no-referrer"); self.send_header("Permissions-Policy","camera=(), microphone=(), geolocation=(), payment=(), usb=()"); self.send_header("Cross-Origin-Opener-Policy","same-origin"); self.send_header("Cross-Origin-Resource-Policy","same-origin"); self.send_header("Content-Security-Policy","default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data:")
         if COOKIE_SECURE:
             self.send_header("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
 

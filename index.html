@@ -8,13 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="styles.css?v=20260915t2100" />
-    <script>
-      (function(){
-        var t = localStorage.getItem('nivesh-theme') || 'dark';
-        document.documentElement.setAttribute('data-theme', t);
-      })();
-    </script>
+    <link rel="stylesheet" href="styles.css?v=20260916t1845" />
   </head>
   <body>
     <div class="app-shell">
@@ -141,40 +135,6 @@
     <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"
       integrity="sha384-uTYyvsSSUZeaPhb5RbKlQa0zY/WpX/QHfvg2mczXyBQOpkWPEDy9lczyp+w7SKXu"
       crossorigin="anonymous"></script>
-    <script>
-      if(!window.lucide){document.getElementById('content').innerHTML='<div style="padding:40px;color:#d64d4d;font-size:14px;">Lucide icons library failed to load. Check your internet connection and refresh.</div>';}
-    </script>
-    <script src="app.js?v=20260915t2100"></script>
-    <script>
-      (function(){
-        var btn = document.getElementById('themeToggleBtn');
-        if(!btn) return;
-        function updateToggleIcon(theme){
-          var iconName = theme === 'dark' ? 'moon' : 'sun';
-          btn.innerHTML = '<i data-lucide="' + iconName + '"></i>';
-          btn.setAttribute('title', theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
-          if(window.lucide && typeof lucide.createIcons === 'function'){
-            try { lucide.createIcons(); } catch(_){}
-          }
-        }
-        var current = localStorage.getItem('nivesh-theme') || 'dark';
-        document.documentElement.setAttribute('data-theme', current);
-        updateToggleIcon(current);
-        btn.addEventListener('click', function(e){
-          e.preventDefault();
-          e.stopPropagation();
-          var active = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
-          document.documentElement.setAttribute('data-theme', active);
-          localStorage.setItem('nivesh-theme', active);
-          updateToggleIcon(active);
-        });
-      })();
-      if(!window._niveshReady){
-        var c=document.getElementById('content');
-        if(c && !c.innerHTML.trim()){
-          c.innerHTML='<div style="padding:40px;color:#d64d4d;font-family:monospace;font-size:13px;line-height:1.8;">app.js loaded but did not render. Check browser console (F12 → Console) for errors.</div>';
-        }
-      }
-    </script>
+    <script src="app.js?v=20260916t1845"></script>
   </body>
 </html>

@@ -3970,6 +3970,42 @@ function showToast(title,message) { const t=document.getElementById('toast');t.q
 function toggleModal(open) { const m=document.getElementById('resetModal'); m.classList.toggle('open',open); m.setAttribute('aria-hidden',String(!open)); }
 function toggleAuth(open) { const a=document.getElementById('authScreen'); a.classList.toggle('open',open); a.setAttribute('aria-hidden',String(!open)); document.body.style.overflow=open?'hidden':''; }
 
+function initThemeToggle() {
+  const btn = document.getElementById('themeToggleBtn');
+  if (!btn) return;
+  const sunSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>';
+  const moonSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>';
+
+  function applyTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    try { localStorage.setItem('nivesh-theme', theme); } catch(_) {}
+    if (theme === 'light') {
+      btn.innerHTML = moonSvg;
+      btn.setAttribute('title', 'Switch to dark mode');
+      btn.setAttribute('aria-label', 'Switch to dark mode');
+    } else {
+      btn.innerHTML = sunSvg;
+      btn.setAttribute('title', 'Switch to light mode');
+      btn.setAttribute('aria-label', 'Switch to light mode');
+    }
+  }
+
+  const saved = (function(){ try { return localStorage.getItem('nivesh-theme'); } catch(_) { return null; } })() || 'dark';
+  applyTheme(saved);
+
+  btn.addEventListener('click', function(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    const current = document.documentElement.getAttribute('data-theme') || 'dark';
+    const next = current === 'light' ? 'dark' : 'light';
+    applyTheme(next);
+    if (activeView === 'charts' && currentChartData) {
+      renderStockChart(currentChartData);
+    }
+  });
+}
+initThemeToggle();
+
 document.querySelectorAll('.nav-item').forEach(b=>b.addEventListener('click',()=>{render(b.dataset.view);document.getElementById('sidebar').classList.remove('open')}));
 document.getElementById('menuBtn').addEventListener('click',()=>document.getElementById('sidebar').classList.toggle('open'));
 document.getElementById('runAgentTop').addEventListener('click',runAgent);
