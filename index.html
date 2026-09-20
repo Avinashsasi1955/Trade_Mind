@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="styles.css?v=20260916t1845" />
+    <link rel="stylesheet" href="styles.css?v=20260916t1925" />
   </head>
   <body>
     <div class="app-shell">
@@ -62,10 +62,58 @@
               <span class="sse-dot"></span><span id="sseLabel">CONNECTING…</span>
             </div>
             <div class="market-clock"><span>IST</span><strong id="clock">12:42:18</strong></div>
-            <button class="icon-btn" aria-label="Search"><i data-lucide="search"></i></button>
-            <button class="icon-btn notification" aria-label="Notifications"><i data-lucide="bell"></i><span></span></button>
+            <button class="icon-btn" id="globalSearchBtn" aria-label="Search" title="Search stocks (⌘K / /)"><i data-lucide="search"></i></button>
+            <button class="icon-btn notification" id="notificationBellBtn" aria-label="Notifications" title="Notifications & Desk Alerts"><i data-lucide="bell"></i><span id="notifBadge"></span></button>
             <button class="icon-btn" id="themeToggleBtn" aria-label="Toggle theme" title="Switch light/dark mode"><i data-lucide="moon"></i></button>
             <button class="primary-btn compact" id="runAgentTop"><i data-lucide="sparkles"></i> Run agent</button>
+            <div class="profile-dropdown-wrap" id="profileDropdownWrap">
+              <button class="topbar-profile-btn" id="topbarProfileBtn" aria-label="User Profile" aria-expanded="false" title="Account & Risk Profile">
+                <div class="avatar topbar-avatar" id="topbarAvatar">AK</div>
+                <div class="topbar-user-info">
+                  <strong id="topbarUserName">Arjun Kapoor</strong>
+                  <small id="topbarUserRole">Balanced Risk</small>
+                </div>
+                <i data-lucide="chevron-down" class="profile-chevron"></i>
+              </button>
+              <div class="profile-menu" id="profileMenu" aria-hidden="true">
+                <div class="profile-menu-header">
+                  <div class="avatar profile-menu-avatar" id="profileMenuAvatar">AK</div>
+                  <div>
+                    <strong id="profileMenuName">Arjun Kapoor</strong>
+                    <small id="profileMenuEmail">arjun@example.com</small>
+                    <span class="profile-desk-tag">Paper Trading Desk</span>
+                  </div>
+                </div>
+                <div class="profile-menu-stats">
+                  <div>
+                    <span>Starting Capital</span>
+                    <strong>₹10,00,000</strong>
+                  </div>
+                  <div>
+                    <span>Risk Profile</span>
+                    <strong id="profileMenuRisk">Balanced</strong>
+                  </div>
+                </div>
+                <div class="profile-menu-links">
+                  <button class="profile-menu-item" data-profile-go="settings">
+                    <i data-lucide="shield"></i> Risk &amp; Governance
+                  </button>
+                  <button class="profile-menu-item" data-profile-go="operations">
+                    <i data-lucide="cpu"></i> Operations &amp; Engine
+                  </button>
+                  <button class="profile-menu-item" data-profile-go="history">
+                    <i data-lucide="history"></i> Trade History Audit
+                  </button>
+                  <div class="profile-menu-divider"></div>
+                  <button class="profile-menu-item danger" id="profileResetBtn">
+                    <i data-lucide="rotate-ccw"></i> Reset Portfolio
+                  </button>
+                  <button class="profile-menu-item danger" id="profileSignOutBtn">
+                    <i data-lucide="log-out"></i> Sign Out
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         </header>
 
@@ -106,6 +154,45 @@
       </div>
     </div>
 
+    <!-- Global Stock Command Palette / Search Modal -->
+    <div class="modal-backdrop" id="searchModal" aria-hidden="true">
+      <div class="modal modal-search">
+        <div class="search-modal-header">
+          <i data-lucide="search"></i>
+          <input type="text" id="globalSearchInput" placeholder="Search 7,000+ NSE & BSE stocks (e.g. RELIANCE, TCS, NIFTY)..." autocomplete="off" />
+          <button class="icon-btn search-modal-close" data-close-search aria-label="Close"><i data-lucide="x"></i></button>
+        </div>
+        <div class="search-modal-results" id="globalSearchResults">
+          <div class="search-modal-empty">Type a symbol or company name to search across the market universe...</div>
+        </div>
+        <div class="search-modal-footer">
+          <span><kbd>↑</kbd> <kbd>↓</kbd> Navigate</span>
+          <span><kbd>↵</kbd> View Chart</span>
+          <span><kbd>ESC</kbd> Close</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Notification Center & Alert Drawer -->
+    <div class="modal-backdrop" id="notificationModal" aria-hidden="true">
+      <div class="modal modal-notifications">
+        <div class="modal-head-row">
+          <div>
+            <span class="eyebrow">Real-Time Desk Feed</span>
+            <h2>Desk Notifications &amp; Alerts</h2>
+          </div>
+          <div class="modal-head-actions">
+            <button class="secondary-btn compact" id="testNotifBtn"><i data-lucide="bell-ring"></i> Test</button>
+            <button class="secondary-btn compact" id="clearNotifBtn"><i data-lucide="trash-2"></i> Clear</button>
+            <button class="icon-btn modal-close" data-close-notif aria-label="Close"><i data-lucide="x"></i></button>
+          </div>
+        </div>
+        <div class="notification-list" id="notificationList">
+          <div class="empty-state">No alerts recorded yet. Real-time trade executions and risk warnings appear here.</div>
+        </div>
+      </div>
+    </div>
+
     <section class="auth-screen" id="authScreen" aria-hidden="true">
       <div class="auth-story">
         <div class="auth-brand"><div class="brand-mark"><span></span><span></span><span></span></div><strong>Nivesh<span>.ai</span></strong></div>
@@ -135,6 +222,6 @@
     <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"
       integrity="sha384-uTYyvsSSUZeaPhb5RbKlQa0zY/WpX/QHfvg2mczXyBQOpkWPEDy9lczyp+w7SKXu"
       crossorigin="anonymous"></script>
-    <script src="app.js?v=20260916t1845"></script>
+    <script src="app.js?v=20260916t1925"></script>
   </body>
 </html>

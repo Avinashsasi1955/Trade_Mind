@@ -164,9 +164,32 @@ function installStockPicker(id){
 
 function ingestDashboard(data) {
   liveSummary=data.summary; liveUniverse=data.universe; currentUser=data.user; activeRisk=data.settings.risk_profile;
-  document.querySelector('.account strong').textContent=data.user.name;
-  document.querySelector('.account small').textContent=`${activeRisk[0].toUpperCase()+activeRisk.slice(1)} risk`;
-  document.querySelector('.avatar').textContent=data.user.name.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase();
+  const initials = (data.user.name || 'AK').split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase();
+  const riskLabel = activeRisk ? (activeRisk[0].toUpperCase() + activeRisk.slice(1)) : 'Balanced';
+
+  const accStrong = document.querySelector('.account strong');
+  if (accStrong) accStrong.textContent = data.user.name;
+  const accSmall = document.querySelector('.account small');
+  if (accSmall) accSmall.textContent = `${riskLabel} risk`;
+  const accAvatar = document.querySelector('.account .avatar');
+  if (accAvatar) accAvatar.textContent = initials;
+
+  // Topbar profile pill & menu updates
+  const topbarName = document.getElementById('topbarUserName');
+  if (topbarName) topbarName.textContent = data.user.name;
+  const topbarRole = document.getElementById('topbarUserRole');
+  if (topbarRole) topbarRole.textContent = `${riskLabel} Risk`;
+  const topbarAv = document.getElementById('topbarAvatar');
+  if (topbarAv) topbarAv.textContent = initials;
+  const menuAv = document.getElementById('profileMenuAvatar');
+  if (menuAv) menuAv.textContent = initials;
+  const menuName = document.getElementById('profileMenuName');
+  if (menuName) menuName.textContent = data.user.name;
+  const menuEmail = document.getElementById('profileMenuEmail');
+  if (menuEmail) menuEmail.textContent = data.user.email || '';
+  const menuRisk = document.getElementById('profileMenuRisk');
+  if (menuRisk) menuRisk.textContent = riskLabel;
+
   holdings=data.holdings.map(h=>[h.symbol,h.name,h.quantity,money(h.average_price),money(h.ltp),money(h.current_value),signedMoney(h.pnl),signedPct(h.pnl_pct),h.weight]);
   history=data.trades.map(t=>({time:new Date(t.created_at).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}),symbol:t.symbol,name:t.name,action:t.action,qty:t.quantity,price:Number(t.price).toLocaleString('en-IN',{minimumFractionDigits:2}),value:Number(t.current_value).toLocaleString('en-IN',{minimumFractionDigits:2}),pnl:signedMoney(t.pnl),pct:signedPct(t.pnl_pct),up:t.pnl>=0,reason:t.reasoning}));
   trades=history.slice(0,3);
@@ -193,6 +216,34 @@ let analysisTimer=null;
 let mlTimer=null;
 let sentimentTimer=null;
 let sseConnection=null, sseRetryTimeout=null, sseActive=false;
+
+const systemNotifications = [];
+function addSystemNotification(type, title, desc) {
+  const timeStr = new Date().toLocaleTimeString('en-IN', {hour12: false, timeZone: 'Asia/Kolkata'});
+  systemNotifications.unshift({type, title, desc, time: timeStr, id: Date.now()});
+  if (systemNotifications.length > 50) systemNotifications.pop();
+  const badge = document.getElementById('notifBadge');
+  if (badge) badge.classList.add('active');
+  renderNotificationList();
+}
+function renderNotificationList() {
+  const list = document.getElementById('notificationList');
+  if (!list) return;
+  if (!systemNotifications.length) {
+    list.innerHTML = '<div class="empty-state">No alerts recorded yet. Real-time trade executions and risk warnings appear here.</div>';
+    return;
+  }
+  list.innerHTML = systemNotifications.map(n => `
+    <div class="notif-item ${n.type}">
+      <div class="notif-top">
+        <span class="${n.type.includes('profit') ? 'up' : n.type.includes('stop') ? 'down' : ''}">${n.type.replace('-', ' ').toUpperCase()}</span>
+        <small>${n.time} IST</small>
+      </div>
+      <div class="notif-title">${escapeHtml(n.title)}</div>
+      <p class="notif-desc">${escapeHtml(n.desc)}</p>
+    </div>
+  `).join('');
+}
 
 function initSSETransport(){
   if(!sessionAuthenticated) return;
@@ -221,6 +272,7 @@ function initSSETransport(){
         const modeTag=trade.trade_mode==='SWING'?'🌊 SWING':'⚡ INTRADAY';
         const price=trade.fill_price||trade.entry_price||0;
         showToast(`Order Opened · ${modeTag}`,`${trade.side||'BUY'} ${trade.symbol} @ ₹${Number(price).toLocaleString('en-IN')}`);
+        addSystemNotification('order-opened', `Order Opened · ${trade.symbol}`, `${trade.side||'BUY'} @ ₹${Number(price).toLocaleString('en-IN')} (${modeTag})`);
         if(['dashboard','positions','history'].includes(activeView)){
           api('/api/shadow/trades?limit=100').then(t=>{
             shadowTrades=t;
@@ -237,6 +289,7 @@ function initSSETransport(){
         const sign=pnl>=0?'+':'';
         const outcome=pnl>=0?'🏆 Profit Captured':'🛑 Stop Hit';
         showToast(outcome,`${trade.symbol}: ${sign}₹${pnl.toLocaleString('en-IN',{minimumFractionDigits:2})} (${trade.exit_reason||'closed'})`);
+        addSystemNotification(pnl>=0?'profit-captured':'stop-hit', `${outcome} · ${trade.symbol}`, `${sign}₹${pnl.toLocaleString('en-IN',{minimumFractionDigits:2})} · Reason: ${trade.exit_reason||'closed'}`);
         if(['dashboard','positions','history'].includes(activeView)){
           api('/api/shadow/trades?limit=100').then(t=>{
             shadowTrades=t;
@@ -258,6 +311,7 @@ function initSSETransport(){
       try{
         const alert=JSON.parse(e.data);
         showToast(alert.alert_type||'Risk Alert',`${alert.symbol}: ₹${alert.current_price} (P&L ₹${alert.pnl})`);
+        addSystemNotification('risk-alert', `${alert.alert_type||'Risk Alert'} · ${alert.symbol}`, `Current Price ₹${alert.current_price} · Marked P&L: ₹${alert.pnl}`);
       }catch(_){}
     });
     sseConnection.addEventListener('metrics_tick',e=>{
@@ -271,7 +325,7 @@ function initSSETransport(){
         if(pnlEl){
           const pnl=Number(tick.total_pnl||0);
           pnlEl.textContent=(pnl>=0?'+':'')+'₹'+pnl.toLocaleString('en-IN',{minimumFractionDigits:2});
-          pnlEl.className=pnl>=0?'up':'down';
+          pnlEl.className=`metric-value ${pnl>=0?'up':'down'}`;
         }
         const openCntEl=document.querySelector('[data-live-open-trades]');
         if(openCntEl) openCntEl.textContent=tick.open_trades;
@@ -1166,7 +1220,7 @@ function renderStockChart(data,options={}){
   min=mid-targetRange/2;max=mid+targetRange/2;
   const y=v=>15+(max-v)/(max-min||1)*(priceBottom-25),maxVol=Math.max(1,...candles.map(c=>c.volume||0)),vy=v=>volumeBottom-(v||0)/maxVol*(volumeBottom-volumeTop),up=data.change>=0;
   const bbUpper=ind.bollinger.upper.slice(start,end),bbLower=ind.bollinger.lower.slice(start,end);
-  const bbPath=activeIndicators.has('bollinger')?`<path class="bb-fill" d="${linePath(bbUpper,x,y)} ${bbLower.map((v,i)=>`L${x(bbLower.length-1-i).toFixed(1)},${y(bbLower[bbLower.length-1-i]).toFixed(1)}`).join(' ')} Z"/><path class="bb-line" d="${linePath(bbUpper,x,y)}"/><path class="bb-line" d="${linePath(bbLower,x,y)}"/>`:'';
+  const bbPath=activeIndicators.has('bollinger')?`<path class="bb-fill" fill="rgba(0, 242, 254, 0.08)" stroke="none" d="${linePath(bbUpper,x,y)} ${bbLower.map((v,i)=>`L${x(bbLower.length-1-i).toFixed(1)},${y(bbLower[bbLower.length-1-i]).toFixed(1)}`).join(' ')} Z"/><path class="bb-line" fill="none" stroke="rgba(0, 242, 254, 0.5)" stroke-dasharray="4 3" stroke-width="1.2" d="${linePath(bbUpper,x,y)}"/><path class="bb-line" fill="none" stroke="rgba(0, 242, 254, 0.5)" stroke-dasharray="4 3" stroke-width="1.2" d="${linePath(bbLower,x,y)}"/>`:'';
   const priceLabels=Array.from({length:5},(_,i)=>{const value=max-(i*(max-min)/4),yy=y(value);return `<line class="price-axis-line" x1="0" y1="${yy}" x2="900" y2="${yy}"/><text class="price-axis-label" x="895" y="${yy-4}" text-anchor="end">${value.toFixed(value<100?2:1)}</text>`}).join('');
   const structureOverlay=activeIndicators.has('structure')?buildStructureOverlay(candles,x,y,priceBottom,data.candles,start):'';
   const candleWidth=Math.max(2.2,Math.min(8,760/Math.max(1,candles.length)));
@@ -1192,8 +1246,8 @@ function renderStockChart(data,options={}){
   }).join('');
   chartRenderScale={min,max,priceBottom,volumeTop,volumeBottom,maxVol,candleWidth,lastIndex:candles.length-1,xLast:x(candles.length-1)};
   const volumeSma=ind.volume_sma20.slice(start,end);
-  const svg=`<svg id="mainStockChart" class="main-stock-chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" data-total="${total}" data-count="${count}"><g class="stock-grid"><path d="M0 60H900M0 130H900M0 200H900M0 270H900M0 345H900"/></g>${priceLabels}${structureOverlay}${bbPath}${activeIndicators.has('ema20')?`<path class="ema-line ema20" d="${linePath(ind.ema20.slice(start,end),x,y)}"/>`:''}${activeIndicators.has('ema50')?`<path class="ema-line ema50" d="${linePath(ind.ema50.slice(start,end),x,y)}"/>`:''}${candles.map((c,i)=>{const rise=c.close>=c.open,color=rise?'#08a77b':'#ff3f52',xx=x(i),yo=y(c.open),yc=y(c.close),volRatio=(c.volume||0)/Math.max(1,volumeSma[i]||0),volOpacity=Math.min(.82,Math.max(.28,.34+volRatio*.12));return `<line data-candle-wick="${i}" x1="${xx}" y1="${y(c.high)}" x2="${xx}" y2="${y(c.low)}" stroke="${color}"/><rect data-candle-body="${i}" x="${xx-candleWidth/2}" y="${Math.min(yo,yc)}" width="${candleWidth}" height="${Math.max(1.2,Math.abs(yo-yc))}" fill="${color}" rx=".6"/>${activeIndicators.has('volume')?`<rect data-volume-bar="${i}" x="${xx-candleWidth/2}" y="${vy(c.volume)}" width="${candleWidth}" height="${volumeBottom-vy(c.volume)}" fill="${color}" opacity="${volOpacity.toFixed(2)}"><title>${chartTimeLabel(c.time,data.timeframe,true)} · Vol ${Number(c.volume||0).toLocaleString('en-IN')} · ${volRatio.toFixed(2)}x avg</title></rect>`:''}`}).join('')}<g class="time-axis">${timeAxis}</g><g class="trade-marker-layer">${chartMarkers}</g><line class="last-price-line" x1="0" y1="${y(last.close)}" x2="866" y2="${y(last.close)}"/><rect class="last-price-label ${up?'positive':'negative'}" x="866" y="${y(last.close)-9}" width="34" height="18" rx="3"/><text x="883" y="${y(last.close)+3}" text-anchor="middle" class="price-label-text">${last.close.toFixed(0)}</text><text class="volume-axis-label" x="895" y="${Math.max(volumeTop+8,vy(maxVol)-4)}" text-anchor="end">${Number(maxVol).toLocaleString('en-IN')}</text><rect class="chart-drag-zone" fill="transparent" x="0" y="0" width="845" height="345"/><rect class="price-scale-drag-zone" fill="transparent" x="845" y="0" width="55" height="345"/><line id="crosshairX" class="chart-crosshair" x1="0" y1="0" x2="0" y2="345" visibility="hidden"/><line id="crosshairY" class="chart-crosshair" x1="0" y1="0" x2="866" y2="0" visibility="hidden"/></svg>`;
-  const rsiValues=ind.rsi14.slice(start,end),rsiSvg=activeIndicators.has('rsi14')?`<div class="rsi-panel"><span>RSI 14 <b>${rsiValues[rsiValues.length-1].toFixed(1)}</b></span><svg viewBox="0 0 900 110" preserveAspectRatio="none"><path class="rsi-zone" d="M0 25H900M0 80H900"/><path class="rsi-line" d="${linePath(rsiValues,x,v=>95-v*.85)}"/></svg></div>`:'';
+  const svg=`<svg id="mainStockChart" class="main-stock-chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" data-total="${total}" data-count="${count}"><g class="stock-grid"><path d="M0 60H900M0 130H900M0 200H900M0 270H900M0 345H900"/></g>${priceLabels}${structureOverlay}${bbPath}${activeIndicators.has('ema20')?`<path class="ema-line ema20" fill="none" stroke="#38ef7d" stroke-width="1.8" d="${linePath(ind.ema20.slice(start,end),x,y)}"/>`:''}${activeIndicators.has('ema50')?`<path class="ema-line ema50" fill="none" stroke="#f59e0b" stroke-width="1.8" d="${linePath(ind.ema50.slice(start,end),x,y)}"/>`:''}${candles.map((c,i)=>{const rise=c.close>=c.open,color=rise?'#08a77b':'#ff3f52',xx=x(i),yo=y(c.open),yc=y(c.close),volRatio=(c.volume||0)/Math.max(1,volumeSma[i]||0),volOpacity=Math.min(.82,Math.max(.28,.34+volRatio*.12));return `<line data-candle-wick="${i}" x1="${xx}" y1="${y(c.high)}" x2="${xx}" y2="${y(c.low)}" stroke="${color}"/><rect data-candle-body="${i}" x="${xx-candleWidth/2}" y="${Math.min(yo,yc)}" width="${candleWidth}" height="${Math.max(1.2,Math.abs(yo-yc))}" fill="${color}" rx=".6"/>${activeIndicators.has('volume')?`<rect data-volume-bar="${i}" x="${xx-candleWidth/2}" y="${vy(c.volume)}" width="${candleWidth}" height="${volumeBottom-vy(c.volume)}" fill="${color}" opacity="${volOpacity.toFixed(2)}"><title>${chartTimeLabel(c.time,data.timeframe,true)} · Vol ${Number(c.volume||0).toLocaleString('en-IN')} · ${volRatio.toFixed(2)}x avg</title></rect>`:''}`}).join('')}<g class="time-axis">${timeAxis}</g><g class="trade-marker-layer">${chartMarkers}</g><line class="last-price-line" x1="0" y1="${y(last.close)}" x2="866" y2="${y(last.close)}"/><rect class="last-price-label ${up?'positive':'negative'}" x="866" y="${y(last.close)-9}" width="34" height="18" rx="3"/><text x="883" y="${y(last.close)+3}" text-anchor="middle" class="price-label-text">${last.close.toFixed(0)}</text><text class="volume-axis-label" x="895" y="${Math.max(volumeTop+8,vy(maxVol)-4)}" text-anchor="end">${Number(maxVol).toLocaleString('en-IN')}</text><rect class="chart-drag-zone" fill="transparent" x="0" y="0" width="845" height="345"/><rect class="price-scale-drag-zone" fill="transparent" x="845" y="0" width="55" height="345"/><line id="crosshairX" class="chart-crosshair" x1="0" y1="0" x2="0" y2="345" visibility="hidden"/><line id="crosshairY" class="chart-crosshair" x1="0" y1="0" x2="866" y2="0" visibility="hidden"/></svg>`;
+  const rsiValues=ind.rsi14.slice(start,end),rsiSvg=activeIndicators.has('rsi14')?`<div class="rsi-panel"><span>RSI 14 <b>${rsiValues[rsiValues.length-1].toFixed(1)}</b></span><svg viewBox="0 0 900 110" preserveAspectRatio="none"><path class="rsi-zone" d="M0 25H900M0 80H900"/><path class="rsi-line" fill="none" stroke="#a78bfa" stroke-width="1.6" d="${linePath(rsiValues,x,v=>95-v*.85)}"/></svg></div>`:'';
   const forming=data.data_mode==='provider_live_forming_candle',micro=data.data_mode==='provider_live_1second_microstructure',viewStatus=chartOffsetBars?`${chartOffsetBars} bars behind latest`:'at latest';
   const tickAge=Math.max(0,Math.round((Date.now()-new Date(last.time).getTime())/1000)),sourceInfo=data.source_summary||{},hasRest=!!sourceInfo.has_rest_repair,hasLive=!!sourceInfo.has_live_stream,latestSource=data.latest_source||last.source||'unknown',sourceLabel=forming?'Live forming candle':hasLive&&hasRest?'Live + REST repaired':hasLive?'Live stream':hasRest?'REST repaired':'Stored/provider';
   const formingMarker=forming?`<span class="forming-marker">${icon('activity')} forming candle</span>`:micro?`<span class="forming-marker">${icon('zap')} 1s microstructure</span>`:'';
@@ -3970,6 +4024,150 @@ function showToast(title,message) { const t=document.getElementById('toast');t.q
 function toggleModal(open) { const m=document.getElementById('resetModal'); m.classList.toggle('open',open); m.setAttribute('aria-hidden',String(!open)); }
 function toggleAuth(open) { const a=document.getElementById('authScreen'); a.classList.toggle('open',open); a.setAttribute('aria-hidden',String(!open)); document.body.style.overflow=open?'hidden':''; }
 
+function initGlobalSearch() {
+  const modal = document.getElementById('searchModal');
+  const input = document.getElementById('globalSearchInput');
+  const results = document.getElementById('globalSearchResults');
+  const searchBtn = document.getElementById('globalSearchBtn');
+  if (!modal || !input || !results) return;
+
+  function openSearch() {
+    modal.classList.add('open');
+    modal.setAttribute('aria-hidden', 'false');
+    input.value = '';
+    results.innerHTML = '<div class="search-modal-empty">Type a symbol or company name to search across the market universe...</div>';
+    setTimeout(() => input.focus(), 50);
+  }
+
+  function closeSearch() {
+    modal.classList.remove('open');
+    modal.setAttribute('aria-hidden', 'true');
+  }
+
+  if (searchBtn) searchBtn.addEventListener('click', openSearch);
+  document.querySelectorAll('[data-close-search]').forEach(b => b.addEventListener('click', closeSearch));
+  modal.addEventListener('click', e => { if (e.target === modal) closeSearch(); });
+
+  window.addEventListener('keydown', e => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      modal.classList.contains('open') ? closeSearch() : openSearch();
+    } else if (e.key === '/' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) {
+      e.preventDefault();
+      openSearch();
+    } else if (e.key === 'Escape' && modal.classList.contains('open')) {
+      closeSearch();
+    }
+  });
+
+  let searchTimer = null;
+  input.addEventListener('input', () => {
+    const q = input.value.trim();
+    if (searchTimer) clearTimeout(searchTimer);
+    if (!q) {
+      results.innerHTML = '<div class="search-modal-empty">Type a symbol or company name to search across the market universe...</div>';
+      return;
+    }
+    results.innerHTML = `<div class="search-modal-empty">${icon('loader-circle')} Searching universe for "${escapeHtml(q)}"…</div>`;
+    if (window.lucide) lucide.createIcons();
+    searchTimer = setTimeout(async () => {
+      try {
+        const matches = await api(`/api/universe/search?q=${encodeURIComponent(q)}&limit=15`);
+        if (!matches || !matches.length) {
+          results.innerHTML = `<div class="search-modal-empty">No matching stocks found for "${escapeHtml(q)}"</div>`;
+          return;
+        }
+        results.innerHTML = matches.map(s => {
+          const sym = s.symbol || s.tradingsymbol || s[0];
+          const name = s.name || s.company_name || s[1] || sym;
+          const ex = s.exchange || s[2] || 'NSE';
+          const price = Number(s.price || s.last_price || s[3] || 0);
+          const chg = Number(s.change_pct || s.change || 0);
+          const up = chg >= 0;
+          return `<div class="search-result-row" data-search-sym="${escapeHtml(sym)}" data-search-ex="${escapeHtml(ex)}">
+            <div class="search-result-left">
+              <div class="search-result-badge">${ex}</div>
+              <div>
+                <strong>${escapeHtml(sym)}</strong>
+                <small>${escapeHtml(name)}</small>
+              </div>
+            </div>
+            <div class="search-result-right">
+              ${price ? `<strong>₹${price.toLocaleString('en-IN', {minimumFractionDigits: 2})}</strong><span class="${up ? 'up' : 'down'}">${up ? '+' : ''}${chg.toFixed(2)}%</span>` : `<span style="color:var(--faint)">${ex} Equity</span>`}
+            </div>
+          </div>`;
+        }).join('');
+        results.querySelectorAll('.search-result-row').forEach(row => {
+          row.addEventListener('click', () => {
+            const sym = row.dataset.searchSym;
+            const ex = row.dataset.searchEx;
+            closeSearch();
+            pendingChartSymbol = sym;
+            pendingChartExchange = ex;
+            render('charts');
+          });
+        });
+      } catch (err) {
+        results.innerHTML = `<div class="search-modal-empty" style="color:var(--negative);">Search error: ${escapeHtml(err.message)}</div>`;
+      }
+    }, 200);
+  });
+}
+initGlobalSearch();
+
+function initNotificationCenter() {
+  const modal = document.getElementById('notificationModal');
+  const btn = document.getElementById('notificationBellBtn');
+  const badge = document.getElementById('notifBadge');
+  const clearBtn = document.getElementById('clearNotifBtn');
+  const testBtn = document.getElementById('testNotifBtn');
+  if (!modal || !btn) return;
+
+  btn.addEventListener('click', () => {
+    modal.classList.add('open');
+    modal.setAttribute('aria-hidden', 'false');
+    if (badge) badge.classList.remove('active');
+    renderNotificationList();
+  });
+
+  document.querySelectorAll('[data-close-notif]').forEach(b => b.addEventListener('click', () => {
+    modal.classList.remove('open');
+    modal.setAttribute('aria-hidden', 'true');
+  }));
+
+  modal.addEventListener('click', e => {
+    if (e.target === modal) {
+      modal.classList.remove('open');
+      modal.setAttribute('aria-hidden', 'true');
+    }
+  });
+
+  if (clearBtn) {
+    clearBtn.addEventListener('click', () => {
+      systemNotifications.length = 0;
+      renderNotificationList();
+      if (badge) badge.classList.remove('active');
+    });
+  }
+
+  if (testBtn) {
+    testBtn.addEventListener('click', async () => {
+      testBtn.disabled = true;
+      try {
+        await api('/api/notifications/test', {method: 'POST'});
+        addSystemNotification('risk-alert', 'Desk Test Alert', 'Manual notification test broadcasted successfully.');
+        showToast('Notification Sent', 'Test alert broadcasted to notification center.');
+      } catch (err) {
+        addSystemNotification('risk-alert', 'Desk Alert Notice', `Notification trigger note: ${err.message}`);
+        showToast('Alert Notice', err.message);
+      } finally {
+        testBtn.disabled = false;
+      }
+    });
+  }
+}
+initNotificationCenter();
+
 function initThemeToggle() {
   const btn = document.getElementById('themeToggleBtn');
   if (!btn) return;
@@ -4005,6 +4203,77 @@ function initThemeToggle() {
   });
 }
 initThemeToggle();
+
+function initProfileMenu() {
+  const wrap = document.getElementById('profileDropdownWrap');
+  const btn = document.getElementById('topbarProfileBtn');
+  const menu = document.getElementById('profileMenu');
+  if (!wrap || !btn || !menu) return;
+
+  btn.addEventListener('click', function(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    const isOpen = wrap.classList.toggle('open');
+    btn.setAttribute('aria-expanded', String(isOpen));
+    menu.setAttribute('aria-hidden', String(!isOpen));
+  });
+
+  document.addEventListener('click', function(e) {
+    if (!wrap.contains(e.target) && wrap.classList.contains('open')) {
+      wrap.classList.remove('open');
+      btn.setAttribute('aria-expanded', 'false');
+      menu.setAttribute('aria-hidden', 'true');
+    }
+  });
+
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && wrap.classList.contains('open')) {
+      wrap.classList.remove('open');
+      btn.setAttribute('aria-expanded', 'false');
+      menu.setAttribute('aria-hidden', 'true');
+    }
+  });
+
+  menu.querySelectorAll('[data-profile-go]').forEach(function(item) {
+    item.addEventListener('click', function(e) {
+      e.preventDefault();
+      const targetView = item.getAttribute('data-profile-go');
+      wrap.classList.remove('open');
+      btn.setAttribute('aria-expanded', 'false');
+      menu.setAttribute('aria-hidden', 'true');
+      if (targetView) render(targetView);
+    });
+  });
+
+  const resetBtn = document.getElementById('profileResetBtn');
+  if (resetBtn) {
+    resetBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      wrap.classList.remove('open');
+      btn.setAttribute('aria-expanded', 'false');
+      menu.setAttribute('aria-hidden', 'true');
+      toggleModal(true);
+    });
+  }
+
+  const signOutBtn = document.getElementById('profileSignOutBtn');
+  if (signOutBtn) {
+    signOutBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      wrap.classList.remove('open');
+      btn.setAttribute('aria-expanded', 'false');
+      menu.setAttribute('aria-hidden', 'true');
+      const mainSignOut = document.getElementById('signOutBtn');
+      if (mainSignOut) mainSignOut.click();
+    });
+  }
+
+  if (window.lucide && window.lucide.createIcons) {
+    try { window.lucide.createIcons(); } catch(_) {}
+  }
+}
+initProfileMenu();
+
 
 document.querySelectorAll('.nav-item').forEach(b=>b.addEventListener('click',()=>{render(b.dataset.view);document.getElementById('sidebar').classList.remove('open')}));
 document.getElementById('menuBtn').addEventListener('click',()=>document.getElementById('sidebar').classList.toggle('open'));

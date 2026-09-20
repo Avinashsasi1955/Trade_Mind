@@ -278,6 +278,14 @@ class Handler(BaseHTTPRequestHandler):
             self._user_id()
             query = parse_qs(urlparse(self.path).query)
             return self._json(200, listed_securities(query.get("query", [""])[0], query.get("exchange", ["ALL"])[0], int(query.get("limit", [50])[0]), int(query.get("offset", [0])[0])))
+        if path == "/api/universe/search" and method == "GET":
+            self._user_id()
+            query = parse_qs(urlparse(self.path).query)
+            q = query.get("q", [""])[0] or query.get("query", [""])[0]
+            limit = int(query.get("limit", [15])[0])
+            offset = int(query.get("offset", [0])[0])
+            result = listed_securities(q, "ALL", limit, offset)
+            return self._json(200, result.get("items", []))
         if path == "/api/market/history/status" and method == "GET":
             self._user_id()
             return self._json(200, market_history_status())
@@ -518,8 +526,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/ml/shadow" and method == "POST":
             self._require_admin()
             return self._json(200, ml_shadow())
-        if path == "/api/ml/drift" and method == "POST":
-            self._require_admin()
+        if path == "/api/ml/drift" and method in {"GET", "POST"}:
+            self._user_id()
             return self._json(200, ml_drift())
         if path == "/api/ml/autonomous-trigger" and method == "POST":
             self._require_admin()

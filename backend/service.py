@@ -126,6 +126,32 @@ def _float(value) -> float:
 
 def portfolio_summary(db: sqlite3.Connection, user_id: int) -> Dict:
     portfolio = db.execute("SELECT * FROM portfolios WHERE user_id=?", (user_id,)).fetchone()
+    starting = float(portfolio["starting_capital"]) if portfolio else DEFAULT_CAPITAL
+    if getattr(db, "is_postgres", False):
+        try:
+            shadow_data = shadow_trade_book(limit=200)
+            sh_sum = shadow_data.get("summary") or {}
+            today_sum = shadow_data.get("today") or {}
+            realised = float(sh_sum.get("realised_pnl") or 0)
+            unrealised = float(sh_sum.get("unrealised_pnl") or 0)
+            net_pnl = float(sh_sum.get("net_marked_pnl") or (realised + unrealised))
+            today_net = float(today_sum.get("net_marked_pnl") or today_sum.get("realised_pnl") or 0)
+            open_trades = shadow_data.get("open") or []
+            invested = sum(abs(float(t.get("quantity") or 0)) * float(t.get("entry_price") or 0) for t in open_trades)
+            cash = max(0.0, starting + realised - invested)
+            curr_val = starting + net_pnl
+            return {
+                "starting_capital": round(starting, 2),
+                "cash": round(cash, 2),
+                "invested": round(invested, 2),
+                "current_value": round(curr_val, 2),
+                "total_pnl": round(net_pnl, 2),
+                "total_pnl_pct": round((net_pnl / max(1.0, starting)) * 100, 2),
+                "today_pnl": round(today_net, 2),
+                "today_pnl_pct": round((today_net / max(1.0, starting)) * 100, 2),
+            }
+        except Exception:
+            pass
     prices = _prices()
     holdings = db.execute("SELECT * FROM holdings WHERE user_id=? ORDER BY symbol", (user_id,)).fetchall()
     invested = sum(item["quantity"] * item["average_price"] for item in holdings)
@@ -142,6 +168,27 @@ def portfolio_summary(db: sqlite3.Connection, user_id: int) -> Dict:
 
 
 def holding_list(db: sqlite3.Connection, user_id: int) -> List[Dict]:
+    if getattr(db, "is_postgres", False):
+        try:
+            shadow_data = shadow_trade_book(limit=100)
+            open_trades = shadow_data.get("open") or []
+            if open_trades:
+                total = sum(abs(t["quantity"]) * float(t.get("current_price") or t.get("entry_price") or 0) for t in open_trades) or 1
+                return [{
+                    "symbol": t["symbol"],
+                    "name": t.get("name") or t["symbol"],
+                    "quantity": t["quantity"] if t.get("side") == "BUY" else -t["quantity"],
+                    "average_price": float(t.get("entry_price") or 0),
+                    "ltp": float(t.get("current_price") or t.get("entry_price") or 0),
+                    "current_value": round(abs(t["quantity"]) * float(t.get("current_price") or t.get("entry_price") or 0), 2),
+                    "pnl": round(float(t.get("marked_pnl") or 0), 2),
+                    "pnl_pct": round(float(t.get("pnl_pct") or 0), 2),
+                    "weight": round((abs(t["quantity"]) * float(t.get("current_price") or t.get("entry_price") or 0)) / total * 100, 1),
+                } for t in open_trades]
+            else:
+                return []
+        except Exception:
+            pass
     prices = _prices()
     rows = db.execute("SELECT * FROM holdings WHERE user_id=? ORDER BY symbol", (user_id,)).fetchall()
     total = sum(abs(item["quantity"]) * prices.get(item["symbol"], item["average_price"]) for item in rows) or 1
@@ -151,12 +198,10 @@ def holding_list(db: sqlite3.Connection, user_id: int) -> List[Dict]:
         qty = item["quantity"]
         avg = item["average_price"]
         if qty < 0:
-            # Short position: gain if price falls below average entry
             value = abs(qty) * ltp
             pnl = (avg - ltp) * abs(qty)
             pnl_pct = ((avg - ltp) / avg) * 100 if avg else 0.0
         else:
-            # Long position: gain if price rises above average entry
             value = qty * ltp
             pnl = (ltp - avg) * qty
             pnl_pct = ((ltp - avg) / avg) * 100 if avg else 0.0
@@ -165,6 +210,29 @@ def holding_list(db: sqlite3.Connection, user_id: int) -> List[Dict]:
 
 
 def trade_list(db: sqlite3.Connection, user_id: int, limit: int = 100) -> List[Dict]:
+    if getattr(db, "is_postgres", False):
+        try:
+            shadow_data = shadow_trade_book(limit=limit)
+            closed_trades = shadow_data.get("closed") or []
+            if closed_trades:
+                return [{
+                    "id": t.get("id"),
+                    "symbol": t["symbol"],
+                    "name": t.get("name") or t["symbol"],
+                    "action": t.get("side") or "BUY",
+                    "quantity": t.get("quantity") or 0,
+                    "price": float(t.get("entry_price") or 0),
+                    "realised_pnl": round(float(t.get("marked_pnl") or 0), 2),
+                    "pnl": round(float(t.get("marked_pnl") or 0), 2),
+                    "pnl_pct": round(float(t.get("pnl_pct") or 0), 2),
+                    "current_value": round(float(t.get("quantity") or 0) * float(t.get("exit_price") or t.get("entry_price") or 0), 2),
+                    "confidence": float(t.get("signal_probability") or 0) * 100 if float(t.get("signal_probability") or 0) <= 1 else float(t.get("signal_probability") or 75),
+                    "strategy": t.get("strategy_label") or t.get("strategy_tag") or "Shadow Quantitative",
+                    "reasoning": t.get("rejection_reason") or t.get("improvement_note") or f"Closed via {t.get('exit_reason', 'order exit')}",
+                    "created_at": t.get("signal_at") or now_iso(),
+                } for t in closed_trades[:limit]]
+        except Exception:
+            pass
     rows = db.execute("SELECT * FROM trades WHERE user_id=? ORDER BY id DESC LIMIT ?", (user_id, limit)).fetchall()
     prices = _prices()
     result = []

@@ -64,6 +64,7 @@ def pool(database_url: str, minimum: int = 1, maximum: int = 12):
 
 
 class PostgresConnection:
+    is_postgres = True
     def __init__(self,database_url: str,minimum: int=1,maximum: int=12):
         self._pool=pool(database_url,minimum,maximum); self._connection=self._pool.getconn(); self._closed=False
     @property

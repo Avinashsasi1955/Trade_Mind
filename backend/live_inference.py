@@ -343,10 +343,39 @@ def _chart_strategy_gate(item: Dict, signal: int) -> Dict:
     if structure.get("accepted") and signal and structure.get("direction") and structure["direction"]!=signal:
         return {"accepted":False,"reason":"ML direction conflicts with BOS/CHoCH structure",
                 "strategy":"NO_TRADE","structure":structure}
+
+    # Regime & Market Structure Analytics: Intraday VWAP & ADX Trend Strength
+    total_pv = sum(((float(b["high"]) + float(b["low"]) + float(b["close"])) / 3.0) * max(1, int(b.get("volume") or 1)) for b in bars)
+    total_vol = sum(max(1, int(b.get("volume") or 1)) for b in bars)
+    vwap = total_pv / total_vol if total_vol > 0 else last
+
+    # True Range & Directional Movement (ADX proxy)
+    dx_vals = []
+    for i in range(1, len(bars)):
+        up_move = highs[i] - highs[i-1]
+        down_move = lows[i-1] - lows[i]
+        plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        if tr > 0:
+            dx = abs(plus_dm - minus_dm) / tr * 100.0
+            dx_vals.append(dx)
+    adx = (sum(dx_vals[-7:]) / len(dx_vals[-7:])) if dx_vals else 20.0
+    is_choppy = adx < 18.0
+
+    # Anti-Chasing Overextension Guard: Never buy the peak or short the bottom
+    vwap_distance_pct = (last - vwap) / vwap
+    if signal > 0 and vwap_distance_pct > 0.008:
+        return {"accepted": False, "reason": f"overextended above VWAP (+{vwap_distance_pct*100:.2f}% > +0.8%), high probability pullback trap",
+                "strategy": "NO_TRADE", "local_direction": local_direction}
+    if signal < 0 and vwap_distance_pct < -0.008:
+        return {"accepted": False, "reason": f"overextended below VWAP ({vwap_distance_pct*100:.2f}% < -0.8%), oversold bounce trap",
+                "strategy": "NO_TRADE", "local_direction": local_direction}
+
     trend_up=ema_fast[-1]>ema_slow[-1] and last>=ema_fast[-1]
     trend_down=ema_fast[-1]<ema_slow[-1] and last<=ema_fast[-1]
-    breakout_up=last>prior_high and volume_ok
-    breakout_down=last<prior_low and volume_ok
+    breakout_up=last>prior_high and volume_ok and not is_choppy
+    breakout_down=last<prior_low and volume_ok and not is_choppy
     pullback_buy=trend_up and (lows[-1]<=ema_fast[-1]*1.002 or last>=ema_fast[-1]>=lows[-2]) and last>=previous
     pullback_sell=trend_down and (highs[-1]>=ema_fast[-1]*0.998 or last<=ema_fast[-1]<=highs[-2]) and last<=previous
     momentum_up=trend_up and last>previous and ema_fast[-1]>ema_fast[-2]
@@ -379,8 +408,8 @@ def _chart_strategy_gate(item: Dict, signal: int) -> Dict:
         strategy="MOMENTUM_PUT_BUY"
         route=("PE","BUY")
     else:
-        return {"accepted":False,"reason":"trade direction not confirmed by this stock's breakout/pullback/momentum chart structure",
-                "strategy":"NO_TRADE","local_direction":local_direction}
+        rej_reason = "breakout blocked during choppy consolidation (ADX < 18)" if (is_choppy and (last>prior_high or last<prior_low)) else "trade direction not confirmed by this stock's breakout/pullback/momentum chart structure"
+        return {"accepted":False,"reason":rej_reason,"strategy":"NO_TRADE","local_direction":local_direction}
     if signal > 0:
         risk = max(atr * 1.5, last * .006)
     else:
@@ -475,9 +504,9 @@ class LivePaperInference:
         self.max_index_learning_trades=max(0,int(os.getenv("NIVESH_SHADOW_MAX_INDEX_LEARNING_TRADES","0")))
         self.max_trades_per_underlying=max(1,int(os.getenv("NIVESH_SHADOW_MAX_TRADES_PER_UNDERLYING","1")))
         self.trailing_enabled=os.getenv("NIVESH_SHADOW_TRAILING_STOP_ENABLED","1")=="1"
-        self.trailing_trigger_pct=Decimal(os.getenv("NIVESH_SHADOW_TRAILING_TRIGGER_PCT","0.08"))
-        self.trailing_giveback_pct=Decimal(os.getenv("NIVESH_SHADOW_TRAILING_GIVEBACK_PCT","0.04"))
-        self.breakeven_trigger_pct=Decimal(os.getenv("NIVESH_SHADOW_BREAKEVEN_TRIGGER_PCT","0.06"))
+        self.trailing_trigger_pct=Decimal(os.getenv("NIVESH_SHADOW_TRAILING_TRIGGER_PCT","0.012"))
+        self.trailing_giveback_pct=Decimal(os.getenv("NIVESH_SHADOW_TRAILING_GIVEBACK_PCT","0.004"))
+        self.breakeven_trigger_pct=Decimal(os.getenv("NIVESH_SHADOW_BREAKEVEN_TRIGGER_PCT","0.006"))
         self.max_daily_loss=Decimal(os.getenv("NIVESH_SHADOW_MAX_DAILY_LOSS","3000"))
         self.hard_kill_daily_loss=Decimal(os.getenv("NIVESH_SHADOW_HARD_KILL_DAILY_LOSS","10000"))
         self.daily_trade_target=max(1,int(os.getenv("NIVESH_SHADOW_DAILY_TRADE_TARGET","40")))
@@ -565,7 +594,7 @@ class LivePaperInference:
         self.sentiment_min_confidence=Decimal(os.getenv("NIVESH_SHADOW_SENTIMENT_MIN_CONFIDENCE","60"))
         self.sentiment_max_age_hours=max(1,int(os.getenv("NIVESH_SHADOW_SENTIMENT_MAX_AGE_HOURS","24")))
         self.entry_cutoff_ist=os.getenv("NIVESH_SHADOW_ENTRY_CUTOFF_IST","15:05")
-        self.force_flat_ist=os.getenv("NIVESH_SHADOW_FORCE_FLAT_IST","15:20")
+        self.force_flat_ist=os.getenv("NIVESH_SHADOW_FORCE_FLAT_IST","15:15")
         self.adaptive_learning_enabled=os.getenv("NIVESH_SHADOW_ADAPTIVE_LEARNING_ENABLED","1")=="1"
         self.adaptive_min_samples=max(1,int(os.getenv("NIVESH_SHADOW_ADAPTIVE_MIN_SAMPLES","3")))
         self.adaptive_max_loss_rate=Decimal(os.getenv("NIVESH_SHADOW_ADAPTIVE_MAX_LOSS_RATE","0.62"))
@@ -1069,29 +1098,40 @@ class LivePaperInference:
             breakeven_price=entry
             profit_lock_price=entry
             
-            # Initial risk R calculation
+            # Initial risk R calculation: strictly use ATR-based risk from chart levels or ATR fallback
+            fallback_risk = max(Decimal("0.50"), entry * Decimal("0.006"))
             if row["side"]=="BUY":
-                r_points = (entry - stop_loss) if (stop_loss is not None and entry > stop_loss) else max(Decimal("0.5"), entry * Decimal("0.015"))
+                r_points = (entry - stop_loss) if (stop_loss is not None and entry > stop_loss) else fallback_risk
             else:
-                r_points = (stop_loss - entry) if (stop_loss is not None and stop_loss > entry) else max(Decimal("0.5"), entry * Decimal("0.015"))
+                r_points = (stop_loss - entry) if (stop_loss is not None and stop_loss > entry) else fallback_risk
 
+            # Fee-padded breakeven buffer (covers both entry and exit Zerodha costs + 2 ticks)
+            fee_buffer_per_share = (fees * Decimal("2.2")) / max(Decimal("1"), quantity)
+
+            bars_seen = 0
             for bar in bars:
+                bars_seen += 1
                 high=Decimal(bar["high_price"]); low=Decimal(bar["low_price"])
                 if row["side"]=="BUY":
                     best_favourable=max(best_favourable,high)
                     favorable_r = (high - entry) / max(Decimal("0.01"), r_points)
+
+                    # Immediate Adverse Excursion Early-Cut: if setup collapses within 3 bars without expanding, cut at -0.5R
+                    if bars_seen <= 3 and low <= entry - Decimal("0.5") * r_points and best_favourable <= entry + Decimal("0.1") * r_points:
+                        exit_price = max(Decimal("0.05"), entry - Decimal("0.5") * r_points)
+                        exit_reason = "EARLY_ADVERSE_CUT"; exit_at = bar["bar_time"]; break
                     
                     # Stage 3: +2.5R Spike Exit
                     if favorable_r >= Decimal("2.5"):
                         exit_price=entry + Decimal("2.5") * r_points; exit_reason="PROFIT_CAPTURE"; exit_at=bar["bar_time"]; break
-                    # Stage 2: +1.5R Lock guaranteed +0.75R profit
-                    if favorable_r >= Decimal("1.5"):
+                    # Stage 2: +1.2R Lock guaranteed +0.6R profit
+                    if favorable_r >= Decimal("1.2"):
                         profit_locked=True
-                        profit_lock_price=max(profit_lock_price, entry + Decimal("0.75") * r_points)
-                    # Stage 1: +1.0R Arm Breakeven
-                    if favorable_r >= Decimal("1.0") or best_favourable>=entry*(Decimal("1")+self.breakeven_trigger_pct):
+                        profit_lock_price=max(profit_lock_price, entry + Decimal("0.6") * r_points)
+                    # Stage 1: +0.7R Arm Fee-Padded Breakeven
+                    if favorable_r >= Decimal("0.7") or best_favourable>=entry*(Decimal("1")+self.breakeven_trigger_pct):
                         breakeven_armed=True
-                        breakeven_price=entry + (fees / max(Decimal("1"), quantity))
+                        breakeven_price=entry + fee_buffer_per_share
 
                     if self.profit_capture_enabled and high>=entry+capture_points:
                         exit_price=entry+capture_points; exit_reason="PROFIT_CAPTURE"; exit_at=bar["bar_time"]; break
@@ -1112,17 +1152,22 @@ class LivePaperInference:
                     best_favourable=min(best_favourable,low)
                     favorable_r = (entry - low) / max(Decimal("0.01"), r_points)
 
+                    # Immediate Adverse Excursion Early-Cut: if setup collapses within 3 bars without expanding, cut at -0.5R
+                    if bars_seen <= 3 and high >= entry + Decimal("0.5") * r_points and best_favourable >= entry - Decimal("0.1") * r_points:
+                        exit_price = entry + Decimal("0.5") * r_points
+                        exit_reason = "EARLY_ADVERSE_CUT"; exit_at = bar["bar_time"]; break
+
                     # Stage 3: +2.5R Spike Exit
                     if favorable_r >= Decimal("2.5"):
                         exit_price=max(Decimal("0.05"), entry - Decimal("2.5") * r_points); exit_reason="PROFIT_CAPTURE"; exit_at=bar["bar_time"]; break
-                    # Stage 2: +1.5R Lock guaranteed +0.75R profit
-                    if favorable_r >= Decimal("1.5"):
+                    # Stage 2: +1.2R Lock guaranteed +0.6R profit
+                    if favorable_r >= Decimal("1.2"):
                         profit_locked=True
-                        profit_lock_price=min(profit_lock_price if profit_lock_price!=entry else (entry - Decimal("0.75") * r_points), entry - Decimal("0.75") * r_points)
-                    # Stage 1: +1.0R Arm Breakeven
-                    if favorable_r >= Decimal("1.0") or best_favourable<=entry*(Decimal("1")-self.breakeven_trigger_pct):
+                        profit_lock_price=min(profit_lock_price if profit_lock_price!=entry else (entry - Decimal("0.6") * r_points), entry - Decimal("0.6") * r_points)
+                    # Stage 1: +0.7R Arm Fee-Padded Breakeven
+                    if favorable_r >= Decimal("0.7") or best_favourable<=entry*(Decimal("1")-self.breakeven_trigger_pct):
                         breakeven_armed=True
-                        breakeven_price=entry - (fees / max(Decimal("1"), quantity))
+                        breakeven_price=entry - fee_buffer_per_share
 
                     if self.profit_capture_enabled and low<=entry-capture_points:
                         exit_price=max(Decimal("0.05"),entry-capture_points); exit_reason="PROFIT_CAPTURE"; exit_at=bar["bar_time"]; break
@@ -1140,25 +1185,26 @@ class LivePaperInference:
                     if take_profit is not None and low<=take_profit:
                         exit_price=take_profit; exit_reason="TAKE_PROFIT"; exit_at=bar["bar_time"]; break
 
-            # Option Stagnation Guard: Force flat exit after 25 minutes without expansion to prevent theta decay
+            # Stagnation Guard: Force flat exit after 20 minutes without expansion to prevent capital lockup and chop loss
             duration_minutes = (watermark - row["signal_at"]).total_seconds() / 60.0
-            if exit_reason == "TIME_EXIT" and is_option and duration_minutes >= 25.0:
-                is_stagnant = (best_favourable < entry + Decimal("0.2") * r_points) if row["side"]=="BUY" else (best_favourable > entry - Decimal("0.2") * r_points)
+            trade_mode = str(row.get("trade_mode") or "INTRADAY").upper()
+            stagnation_limit = 25.0 if is_option else 20.0
+            if exit_reason == "TIME_EXIT" and duration_minutes >= stagnation_limit and trade_mode == "INTRADAY":
+                is_stagnant = (best_favourable < entry + Decimal("0.25") * r_points) if row["side"]=="BUY" else (best_favourable > entry - Decimal("0.25") * r_points)
                 if is_stagnant:
                     exit_price=Decimal(row["exit_price"])
                     exit_reason="STAGNATION_GUARD"
                     exit_at=watermark
 
-            trade_mode = str(row.get("trade_mode") or "INTRADAY").upper()
             if trade_mode == "SWING":
-                # Multi-day swing trade: exempt from 15:20 intraday force-flat
+                # Multi-day swing trade: exempt from 15:15 intraday force-flat
                 # Only exit if SL or TP is hit, or max_holding_days reached
                 signal_date = row["signal_at"].astimezone(IST).date()
                 watermark_date = watermark.astimezone(IST).date()
                 days_held = (watermark_date - signal_date).days
-                if days_held >= int(row.get("max_holding_days") or 5):
+                if days_held >= int(row.get("max_holding_days") or 15):
                     exit_reason = "SWING_MAX_DAYS_EXPIRED"
-                elif exit_reason == "TIME_EXIT":
+                elif exit_reason in ("TIME_EXIT", "STAGNATION_GUARD"):
                     # Keep multi-day position open!
                     continue
             else:
@@ -2501,7 +2547,14 @@ class LivePaperInference:
             target=item["_execution_target"]
             side=str(target["side"]).upper()
             key=self._underlying_key(item)
-            sector=str(item.get("_sector") or "OTHER").upper()
+            # Prevent simultaneous opposing bets in the same minute cycle
+            primary_cycle_side = str(selected[0]["_execution_target"]["side"]).upper() if selected else None
+            if primary_cycle_side and side != primary_cycle_side:
+                rejected += 1
+                reject_reasons["cycle_directional_conflict"] = reject_reasons.get("cycle_directional_conflict", 0) + 1
+                audit(item, "cycle_directional_consensus", False, f"conflicts with cycle primary direction {primary_cycle_side}", target=target)
+                continue
+
             if underlying_counts[key]>=self.max_trades_per_underlying:
                 rejected+=1; reject_reasons["underlying_limit_after_ranking"]+=1; audit(item,"ranking_limits",False,"underlying_limit_after_ranking",target=target,quality=item.get("_entry_quality"),market_quality=item.get("_market_quality"),sentiment=item.get("_sentiment_gate"),adaptive=item.get("_adaptive_gate"),selector_score=item.get("_selector_score"),sector=sector,thresholds=item.get("_effective_thresholds")); continue
             if sector_counts[sector]>=self.max_open_per_sector or new_sector_counts[sector]>=self.max_new_per_sector:
@@ -2952,17 +3005,21 @@ class LivePaperInference:
             try:
                 from .brains.orchestrator import get_orchestrator
                 orch = get_orchestrator(self.engine, self.redis)
+                is_equity_long = str(target.get("kind") or "EQ").upper() == "EQ" and str(target.get("side") or "BUY").upper() == "BUY"
+                quality_score = float((item.get("_entry_quality") or {}).get("score") or 0.0)
+                proposed_mode = "SWING" if (is_equity_long and quality_score >= 74.0) else "INTRADAY"
                 candidate_ctx = {
                     "symbol": item.get("symbol"),
                     "side": target["side"],
                     "probability": item.get("probability"),
                     "entry_quality": item.get("_entry_quality"),
-                    "quality_score": (item.get("_entry_quality") or {}).get("score"),
+                    "quality_score": quality_score,
                     "strategy": strategy_name,
                     "instrument_type": target.get("kind"),
                     "expected_net_edge_bps": (item.get("policy_candidate") or {}).get("expected_net_edge_bps", 40.0),
                     "multi_timeframe": consistency.get("multi_timeframe"),
-                    "spread_basket_id": spread_basket_id
+                    "spread_basket_id": spread_basket_id,
+                    "proposed_mode": proposed_mode
                 }
                 agent_eval = orch.evaluate_candidate(candidate_ctx, {"session_case": session_case})
                 if not agent_eval.get("accepted"):

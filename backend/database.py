@@ -294,12 +294,16 @@ def initialize() -> None:
 
 
 def seed_demo_portfolio(db: sqlite3.Connection, user_id: int) -> None:
+    stamp = now_iso()
+    if getattr(db, "is_postgres", False):
+        db.execute("UPDATE portfolios SET starting_capital=?, cash=?, realised_pnl=0, updated_at=? WHERE user_id=?", (DEFAULT_CAPITAL, DEFAULT_CAPITAL, stamp, user_id))
+        db.commit()
+        return
     holdings = [
         ("RELIANCE", "Reliance Industries", 12, 2948.20), ("HDFCBANK", "HDFC Bank", 18, 1682.10),
         ("INFY", "Infosys", 20, 1487.65), ("LT", "Larsen & Toubro", 8, 3584.50),
         ("SUNPHARMA", "Sun Pharma", 15, 1496.40), ("MARUTI", "Maruti Suzuki", 2, 12340.00),
     ]
-    stamp = now_iso()
     invested = 0.0
     for symbol, name, qty, price in holdings:
         db.execute("INSERT OR IGNORE INTO holdings(user_id,symbol,name,quantity,average_price,opened_at) VALUES(?,?,?,?,?,?)", (user_id, symbol, name, qty, price, stamp))

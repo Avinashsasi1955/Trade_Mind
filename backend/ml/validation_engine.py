@@ -48,7 +48,24 @@ def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:
         best_ask=depth.get("best_ask")
         reference=Decimal(str(best_ask if side=="BUY" else best_bid)) if (best_ask if side=="BUY" else best_bid) is not None else decision_price
         fill=(reference+tick) if side=="BUY" else (reference-tick)
-        segment="FUTURES" if instrument["instrument_type"]=="FUT" else "OPTIONS" if instrument["instrument_type"] in {"CE","PE"} else "EQUITY_INTRADAY"
+        trade_mode = "INTRADAY"
+        reasoning_chain_json = None
+        chart_sl = None
+        chart_tp = None
+        allow_strategy_risk = False
+        if strategy_note:
+            try:
+                note=json.loads(strategy_note) if str(strategy_note).strip().startswith("{") else {}
+                trade_mode = str(note.get("trade_mode") or "INTRADAY").upper()
+                if note.get("reasoning_chain"):
+                    reasoning_chain_json = json.dumps(note.get("reasoning_chain"), default=str)
+                chart_sl=note.get("strategy_stop_loss")
+                chart_tp=note.get("strategy_take_profit")
+                risk_price_basis=str(note.get("risk_price_basis") or "").lower()
+                allow_strategy_risk = instrument["instrument_type"] not in {"CE","PE"} or risk_price_basis=="instrument"
+            except Exception:
+                pass
+        segment="FUTURES" if instrument["instrument_type"]=="FUT" else "OPTIONS" if instrument["instrument_type"] in {"CE","PE"} else ("EQUITY_DELIVERY" if trade_mode=="SWING" else "EQUITY_INTRADAY")
         costs=estimate_zerodha_costs(segment,side,fill,int(quantity),"NSE" if instrument["exchange"] in {"NSE","NFO"} else "BSE")
         signal_date=signal_at.date()
         verified=(instrument["instrument_type"] in {"FUT","CE","PE"} and instrument["is_active"]
@@ -57,28 +74,14 @@ def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:
         tp_pct=OPTION_TAKE_PROFIT_PCT if instrument["instrument_type"] in {"CE","PE"} else TAKE_PROFIT_PCT
         stop_loss=(fill*(Decimal("1")-sl_pct)) if side=="BUY" else (fill*(Decimal("1")+sl_pct))
         take_profit=(fill*(Decimal("1")+tp_pct)) if side=="BUY" else (fill*(Decimal("1")-tp_pct))
-        trade_mode = "INTRADAY"
-        reasoning_chain_json = None
-        if strategy_note:
-            try:
-                note=json.loads(strategy_note) if str(strategy_note).strip().startswith("{") else {}
-                trade_mode = note.get("trade_mode", "INTRADAY")
-                if note.get("reasoning_chain"):
-                    reasoning_chain_json = json.dumps(note.get("reasoning_chain"), default=str)
-                chart_sl=note.get("strategy_stop_loss")
-                chart_tp=note.get("strategy_take_profit")
-                risk_price_basis=str(note.get("risk_price_basis") or "").lower()
-                allow_strategy_risk = instrument["instrument_type"] not in {"CE","PE"} or risk_price_basis=="instrument"
-                if allow_strategy_risk and chart_sl not in (None,""):
-                    candidate_sl=Decimal(str(chart_sl))
-                    if (side=="BUY" and candidate_sl<fill) or (side=="SELL" and candidate_sl>fill):
-                        stop_loss=candidate_sl
-                if allow_strategy_risk and chart_tp not in (None,""):
-                    candidate_tp=Decimal(str(chart_tp))
-                    if (side=="BUY" and candidate_tp>fill) or (side=="SELL" and candidate_tp<fill):
-                        take_profit=candidate_tp
-            except Exception:
-                pass
+        if allow_strategy_risk and chart_sl not in (None,""):
+            candidate_sl=Decimal(str(chart_sl))
+            if (side=="BUY" and candidate_sl<fill) or (side=="SELL" and candidate_sl>fill):
+                stop_loss=candidate_sl
+        if allow_strategy_risk and chart_tp not in (None,""):
+            candidate_tp=Decimal(str(chart_tp))
+            if (side=="BUY" and candidate_tp>fill) or (side=="SELL" and candidate_tp<fill):
+                take_profit=candidate_tp
         fill_source="DEPTH_SNAPSHOT" if depth else "DECISION_PRICE_FALLBACK"
         inserted=connection.execute(text("""INSERT INTO shadow_execution_audits(model_version,instrument_id,signal_at,side,quantity,signal_probability,decision_price,
             best_bid,best_ask,bid_quantity,ask_quantity,theoretical_fill_price,one_tick_penalty,estimated_fees,cost_reconciled,
@@ -177,7 +180,9 @@ def record_shadow_exit(engine,audit_id:int,exit_price:Decimal,exit_reason: str =
         row=connection.execute(text("""SELECT a.*,i.exchange,i.instrument_type,i.symbol FROM shadow_execution_audits a
             JOIN instrument_master i ON i.id=a.instrument_id WHERE a.id=:id AND a.audit_status='RECONCILED' FOR UPDATE"""),{"id":audit_id}).mappings().one()
         entry=Decimal(row["theoretical_fill_price"]); quantity=int(row["quantity"]); side=row["side"]
-        exit_side="SELL" if side=="BUY" else "BUY"; segment="FUTURES" if row["instrument_type"]=="FUT" else "OPTIONS" if row["instrument_type"] in {"CE","PE"} else "EQUITY_INTRADAY"
+        exit_side="SELL" if side=="BUY" else "BUY"
+        trade_mode = str(row.get("trade_mode") or "INTRADAY").upper()
+        segment="FUTURES" if row["instrument_type"]=="FUT" else "OPTIONS" if row["instrument_type"] in {"CE","PE"} else ("EQUITY_DELIVERY" if trade_mode=="SWING" else "EQUITY_INTRADAY")
         exit_costs=estimate_zerodha_costs(segment,exit_side,exit_price,quantity,"NSE" if row["exchange"] in {"NSE","NFO"} else "BSE")
         gross=(exit_price-entry)*quantity if side=="BUY" else (entry-exit_price)*quantity
         net=gross-Decimal(row["estimated_fees"])-exit_costs.total
