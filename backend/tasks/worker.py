@@ -132,12 +132,17 @@ celery_app.conf.beat_schedule = {
         "task": "backend.tasks.worker.run_live_paper_inference",
         "schedule": crontab(minute="*", hour="9-15", day_of_week="1-5"),
     },
+    "continuous-high-frequency-position-defense": {
+        "task": "backend.tasks.worker.run_position_defense_loop",
+        "schedule": 5.0,
+    },
 }
 
 _engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=2, future=True)
 _redis = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=5)
 _finbert = None
 _live_inference = None
+_position_manager = None
 IST = ZoneInfo("Asia/Kolkata")
 
 
@@ -346,6 +351,25 @@ def run_live_paper_inference(self) -> Dict:
         return infer_result
     finally:
         _release_lock("live-paper-inference",lock)
+
+
+@celery_app.task(bind=True, name="backend.tasks.worker.run_position_defense_loop", max_retries=1)
+def run_position_defense_loop(self) -> Dict:
+    """High-frequency position defense loop: cuts adverse moves, tightens stagnation stops, and locks profits."""
+    global _position_manager
+    lock = _acquire_lock("position-defense", 8)
+    if not lock:
+        return {"status": "skipped", "reason": "another worker holds position-defense lock"}
+    try:
+        if _position_manager is None:
+            from backend.position_manager import PositionManager
+            _position_manager = PositionManager(DATABASE_URL, REDIS_URL)
+        return _position_manager.run_once()
+    except Exception as exc:
+        logger.error("Position defense evaluation error: %s", exc, exc_info=True)
+        return {"status": "error", "error": str(exc)}
+    finally:
+        _release_lock("position-defense", lock)
 
 
 def _acquire_lock(name: str, ttl: int) -> str:

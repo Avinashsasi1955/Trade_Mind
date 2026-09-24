@@ -31,7 +31,16 @@ FEATURES_V1 = ("return_1d","return_5d","sma20_gap","sma50_gap","volatility_20d",
 FEATURES_V2 = FEATURES_V1 + ("return_20d","relative_strength_20d","market_return_1d","market_return_20d",
                             "market_breadth","market_volatility_20d","gap_pct","close_location",
                             "volume_trend","downside_volatility_20d","atr_regime")
-FEATURE_SETS = {"daily_v1": FEATURES_V1, "daily_v2": FEATURES_V2}
+FEATURES_INTRADAY = (
+    "return_1d","vwap_distance_bps","rvol_time_of_day","adx_14","ema_9_21_slope",
+    "candle_spread_vs_atr","sector_relative_return","tick_aggressor_ratio",
+    "rsi_14","atr_14","volume_z20","range_pct","downside_volatility_20d"
+)
+FEATURE_SETS = {
+    "daily_v1": FEATURES_V1,
+    "daily_v2": FEATURES_V2,
+    "intraday_micro_v1": FEATURES_INTRADAY
+}
 DEFAULT_FEATURE_SET = "daily_v2"
 FEATURES = FEATURES_V2
 _ESTIMATOR_CACHE = {}
@@ -219,6 +228,30 @@ def feature_rows(exchange: str, symbol: str, bars: List[Dict], horizon: int = 10
                 "atr_regime":sum(value<=atr for value in current_trs)/max(1,len(current_trs))-.5,
             })
             label,future=_triple_barrier(bars,i,atr,horizon)
+        elif feature_set == "intraday_micro_v1":
+            downside=[min(0,value) for value in returns]
+            cum_vol = sum(volumes[max(0, i-20):i+1])
+            cum_pv = sum(closes[j] * volumes[j] for j in range(max(0, i-20), i+1))
+            vwap = (cum_pv / cum_vol) if cum_vol > 0 else c
+            vwap_dist = (c - vwap) / max(vwap, 1e-9) * 10000.0
+            rvol = volumes[i] / max(1.0, mean_volume)
+            dx = abs(closes[i] - closes[i-1]) / max(atr * c, 1e-9) * 100.0
+            ema9 = sum(closes[i-8:i+1]) / 9.0 if i >= 8 else c
+            ema21 = mean20
+            slope = (ema9 - ema21) / max(atr * c, 1e-9)
+            spread_ratio = (float(bars[i]["high"]) - float(bars[i]["low"])) / max(atr * c, 1e-9)
+            sec_ret = float(context.get("sector_return", 0.0))
+            values.update({
+                "vwap_distance_bps": round(vwap_dist, 2),
+                "rvol_time_of_day": round(rvol, 3),
+                "adx_14": round(min(100.0, dx), 2),
+                "ema_9_21_slope": round(slope, 4),
+                "candle_spread_vs_atr": round(spread_ratio, 3),
+                "sector_relative_return": round((closes[i]/closes[i-1]-1) - sec_ret, 5),
+                "tick_aggressor_ratio": 0.5 if closes[i] >= float(bars[i]["open"]) else -0.5,
+                "downside_volatility_20d": _raw_std(downside),
+            })
+            label,future=_triple_barrier(bars,i,atr,min(horizon, 6),barrier_multiple=1.2)
         else:
             label=1 if future is not None and future>.003 else 0 if future is not None and future<-.003 else None
         digest=hashlib.sha256(json.dumps({"bar":bars[i],"features":values},sort_keys=True).encode()).hexdigest()
@@ -341,12 +374,14 @@ def _fit_hgb(samples: List[Dict], features: Tuple[str,...], variant: str = "cons
     from sklearn.ensemble import HistGradientBoostingClassifier
     x=np.asarray([[float(row["features"][feature]) for feature in features] for row in samples],dtype=np.float64)
     y=np.asarray([int(row["label"]) for row in samples],dtype=np.int8)
-    params={"loss":"log_loss","random_state":42,"early_stopping":False,"class_weight":"balanced"}
+    # Asymmetric Loss Weights: penalize false-positive buy errors 2.5x more than missed moves
+    sample_weights = np.where(y == 1, 1.0, 2.5)
+    params={"loss":"log_loss","random_state":42,"early_stopping":False}
     if variant == "conservative":
         params.update({"learning_rate":.05,"max_iter":140,"max_leaf_nodes":15,"min_samples_leaf":80,"l2_regularization":3.0,"max_features":.8})
     else:
         params.update({"learning_rate":.04,"max_iter":180,"max_leaf_nodes":31,"min_samples_leaf":50,"l2_regularization":5.0,"max_features":.7})
-    estimator=HistGradientBoostingClassifier(**params).fit(x,y)
+    estimator=HistGradientBoostingClassifier(**params).fit(x,y,sample_weight=sample_weights)
     encoded=base64.b64encode(pickle.dumps(estimator,protocol=pickle.HIGHEST_PROTOCOL)).decode("ascii")
     signature=hmac.new(MODEL_ARTIFACT_KEY.encode(),encoded.encode(),hashlib.sha256).hexdigest()
     return {"algorithm":f"hist_gradient_boosting_{variant}","features":list(features),"estimator_b64":encoded,"estimator_hmac":signature,
@@ -443,9 +478,17 @@ def predict(model: Dict, features: Dict) -> float:
 
 def _with_isotonic_calibration(model: Dict, calibration_samples: List[Dict]) -> Dict:
     probabilities=[_raw_predict(model,row["features"]) for row in calibration_samples]
+    labels=[int(row["label"]) for row in calibration_samples]
     calibrated=dict(model)
     try:
-        calibrated["calibration"]=fit_isotonic(probabilities,[int(row["label"]) for row in calibration_samples])
+        iso_cal=fit_isotonic(probabilities,labels)
+        from .ml.calibration import calibration_metrics
+        raw_m = calibration_metrics(labels, probabilities)
+        iso_m = calibration_metrics(labels, [apply_calibration(p, iso_cal) for p in probabilities])
+        if (iso_m.get("log_loss") or 999) < (raw_m.get("log_loss") or 999):
+            calibrated["calibration"]=iso_cal
+        else:
+            calibrated["calibration"]={"method":"identity","samples":len(calibration_samples),"reason":"raw_lower_loss"}
     except ValueError as exc:
         calibrated["calibration"]={"method":"identity","samples":len(calibration_samples),"reason":str(exc)}
     return calibrated
@@ -535,7 +578,7 @@ def train_model(store: Optional[ResearchStore] = None, feature_set: str = DEFAUL
              "selection_comparison":comparison,"untouched_final":True,"purge_sessions":purge,
              "development_period":[dates[0],dates[calibration_start-1]],"calibration_period":[dates[calibration_start],dates[selection_start-1]],"selection_period":[dates[selection_start],dates[final_start-1]],"final_period":[dates[final_start],dates[-1]]}
     stamp=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"); version=f"direction-v2.6-{stamp}"
-    payload={**model,"reference":_reference(refit,features),"decision_threshold":.55,"live_eligible":False,
+    payload={**model,"reference":_reference(refit,features),"decision_threshold":.70,"live_eligible":False,
              "selection_comparison":comparison,"untouched_final":True,"trading_policy":policy_manifest()}
     with store.connect() as db:
         db.execute("UPDATE model_versions SET status='rejected' WHERE status='candidate'")

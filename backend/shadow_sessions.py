@@ -277,7 +277,8 @@ def evaluate_session(engine,session_date: date = None) -> Dict:
 
             COUNT(DISTINCT bar_time) FILTER(WHERE interval='1minute') all_one_minute_buckets,
             COUNT(DISTINCT bar_time) FILTER(WHERE interval='5minute') all_five_minute_buckets,
-            COUNT(DISTINCT instrument_id) all_instruments_seen
+            COUNT(DISTINCT instrument_id) all_instruments_seen,
+            COUNT(*) FILTER(WHERE open_interest IS NOT NULL AND source = ANY(:live_sources)) oi_observations
             FROM live_market_bars
             WHERE bar_time >= :start_dt AND bar_time < :end_dt"""),
             {"live_sources":list(LIVE_SOURCES),"repair_sources":list(REPAIR_SOURCES),"start_dt":start_dt,"end_dt":end_dt}).mappings().one()
@@ -285,9 +286,7 @@ def evaluate_session(engine,session_date: date = None) -> Dict:
             WHERE ((timestamp AT TIME ZONE 'Asia/Kolkata')::date=:day OR (created_at AT TIME ZONE 'Asia/Kolkata')::date=:day)"""),{"day":day}).scalar_one()
         vix=connection.execute(text("SELECT COUNT(*) FROM india_vix_history WHERE (observed_at AT TIME ZONE 'Asia/Kolkata')::date=:day"),{"day":day}).scalar_one()
         news=connection.execute(text("SELECT COUNT(*) FROM news_articles_v3 WHERE (published_at AT TIME ZONE 'Asia/Kolkata')::date=:day"),{"day":day}).scalar_one()
-        oi=connection.execute(text("""SELECT COUNT(*) FROM live_market_bars
-            WHERE open_interest IS NOT NULL AND source = ANY(:sources) AND (bar_time AT TIME ZONE 'Asia/Kolkata')::date=:day"""),
-            {"sources":list(LIVE_SOURCES),"day":day}).scalar_one()
+        oi=int(bars_agg.get("oi_observations") or 0)
         gaps=connection.execute(text("""SELECT
             COUNT(*) FILTER(WHERE status='OPEN') open_gaps,
             COUNT(*) FILTER(WHERE status='RECOVERED') recovered_gaps,
@@ -298,7 +297,7 @@ def evaluate_session(engine,session_date: date = None) -> Dict:
             WHERE (detected_at AT TIME ZONE 'Asia/Kolkata')::date=:day
             ORDER BY detected_at DESC LIMIT 8"""),{"day":day}).mappings().all()
         errors=connection.execute(text("""SELECT COUNT(*) FROM monitoring_events
-            WHERE level IN ('ERROR','CRITICAL') AND (created_at AT TIME ZONE 'Asia/Kolkata')::date=:day"""),{"day":day}).scalar_one()
+            WHERE level IN ('ERROR','CRITICAL') AND created_at >= :start_dt AND created_at < :end_dt"""),{"start_dt":start_dt,"end_dt":end_dt}).scalar_one()
     pnl=paper_pnl_summary(engine,day)
     metrics={**dict(bars_agg),
              "predictions":int(predictions or 0),"vix_observations":int(vix or 0),
@@ -604,7 +603,12 @@ def status(engine) -> Dict:
     should_recover = _last_recovery_at is None or (today_dt - _last_recovery_at).total_seconds() >= 300
     if should_recover:
         try:
-            recover_stale_started_sessions(engine, lookback_days=10)
+            with engine.connect() as connection:
+                stale_dates = [r[0] for r in connection.execute(text(
+                    "SELECT session_date FROM forward_shadow_sessions WHERE status='STARTED' AND session_date < :d"
+                ), {"d": today_date}).fetchall()]
+            for s_date in stale_dates:
+                materialize_session(engine, s_date)
             _last_recovery_at = today_dt
         except Exception as exc:
             _monitor(engine, "shadow_session_status", "WARNING",

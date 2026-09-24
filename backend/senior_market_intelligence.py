@@ -162,7 +162,7 @@ def _candidate_row(item: Dict, accepted_ids: set) -> Dict:
     quality = _safe_float((item.get("_entry_quality") or {}).get("score"))
     if not quality:
         quality = min(100.0, max(0.0, _safe_float((chart.get("structure") or {}).get("confidence")) * 0.55 + scan["confidence"] * 0.45))
-    score = scan["confidence"] + min(12, abs(probability - 0.5) * 100) + min(10, _safe_float(chart.get("rr")) * 2)
+    score = min(100.0, max(0.0, scan["confidence"] + min(12, abs(probability - 0.5) * 100) + min(10, _safe_float(chart.get("rr")) * 2)))
     return {
         "symbol": item.get("symbol"),
         "exchange": item.get("exchange"),

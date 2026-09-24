@@ -276,13 +276,25 @@ def shadow_trade_book(limit: int = 200) -> Dict:
     if not DATABASE_URL:
         return {"open": [], "closed": [], "daily": [], "summary": empty_summary, "today": empty_summary,
                  "market_date": datetime.now(IST).date().isoformat(), "orders_allowed": False}
+    
+    r_client = _get_redis()
+    cache_key = f"nivesh:cache:shadow_trade_book:{limit}"
+    if r_client:
+        try:
+            cached = r_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass
+
     engine = _get_engine()
-    with engine.connect() as connection:
-        # Query 1: fetch the shadow audit rows with strategy attribution
-        rows=connection.execute(text("""SELECT a.id,a.instrument_id,a.model_version,a.signal_at,a.side,a.quantity,a.signal_probability,a.decision_price,
-                   a.theoretical_fill_price,a.estimated_fees,a.realised_exit_price,a.net_pnl,a.audit_status,
-                   a.rejection_reason,a.stop_loss_price,a.take_profit_price,a.exit_at,a.exit_reason,a.fill_source,
-                   a.mistake_tags,a.improvement_note,
+    try:
+        with engine.connect() as connection:
+            # Query 1: fetch the shadow audit rows with strategy attribution
+            rows=connection.execute(text("""SELECT a.id,a.instrument_id,a.model_version,a.signal_at,a.side,a.quantity,a.signal_probability,a.decision_price,
+                    a.theoretical_fill_price,a.estimated_fees,a.realised_exit_price,a.net_pnl,a.audit_status,
+                    a.rejection_reason,a.stop_loss_price,a.take_profit_price,a.exit_at,a.exit_reason,a.fill_source,
+                    a.mistake_tags,a.improvement_note,
                    COALESCE(a.trade_mode, 'INTRADAY') trade_mode, a.reasoning_chain, COALESCE(a.holding_days, 0) holding_days,
                    COALESCE(
                        NULLIF(NULLIF(NULLIF(atr.strategy, 'UNKNOWN_STRATEGY'), 'UNKNOWN'), 'NO_TRADE'),
@@ -310,34 +322,56 @@ def shadow_trade_book(limit: int = 200) -> Dict:
             ORDER BY a.signal_at DESC
             LIMIT :limit"""),{"limit":max(1,min(int(limit),500))}).mappings().all()
 
-        # Query 2: batch-fetch latest price for ALL needed instrument_ids in ONE query
-        # DISTINCT ON is O(instruments_seen) not O(limit) — eliminates the N+1 pattern
-        instrument_ids = list({int(r["instrument_id"]) for r in rows if r["net_pnl"] is None})
-        latest_price_map: dict = {}
-        if instrument_ids:
-            price_rows = connection.execute(text("""SELECT DISTINCT ON (instrument_id)
-                    instrument_id, close_price
-                FROM live_market_bars
-                WHERE instrument_id = ANY(:ids)
-                  AND interval IN ('1minute','5minute','day')
-                ORDER BY instrument_id, bar_time DESC"""),
-                {"ids": instrument_ids}).fetchall()
-            latest_price_map = {int(r[0]): float(r[1]) for r in price_rows if r[1] is not None}
+            # Query 2: batch-fetch latest price for ALL needed instrument_ids in ONE query
+            # DISTINCT ON is O(instruments_seen) not O(limit) — eliminates the N+1 pattern
+            instrument_ids = list({int(r["instrument_id"]) for r in rows if r["net_pnl"] is None})
+            latest_price_map: dict = {}
+            if instrument_ids:
+                price_rows = connection.execute(text("""SELECT DISTINCT ON (instrument_id)
+                        instrument_id, close_price
+                    FROM live_market_bars
+                    WHERE instrument_id = ANY(:ids)
+                      AND interval IN ('1minute','5minute','day')
+                    ORDER BY instrument_id, bar_time DESC"""),
+                    {"ids": instrument_ids}).fetchall()
+                latest_price_map = {int(r[0]): float(r[1]) for r in price_rows if r[1] is not None}
+            if r_client:
+                try:
+                    live_pos_raw = r_client.get("nivesh:positions:live")
+                    if live_pos_raw:
+                        pos_data = json.loads(live_pos_raw)
+                        for p in pos_data.get("positions", []):
+                            for r in rows:
+                                if r.get("id") == p.get("id") and p.get("latest_price"):
+                                    latest_price_map[int(r["instrument_id"])] = float(p["latest_price"])
+                except Exception:
+                    pass
 
-        daily_rows=connection.execute(text("""SELECT
-            (signal_at AT TIME ZONE 'Asia/Kolkata')::date session_date,
-            COUNT(*) trades,
-            COUNT(*) FILTER(WHERE audit_status='RECONCILED' AND net_pnl IS NULL) open_trades,
-            COUNT(*) FILTER(WHERE net_pnl IS NOT NULL) closed_trades,
-            COUNT(*) FILTER(WHERE net_pnl > 0) winning_trades,
-            COUNT(*) FILTER(WHERE net_pnl <= 0) losing_trades,
-            COALESCE(SUM(net_pnl),0) realised_pnl,
-            COALESCE(SUM(estimated_fees),0) estimated_fees
-            FROM shadow_execution_audits
-            WHERE audit_status='RECONCILED'
-            GROUP BY session_date
-            ORDER BY session_date DESC
-            LIMIT 20""")).mappings().all()
+            daily_rows=connection.execute(text("""SELECT
+                (signal_at AT TIME ZONE 'Asia/Kolkata')::date session_date,
+                COUNT(*) trades,
+                COUNT(*) FILTER(WHERE audit_status='RECONCILED' AND net_pnl IS NULL) open_trades,
+                COUNT(*) FILTER(WHERE net_pnl IS NOT NULL) closed_trades,
+                COUNT(*) FILTER(WHERE net_pnl > 0) winning_trades,
+                COUNT(*) FILTER(WHERE net_pnl <= 0) losing_trades,
+                COALESCE(SUM(net_pnl),0) realised_pnl,
+                COALESCE(SUM(estimated_fees),0) estimated_fees
+                FROM shadow_execution_audits
+                WHERE audit_status='RECONCILED'
+                GROUP BY session_date
+                ORDER BY session_date DESC
+                LIMIT 20""")).mappings().all()
+    except Exception as db_exc:
+        print(f"[nivesh] Error reading shadow trade book: {db_exc}")
+        if r_client:
+            try:
+                cached_fallback = r_client.get(f"nivesh:cache:shadow_trade_book:{limit}:last_good")
+                if cached_fallback:
+                    return json.loads(cached_fallback)
+            except Exception:
+                pass
+        return {"open": [], "closed": [], "daily": [], "summary": empty_summary, "today": empty_summary,
+                "market_date": datetime.now(IST).date().isoformat(), "orders_allowed": False}
     items=[]
     for row in rows:
         entry=_float(row["theoretical_fill_price"] or row["decision_price"])
@@ -425,13 +459,20 @@ def shadow_trade_book(limit: int = 200) -> Dict:
     closed_items=[item for item in items if not item["is_open"]]
     market_date=datetime.now(IST).date()
     today_items=[item for item in items if item.get("signal_at") and item["signal_at"].astimezone(IST).date()==market_date]
-    return {"open":open_items,"closed":closed_items,
+    result = {"open":open_items,"closed":closed_items,
             "summary":summarise(items),
             "today":summarise(today_items),
             "market_date":market_date.isoformat(),
             "daily":[dict(row) for row in daily_rows],
             "orders_allowed":False,
             "basis":"shadow_execution_audits only; legacy demo portfolio tables excluded"}
+    if r_client:
+        try:
+            r_client.set(cache_key, json.dumps(result, default=str), ex=2)
+            r_client.set(f"{cache_key}:last_good", json.dumps(result, default=str), ex=3600)
+        except Exception:
+            pass
+    return result
 
 
 def _latest_shadow_price(connection, audit_id: int) -> Decimal:
@@ -1261,6 +1302,15 @@ def bot_conversation(db: sqlite3.Connection, user_id: int, conversation_id: int)
 
 
 def production_status(db: sqlite3.Connection, user_id: int) -> Dict:
+    r_client = _get_redis()
+    cache_key = f"nivesh:cache:production_status:{user_id}"
+    if r_client:
+        try:
+            cached = r_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass
     data = operations_status(db, user_id)
     if DATABASE_URL:
         engine = _get_engine()
@@ -1491,6 +1541,12 @@ def production_status(db: sqlite3.Connection, user_id: int) -> Dict:
         data["alpha_fragility"] = alpha_fragility_status(None)
     data["brain_pipeline_status"] = _brain_pipeline_status()
     data["operations_copilot"] = _build_operations_copilot(data)
+    if r_client:
+        try:
+            r_client.set(cache_key, json.dumps(data, default=str), ex=3)
+            r_client.set(f"{cache_key}:last_good", json.dumps(data, default=str), ex=3600)
+        except Exception:
+            pass
     return data
 
 
@@ -1963,6 +2019,7 @@ def update_risk_policy(db:sqlite3.Connection,user_id:int,data:Dict)->Dict:
         after=risk_policy(db,user_id)
         changed={key:{"old":before.get(key),"new":after.get(key)} for key in after if before.get(key)!=after.get(key) and key!="updated_at"}
         if changed:
+            from backend.monitoring import record_event
             record_event(db,"risk_parameter_change","INFO","risk policy parameters updated",user_id,
                          {"changed":changed,"orders_allowed":False,"source":"operator_api"})
             return after

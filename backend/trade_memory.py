@@ -208,6 +208,9 @@ def auto_ingest_winning_trade(trade_record: Dict, engine=None) -> Optional[Dict]
             "target_rr": round(max(1.8, rr), 2),
             "notes": f"Auto-learned from closed paper trade #{trade_record.get('id', '')} via {exit_reason} (+₹{pnl:,.2f})"
         }
+        if not any(p.get("pattern_name") == pattern["pattern_name"] for p in DEFAULT_GOLDEN_PATTERNS):
+            DEFAULT_GOLDEN_PATTERNS.append(pattern)
+            save_golden_patterns_to_disk()
         logger.info(f"Auto-ingested Golden Trade Pattern: {pattern['pattern_name']} (+₹{pnl:,.2f})")
         return pattern
     except Exception as exc:
@@ -403,5 +406,42 @@ def find_matching_golden_trade(candidate: Dict) -> Dict:
         "is_fast_path": is_fast_path,
         "confidence_boost": 15.0 if is_fast_path else (8.0 if is_golden_match else 0.0),
         "recommended_target_rr": best_match.get("target_rr", 2.2),
-        "notes": best_match["notes"]
+        "notes": best_match["notes"],
+        "matched_strategy": best_match.get("conditions", {}).get("strategy")
     }
+
+
+def autonomous_strategy_decider(candidate: Dict) -> Dict:
+    """Autonomous Strategy Decider: When a live candidate matches a stored winning pattern
+    with >= 92% similarity AND 100% discrete rule match, locks that strategy and optimal R:R directly."""
+    match = find_matching_golden_trade(candidate)
+    similarity = float(match.get("similarity_pct", 0.0))
+    cand_side = str(candidate.get("side") or candidate.get("option_side") or "BUY").upper()
+
+    condition_matches = (
+        similarity >= 92.0 and
+        match.get("matched_side") == cand_side and
+        float(match.get("historical_pnl", 0.0)) >= 100.0
+    )
+
+    if condition_matches:
+        strategy_assigned = match.get("matched_strategy") or match.get("matched_pattern")
+        return {
+            "decided": True,
+            "strategy": strategy_assigned,
+            "target_rr": float(match.get("recommended_target_rr", 2.4)),
+            "confidence_boost": 20.0,
+            "fast_path_allowed": True,
+            "reason": f"100% condition signature match with historical winner '{match.get('matched_pattern')}' (similarity {similarity:.1f}%)",
+            "match": match,
+        }
+    return {
+        "decided": False,
+        "strategy": None,
+        "target_rr": 2.0,
+        "confidence_boost": float(match.get("confidence_boost", 0.0)),
+        "fast_path_allowed": bool(match.get("is_fast_path", False)),
+        "reason": f"Standard ML evaluation (similarity {similarity:.1f}% < 92%)",
+        "match": match,
+    }
+

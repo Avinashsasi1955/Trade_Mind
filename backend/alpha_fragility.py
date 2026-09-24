@@ -162,9 +162,9 @@ def alpha_fragility_status(database_url: str | None, *, limit: int = 80) -> Dict
                 SELECT tag reason, COUNT(*) count
                 FROM (
                     SELECT UNNEST(ARRAY[
-                        CASE WHEN COALESCE(strategy_note,'') ILIKE '%stale_signal_loss%' THEN 'stale_signal_loss' END,
-                        CASE WHEN COALESCE(strategy_note,'') ILIKE '%fallback_fill%' THEN 'fallback_fill' END,
-                        CASE WHEN COALESCE(strategy_note,'') ILIKE '%cost_drag%' THEN 'cost_drag' END,
+                        CASE WHEN COALESCE(improvement_note,'') ILIKE '%stale_signal_loss%' THEN 'stale_signal_loss' END,
+                        CASE WHEN COALESCE(improvement_note,'') ILIKE '%fallback_fill%' THEN 'fallback_fill' END,
+                        CASE WHEN COALESCE(improvement_note,'') ILIKE '%cost_drag%' THEN 'cost_drag' END,
                         CASE WHEN exit_reason='STOP_LOSS' THEN 'stop_loss_hit' END,
                         CASE WHEN COALESCE(exit_reason,'') ILIKE '%TIME%' THEN 'late_time_exit' END
                     ]) AS tag
@@ -180,7 +180,7 @@ def alpha_fragility_status(database_url: str | None, *, limit: int = 80) -> Dict
             recent_trades = connection.execute(text("""
                 SELECT a.signal_at, i.symbol, i.instrument_type, a.side, a.signal_probability,
                        a.decision_price, a.theoretical_fill_price, a.net_pnl, a.exit_reason,
-                       a.strategy_note
+                       a.improvement_note AS strategy_note
                 FROM shadow_execution_audits a
                 JOIN instrument_master i ON i.id=a.instrument_id
                 WHERE (a.signal_at AT TIME ZONE 'Asia/Kolkata')::date=CURRENT_DATE

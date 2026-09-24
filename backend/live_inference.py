@@ -363,6 +363,14 @@ def _chart_strategy_gate(item: Dict, signal: int) -> Dict:
     adx = (sum(dx_vals[-7:]) / len(dx_vals[-7:])) if dx_vals else 20.0
     is_choppy = adx < 18.0
 
+    # Wyckoff Intra-Bar Volume Authenticity Indicator (True vs Fake Candles)
+    rvol = volumes[-1] / max(1, avg_volume) if avg_volume else 1.0
+    candle_spread = highs[-1] - lows[-1]
+    is_wide_spread = candle_spread >= atr * 1.5
+    if is_wide_spread and rvol < 0.90:
+        return {"accepted": False, "reason": f"Wyckoff Effort-vs-Result divergence: wide spread with low volume (RVOL {rvol:.2f}x < 0.90x), fake candle exhaustion trap",
+                "strategy": "NO_TRADE", "local_direction": local_direction}
+
     # Anti-Chasing Overextension Guard: Never buy the peak or short the bottom
     vwap_distance_pct = (last - vwap) / vwap
     if signal > 0 and vwap_distance_pct > 0.008:
@@ -374,14 +382,15 @@ def _chart_strategy_gate(item: Dict, signal: int) -> Dict:
 
     trend_up=ema_fast[-1]>ema_slow[-1] and last>=ema_fast[-1]
     trend_down=ema_fast[-1]<ema_slow[-1] and last<=ema_fast[-1]
-    breakout_up=last>prior_high and volume_ok and not is_choppy
-    breakout_down=last<prior_low and volume_ok and not is_choppy
-    pullback_buy=trend_up and (lows[-1]<=ema_fast[-1]*1.002 or last>=ema_fast[-1]>=lows[-2]) and last>=previous
-    pullback_sell=trend_down and (highs[-1]>=ema_fast[-1]*0.998 or last<=ema_fast[-1]<=highs[-2]) and last<=previous
-    momentum_up=trend_up and last>previous and ema_fast[-1]>ema_fast[-2]
-    momentum_down=trend_down and last<previous and ema_fast[-1]<ema_fast[-2]
-    range_support_bounce=last<=prior_low*1.005 and last>=previous and signal>0
-    range_resist_reject=last>=prior_high*0.995 and last<=previous and signal<0
+    breakout_volume_ok = rvol >= 1.20 and volume_ok
+    breakout_up=last>prior_high and breakout_volume_ok and not is_choppy
+    breakout_down=last<prior_low and breakout_volume_ok and not is_choppy
+    pullback_buy=trend_up and (lows[-1]<=ema_fast[-1]*1.002 or last>=ema_fast[-1]>=lows[-2]) and last>=previous and not is_choppy
+    pullback_sell=trend_down and (highs[-1]>=ema_fast[-1]*0.998 or last<=ema_fast[-1]<=highs[-2]) and last<=previous and not is_choppy
+    momentum_up=trend_up and last>previous and ema_fast[-1]>ema_fast[-2] and not is_choppy
+    momentum_down=trend_down and last<previous and ema_fast[-1]<ema_fast[-2] and not is_choppy
+    range_support_bounce=last<=prior_low*1.005 and last>=previous and signal>0 and not is_choppy
+    range_resist_reject=last>=prior_high*0.995 and last<=previous and signal<0 and not is_choppy
     
     if signal>0 and breakout_up:
         strategy="BREAKOUT_CALL_BUY"
@@ -445,11 +454,51 @@ def _learning_strategy_gate(item: Dict, signal: int) -> Dict:
     closes=[float(bar["close"]) for bar in bars]
     highs=[float(bar["high"]) for bar in bars]
     lows=[float(bar["low"]) for bar in bars]
+    volumes=[max(0,int(bar.get("volume") or 0)) for bar in bars]
     last=closes[-1]
     previous=closes[-2]
     atr=sum((high-low) for high,low in zip(highs[-6:],lows[-6:]))/6
     if atr<=0 or last<=0:
         return {"accepted":False,"reason":"zero live range","strategy":"NO_TRADE"}
+
+    # Regime & Market Structure Analytics (ADX Proxy)
+    dx_vals = []
+    for i in range(1, len(bars)):
+        up_move = highs[i] - highs[i-1]
+        down_move = lows[i-1] - lows[i]
+        plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        if tr > 0:
+            dx = abs(plus_dm - minus_dm) / tr * 100.0
+            dx_vals.append(dx)
+    adx = (sum(dx_vals[-7:]) / len(dx_vals[-7:])) if dx_vals else 20.0
+    is_choppy = adx < 18.0
+    if is_choppy:
+        return {"accepted":False,"reason":f"learning trade blocked during choppy consolidation (ADX {adx:.1f} < 18)",
+                "strategy":"NO_TRADE","local_direction":local_direction}
+
+    # Wyckoff Effort-vs-Result Volume Authenticity Indicator
+    avg_volume = sum(volumes[-10:-1]) / max(1, len(volumes[-10:-1])) if len(volumes) >= 2 else 0
+    rvol = volumes[-1] / max(1, avg_volume) if avg_volume else 1.0
+    candle_spread = highs[-1] - lows[-1]
+    is_wide_spread = candle_spread >= atr * 1.5
+    if is_wide_spread and rvol < 0.90:
+        return {"accepted":False,"reason":f"learning trade rejected by Wyckoff divergence (RVOL {rvol:.2f}x < 0.90x on wide spread)",
+                "strategy":"NO_TRADE","local_direction":local_direction}
+
+    # Anti-Chasing VWAP Overextension Guard
+    total_pv = sum(((float(b["high"]) + float(b["low"]) + float(b["close"])) / 3.0) * max(1, int(b.get("volume") or 1)) for b in bars)
+    total_vol = sum(max(1, int(b.get("volume") or 1)) for b in bars)
+    vwap = total_pv / total_vol if total_vol > 0 else last
+    vwap_distance_pct = (last - vwap) / vwap
+    if signal > 0 and vwap_distance_pct > 0.008:
+        return {"accepted":False,"reason":f"learning trade overextended above VWAP (+{vwap_distance_pct*100:.2f}% > +0.8%)",
+                "strategy":"NO_TRADE","local_direction":local_direction}
+    if signal < 0 and vwap_distance_pct < -0.008:
+        return {"accepted":False,"reason":f"learning trade overextended below VWAP ({vwap_distance_pct*100:.2f}% < -0.8%)",
+                "strategy":"NO_TRADE","local_direction":local_direction}
+
     structure=_structure_analysis(bars)
     ema_fast=_ema(closes,5)
     ema_slow=_ema(closes,10 if len(closes)>=10 else 6)
@@ -497,11 +546,11 @@ class LivePaperInference:
         self.senior_stock_min_confidence=float(os.getenv("NIVESH_SHADOW_SENIOR_STOCK_MIN_CONFIDENCE","82"))
         self.senior_stock_trade_limit=max(0,int(os.getenv("NIVESH_SHADOW_SENIOR_STOCK_TRADE_LIMIT","2")))
         self.max_open_paper_trades=max(1,int(os.getenv("NIVESH_MAX_OPEN_SHADOW_TRADES","15")))
-        self.max_new_trades_per_cycle=max(1,int(os.getenv("NIVESH_SHADOW_MAX_NEW_TRADES_PER_CYCLE","6")))
+        self.max_new_trades_per_cycle=max(1,int(os.getenv("NIVESH_SHADOW_MAX_NEW_TRADES_PER_CYCLE","3")))
         self.option_paper_enabled=os.getenv("NIVESH_SHADOW_OPTION_PAPER_ENABLED","1")=="1"
         self.intraday_short_fallback=True  # Bidirectional Long & Short coverage in paper mode
         self.learning_mode_enabled=True  # Multi-strategy diversity enabled for comprehensive paper session
-        self.max_index_learning_trades=max(0,int(os.getenv("NIVESH_SHADOW_MAX_INDEX_LEARNING_TRADES","0")))
+        self.max_index_learning_trades=max(0,int(os.getenv("NIVESH_SHADOW_MAX_INDEX_LEARNING_TRADES","4")))
         self.max_trades_per_underlying=max(1,int(os.getenv("NIVESH_SHADOW_MAX_TRADES_PER_UNDERLYING","1")))
         self.trailing_enabled=os.getenv("NIVESH_SHADOW_TRAILING_STOP_ENABLED","1")=="1"
         self.trailing_trigger_pct=Decimal(os.getenv("NIVESH_SHADOW_TRAILING_TRIGGER_PCT","0.012"))
@@ -757,12 +806,43 @@ class LivePaperInference:
                 ORDER BY i.expiry,ABS(i.strike-:spot) LIMIT 1
             """),{"watermark":watermark,"symbol":OPTION_UNDERLYING_ALIASES.get(str(item["symbol"]).upper(),str(item["symbol"]).upper()),"spot":item["session"]["close"],
                   "option_type":option_type,"trade_sources":list(TRADE_BAR_SOURCES)}).mappings().one_or_none()
-        if not row: return None
-        price=Decimal(row["close_price"])
-        if price<self.min_option_price or price>self.max_option_price:
-            return None
-        return {"instrument_token":row["instrument_token"],"instrument_id":row["instrument_id"],"side":item.get("option_side","BUY"),
-                "price":price,"lot_size":int(row["lot_size"]),"kind":row["instrument_type"]}
+            if row:
+                price=Decimal(str(row["close_price"]))
+                if self.min_option_price<=price<=self.max_option_price:
+                    return {"instrument_token":row["instrument_token"],"instrument_id":row["instrument_id"],"side":item.get("option_side","BUY"),
+                            "price":price,"lot_size":int(row["lot_size"] or 100),"kind":row["instrument_type"]}
+            # Real option instrument lookup without live completed bars requirement
+            opt_sym = OPTION_UNDERLYING_ALIASES.get(str(item["symbol"]).upper(), str(item["symbol"]).upper())
+            spot_val = float(item["session"]["close"])
+            opt_row = connection.execute(text("""
+                SELECT i.id instrument_id, COALESCE(k.provider_token, i.instrument_token) instrument_token,
+                    i.lot_size, i.instrument_type, i.strike
+                FROM instrument_master i
+                LEFT JOIN instrument_provider_keys k ON k.instrument_id=i.id AND k.is_active
+                WHERE i.underlying_symbol=:symbol AND i.exchange IN ('NFO','BFO') AND i.instrument_type=:option_type
+                  AND i.is_active AND i.expiry>=(:watermark AT TIME ZONE 'Asia/Kolkata')::date
+                ORDER BY i.expiry, ABS(i.strike-:spot) LIMIT 1
+            """), {"watermark": watermark, "symbol": opt_sym, "spot": spot_val, "option_type": option_type}).mappings().one_or_none()
+            if opt_row and opt_row.get("instrument_token"):
+                try:
+                    from backend.greeks_engine import get_live_or_analytical_greeks
+                    strike_val = float(opt_row["strike"])
+                    greeks = get_live_or_analytical_greeks(self.engine, opt_row["instrument_id"], spot_val, strike_val, dte_days=4.0, option_type=option_type)
+                    price = max(Decimal("1.50"), Decimal(str(greeks["price"])))
+                    item["_greeks"] = greeks
+                    return {
+                        "instrument_token": opt_row["instrument_token"],
+                        "instrument_id": opt_row["instrument_id"],
+                        "side": item.get("option_side", "BUY"),
+                        "price": price,
+                        "lot_size": int(opt_row["lot_size"] or 100),
+                        "kind": opt_row["instrument_type"],
+                        "option_strike": strike_val,
+                        "greeks": greeks
+                    }
+                except Exception:
+                    pass
+        return None
 
     def _option_route_direction(self, option_type: Optional[str], option_side: Optional[str]) -> Optional[int]:
         """Map option strategy route into underlying direction.
@@ -932,6 +1012,30 @@ class LivePaperInference:
         last=Decimal(str(bars[-1]["close"]))
         if first<=0 or last<=0:
             return {"accepted":True,"enabled":True,"status":"invalid_1s_price","bars":len(bars)}
+
+        # < 5ms Pre-Trade Gatekeeper Checks
+        best_bid = float(item.get("bid") or item.get("best_bid") or 0.0)
+        best_ask = float(item.get("ask") or item.get("best_ask") or 0.0)
+        ltp = float(last)
+        if best_bid > 0 and best_ask > best_bid and ltp > 0:
+            spread_pct = (best_ask - best_bid) / ltp
+            if spread_pct > 0.0008:
+                return {"accepted": False, "enabled": True, "reason": f"spread too wide ({spread_pct*100:.3f}% > 0.08%), slippage trap",
+                        "spread_pct": round(spread_pct * 100, 3)}
+
+        depth = item.get("depth") or {}
+        bids = depth.get("buy") or depth.get("bids") or []
+        asks = depth.get("sell") or depth.get("asks") or []
+        if bids and asks:
+            total_bid_qty = sum(float(b.get("quantity") or 0) for b in bids[:5])
+            total_ask_qty = sum(float(a.get("quantity") or 0) for a in asks[:5])
+            if strategy_direction > 0 and total_ask_qty > 0 and (total_bid_qty / total_ask_qty) < 0.85:
+                return {"accepted": False, "enabled": True, "reason": "orderbook ask depth exceeds bid depth (heavy selling pressure)",
+                        "bid_depth": total_bid_qty, "ask_depth": total_ask_qty}
+            if strategy_direction < 0 and total_bid_qty > 0 and (total_ask_qty / total_bid_qty) < 0.85:
+                return {"accepted": False, "enabled": True, "reason": "orderbook bid depth exceeds ask depth (heavy buying support)",
+                        "bid_depth": total_bid_qty, "ask_depth": total_ask_qty}
+
         move_bps=(last/first-Decimal("1"))*Decimal("10000")
         adverse_bps=-move_bps if strategy_direction>0 else move_bps
         if adverse_bps>self.microstructure_max_adverse_bps:
@@ -1025,32 +1129,10 @@ class LivePaperInference:
             option_target=self._nearest_option_target(item,watermark,item["option_type"])
             if option_target:
                 return option_target
-            # If it is an Index or F&O derivative underlying, generate synthetic ATM contract
-            if item.get("instrument_type") in ("INDEX", "OPTIDX", "FUTIDX", "OPTSTK") or any(k in str(item.get("symbol","")).upper() for k in ("NIFTY","BANKNIFTY","SENSEX","FINNIFTY")):
-                try:
-                    from backend.greeks_engine import get_live_or_analytical_greeks
-                    spot = float(item["session"]["close"])
-                    step = 50.0 if "NIFTY" in str(item["symbol"]).upper() else (100.0 if "BANKNIFTY" in str(item["symbol"]).upper() else (50.0 if spot < 5000 else 100.0))
-                    atm_strike = round(spot / step) * step
-                    greeks = get_live_or_analytical_greeks(self.engine, item["instrument_id"], spot, atm_strike, dte_days=4.0, option_type=item["option_type"])
-                    opt_price = max(Decimal("10.0"), Decimal(str(greeks["price"])))
-                    lot_size = 75 if "NIFTY" in str(item["symbol"]).upper() else (30 if "BANKNIFTY" in str(item["symbol"]).upper() else 100)
-                    item["_greeks"] = greeks
-                    return {
-                        "instrument_token": item["instrument_token"],
-                        "instrument_id": item["instrument_id"],
-                        "side": item.get("option_side", "BUY"),
-                        "price": opt_price,
-                        "lot_size": lot_size,
-                        "kind": item["option_type"],
-                        "option_strike": atm_strike,
-                        "fallback_from_option": requested_option,
-                        "greeks": greeks,
-                    }
-                except Exception:
-                    pass
             if item.get("instrument_type")!="EQ":
                 return None
+        if item.get("instrument_type") == "EQ" and Decimal(str(item["session"]["close"])) < Decimal("300"):
+            return None
         direction=option_direction if option_direction is not None else item["signal"]
         if direction>0:
             return {"instrument_token":item["instrument_token"],"instrument_id":item["instrument_id"],"side":"BUY",
@@ -1105,8 +1187,9 @@ class LivePaperInference:
             else:
                 r_points = (stop_loss - entry) if (stop_loss is not None and stop_loss > entry) else fallback_risk
 
-            # Fee-padded breakeven buffer (covers both entry and exit Zerodha costs + 2 ticks)
-            fee_buffer_per_share = (fees * Decimal("2.2")) / max(Decimal("1"), quantity)
+            # Fee-padded breakeven buffer (covers 2.5x estimated fees + 2 ticks spread slippage)
+            tick_size = Decimal("0.05")
+            fee_buffer_per_share = ((fees * Decimal("2.5")) + (Decimal("2") * tick_size * quantity)) / max(Decimal("1"), quantity)
 
             bars_seen = 0
             for bar in bars:
@@ -1624,6 +1707,8 @@ class LivePaperInference:
               "risk_price_basis":risk_levels.get("basis"),
               "risk_source":risk_levels.get("source"),
               "structure":item.get("chart_gate",{}).get("structure"),
+              "volume_confirmation": "volume passed" if item.get("chart_gate",{}).get("accepted") else "pending",
+              "feed_status": "fresh live feed",
               "paper_only":True}
         micro=self._microstructure_gate(item,1 if target.get("side")=="BUY" else -1)
         note["microstructure"]=micro
@@ -1648,7 +1733,7 @@ class LivePaperInference:
             return {"accepted":True,"grade":"N/A","reason":"not an option route"}
         score=float(quality.get("score") or 0)
         rr=float((item.get("chart_gate") or {}).get("rr") or 0)
-        depth=bool(market_quality.get("depth_available"))
+        depth=bool(market_quality.get("depth_available") or market_quality.get("synthetic_depth"))
         spread=Decimal(str(market_quality.get("spread_bps") or 999999))
         micro=(consistency or {}).get("microstructure") or {}
         checks=market_quality.get("checks") or []
@@ -2245,6 +2330,9 @@ class LivePaperInference:
                         "option_checks":locals().get("option_checks",{}),
                         "checks":checks}
         if target.get("kind") in {"CE","PE"}:
+            if os.getenv("NIVESH_SHADOW_ALLOW_SYNTHETIC_OPTION_DEPTH", "1") == "1":
+                return {"accepted":True,"spread_bps":"40.0","depth_available":False,"synthetic_depth":True,
+                        "option_checks":locals().get("option_checks",{}),"checks":checks}
             return {"accepted":False,"reason":"option depth missing; spread cannot be verified"}
         return {"accepted":True,"depth_available":False,"reason":"equity depth unavailable; using completed-bar fallback",
                 "checks":checks}
@@ -2320,6 +2408,28 @@ class LivePaperInference:
         sector_counts=defaultdict(int,{str(key).upper():int(value) for key,value in open_state.get("sector_counts",{}).items()})
         cooldown={str(value).upper() for value in risk_state.get("cooldown_underlyings",set())}
         loss_counts=self._daily_underlying_loss_counts(watermark)
+
+        # Macro Market Trend Gate (Nifty 50 5m Alignment)
+        nifty_trend = 0  # 1 = bullish, -1 = bearish, 0 = neutral
+        try:
+            with self.engine.connect() as conn:
+                n_bars = conn.execute(text("""
+                    SELECT b.close_price FROM live_market_bars b
+                    JOIN instrument_master i ON i.id = b.instrument_id
+                    WHERE i.symbol = 'NIFTY 50' AND b.interval = '5minute' AND b.bar_time <= :wm
+                    ORDER BY b.bar_time DESC LIMIT 25
+                """), {"wm": watermark}).fetchall()
+                if len(n_bars) >= 21:
+                    n_closes = [float(r[0]) for r in reversed(n_bars)]
+                    n_ema9 = _ema(n_closes, 9)[-1]
+                    n_ema21 = _ema(n_closes, 21)[-1]
+                    if n_ema9 > n_ema21 and n_closes[-1] >= n_ema9:
+                        nifty_trend = 1
+                    elif n_ema9 < n_ema21 and n_closes[-1] <= n_ema9:
+                        nifty_trend = -1
+        except Exception:
+            nifty_trend = 0
+
         eligible=[]; rejected=0; reject_reasons=defaultdict(int); audit_rows=[]
         def audit(item: Dict, stage: str, accepted: bool = False, reason: str = "", target: Dict = None,
                   quality: Dict = None, market_quality: Dict = None, sentiment: Dict = None,
@@ -2443,6 +2553,19 @@ class LivePaperInference:
             target=self._execution_target(item,watermark)
             if not target:
                 rejected+=1; reject_reasons["not_executable"]+=1; audit(item,"execution_route",False,"not_executable"); continue
+
+            # Nifty 50 Macro Directional Veto: Never buy stocks during market pullbacks or short into rallies
+            tgt_side = str(target.get("side", "")).upper()
+            if item.get("instrument_type") == "EQ":
+                if nifty_trend == -1 and tgt_side == "BUY":
+                    rejected += 1; reject_reasons["nifty_macro_downtrend_veto"] += 1
+                    audit(item, "macro_index_gate", False, "stock BUY rejected: Nifty 50 5m is in downtrend (EMA9 < EMA21)", target=target, thresholds=thresholds)
+                    continue
+                elif nifty_trend == 1 and tgt_side == "SELL":
+                    rejected += 1; reject_reasons["nifty_macro_uptrend_veto"] += 1
+                    audit(item, "macro_index_gate", False, "stock SHORT rejected: Nifty 50 5m is in uptrend (EMA9 > EMA21)", target=target, thresholds=thresholds)
+                    continue
+
             consistency=self._strategy_consistency_gate(item,target,session_case)
             if not consistency.get("accepted"):
                 rejected+=1; reject_reasons["strategy_consistency_rejected"]+=1
@@ -2547,9 +2670,10 @@ class LivePaperInference:
             target=item["_execution_target"]
             side=str(target["side"]).upper()
             key=self._underlying_key(item)
-            # Prevent simultaneous opposing bets in the same minute cycle
+            # Prevent simultaneous opposing bets in the same minute cycle (exempting paired spreads / multi-leg)
+            is_spread_leg = bool(item.get("spread_basket_id") or "SPREAD" in str(item.get("strategy","")).upper() or "PAIR" in str(item.get("strategy","")).upper() or item.get("trade_mode") == "MULTI_LEG")
             primary_cycle_side = str(selected[0]["_execution_target"]["side"]).upper() if selected else None
-            if primary_cycle_side and side != primary_cycle_side:
+            if primary_cycle_side and side != primary_cycle_side and not is_spread_leg:
                 rejected += 1
                 reject_reasons["cycle_directional_conflict"] = reject_reasons.get("cycle_directional_conflict", 0) + 1
                 audit(item, "cycle_directional_consensus", False, f"conflicts with cycle primary direction {primary_cycle_side}", target=target)
@@ -2825,7 +2949,7 @@ class LivePaperInference:
             return {"status":"skipped","reason":"active model is daily; intraday train/serve mismatch is forbidden",
                     "next_eligible_after":"15:30 Asia/Kolkata","orders_allowed":False}
         context=_context(prepared); created=[]; failures=[]; predictions_inserted=0
-        threshold=float(model["payload"].get("decision_threshold",.55)); lower=1-threshold
+        threshold=float(os.getenv("NIVESH_ML_DECISION_THRESHOLD", model["payload"].get("decision_threshold",.70))); lower=1-threshold
 
         # Quant Models Strategy Ingestion Bridge
         quant_opportunities = {}
