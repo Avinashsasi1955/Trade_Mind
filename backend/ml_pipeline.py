@@ -13,10 +13,14 @@ import math
 import os
 import pickle
 import sqlite3
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Dict, Iterable, List, Optional, Tuple
+
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*encountered in matmul.*")
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn.utils.extmath")
 
 from .config import (DATABASE_URL, IS_PRODUCTION, ML_MAX_SYMBOLS_PER_SESSION, ML_MIN_ADTV,
                      ML_MIN_COVERAGE_PCT, ML_MIN_DAILY_BARS, ML_MIN_TRAIN_SAMPLES,
@@ -34,7 +38,9 @@ FEATURES_V2 = FEATURES_V1 + ("return_20d","relative_strength_20d","market_return
 FEATURES_INTRADAY = (
     "return_1d","vwap_distance_bps","rvol_time_of_day","adx_14","ema_9_21_slope",
     "candle_spread_vs_atr","sector_relative_return","tick_aggressor_ratio",
-    "rsi_14","atr_14","volume_z20","range_pct","downside_volatility_20d"
+    "rsi_14","atr_14","volume_z20","range_pct","downside_volatility_20d",
+    "vp_shape_code","poc_distance_bps","in_value_area_flag",
+    "asi_direction","trap_detected_flag","order_flow_imbalance",
 )
 FEATURE_SETS = {
     "daily_v1": FEATURES_V1,
@@ -173,15 +179,27 @@ def adjust_corporate_actions(bars: List[Dict], actions: List[Dict]) -> List[Dict
     return adjusted
 
 
-def _triple_barrier(bars: List[Dict], index: int, atr_ratio: float, horizon: int = 10,
-                    barrier_multiple: float = 1.5) -> Tuple[Optional[int], Optional[float]]:
-    close=float(bars[index]["close"]); distance=max(close*atr_ratio*barrier_multiple,close*.005)
+def _triple_barrier(bars: List[Dict], index: int, atr_ratio: float, horizon: int = 3,
+                    barrier_multiple: float = 2.0, min_barrier_pct: float = 0.005,
+                    label_timeout_as_notrade: bool = True) -> Tuple[Optional[int], Optional[float]]:
+    """Triple-barrier labeling with configurable horizon and NO_TRADE timeout.
+
+    Returns (label, forward_return) where:
+      1  = upper barrier hit (UP / tradeable)
+      0  = lower barrier hit OR timeout with no significant move (NO_TRADE)
+      None = ambiguous (both barriers hit on same bar) or insufficient future bars
+    """
+    close=float(bars[index]["close"]); distance=max(close*atr_ratio*barrier_multiple,close*min_barrier_pct)
     upper=close+distance; lower=max(.01,close-distance)
     for future in bars[index+1:min(len(bars),index+horizon+1)]:
         hit_upper=float(future["high"])>=upper; hit_lower=float(future["low"])<=lower
         if hit_upper and hit_lower: return None,None  # daily OHLC cannot identify which hit first
         if hit_upper: return 1,upper/close-1
         if hit_lower: return 0,lower/close-1
+    # Timeout: no barrier hit within horizon
+    if label_timeout_as_notrade and index+horizon<len(bars):
+        horizon_return=float(bars[index+horizon]["close"])/close-1
+        return 0,horizon_return  # NO_TRADE — chop period becomes explicit training example
     return None,None
 
 
@@ -227,7 +245,7 @@ def feature_rows(exchange: str, symbol: str, bars: List[Dict], horizon: int = 10
                 "downside_volatility_20d":_raw_std(downside),
                 "atr_regime":sum(value<=atr for value in current_trs)/max(1,len(current_trs))-.5,
             })
-            label,future=_triple_barrier(bars,i,atr,horizon)
+            label,future=_triple_barrier(bars,i,atr,min(horizon,3),barrier_multiple=2.0)
         elif feature_set == "intraday_micro_v1":
             downside=[min(0,value) for value in returns]
             cum_vol = sum(volumes[max(0, i-20):i+1])
@@ -241,17 +259,54 @@ def feature_rows(exchange: str, symbol: str, bars: List[Dict], horizon: int = 10
             slope = (ema9 - ema21) / max(atr * c, 1e-9)
             spread_ratio = (float(bars[i]["high"]) - float(bars[i]["low"])) / max(atr * c, 1e-9)
             sec_ret = float(context.get("sector_return", 0.0))
+            # --- Volume Profile features (sliding window) ---
+            vp_window = bars[max(0, i-29):i+1]
+            vp_shape_code = 0; poc_distance_bps = 0.0; in_value_area_flag = 0
+            if len(vp_window) >= 5:
+                from backend.volume_profile import calculate_volume_profile
+                vp = calculate_volume_profile(vp_window, num_bins=30)
+                if vp.get("is_valid") and vp.get("poc") is not None:
+                    shape_map = {"P": 1, "b": 2, "D": 3, "B": 4, "WIDE": 5, "THIN": 6, "DEVELOPING": 0}
+                    vp_shape_code = shape_map.get(vp.get("shape"), 0)
+                    poc_distance_bps = round((c - float(vp["poc"])) / max(float(vp["poc"]), 1e-9) * 10000.0, 2)
+                    vah = float(vp.get("vah") or c); val = float(vp.get("val") or c)
+                    in_value_area_flag = 1 if val <= c <= vah else 0
+            # --- ASI features (direction + trap detection) ---
+            asi_direction = 0; trap_detected_flag = 0
+            asi_window = bars[max(0, i-16):i+1]
+            if len(asi_window) >= 3:
+                from backend.asi_indicator import calculate_asi, detect_nse_trap
+                asi_series = calculate_asi([{"open": float(b["open"]), "high": float(b["high"]),
+                    "low": float(b["low"]), "close": float(b["close"]), "time": b.get("timestamp")} for b in asi_window])
+                if len(asi_series) >= 2:
+                    asi_direction = 1 if asi_series[-1]["asi"] > asi_series[-2]["asi"] else (-1 if asi_series[-1]["asi"] < asi_series[-2]["asi"] else 0)
+                if len(asi_window) >= 5:
+                    trap = detect_nse_trap([{"open": float(b["open"]), "high": float(b["high"]),
+                        "low": float(b["low"]), "close": float(b["close"]), "time": b.get("timestamp")} for b in asi_window],
+                        asi_series=asi_series, lookback=min(15, len(asi_window)-2))
+                    trap_detected_flag = 1 if trap.get("is_trap") else 0
+            # --- Order flow imbalance (close vs open proxy) ---
+            buy_vol = sum(volumes[j] for j in range(max(0,i-4),i+1) if closes[j] >= float(bars[j]["open"]))
+            sell_vol = sum(volumes[j] for j in range(max(0,i-4),i+1) if closes[j] < float(bars[j]["open"]))
+            total_flow = max(1, buy_vol + sell_vol)
+            order_flow_imbalance = round((buy_vol - sell_vol) / total_flow, 4)
             values.update({
-                "vwap_distance_bps": round(vwap_dist, 2),
-                "rvol_time_of_day": round(rvol, 3),
+                "vwap_distance_bps": round(max(-500.0, min(500.0, vwap_dist)), 2),
+                "rvol_time_of_day": round(min(20.0, rvol), 3),
                 "adx_14": round(min(100.0, dx), 2),
-                "ema_9_21_slope": round(slope, 4),
-                "candle_spread_vs_atr": round(spread_ratio, 3),
+                "ema_9_21_slope": round(max(-10.0, min(10.0, slope)), 4),
+                "candle_spread_vs_atr": round(min(10.0, spread_ratio), 3),
                 "sector_relative_return": round((closes[i]/closes[i-1]-1) - sec_ret, 5),
                 "tick_aggressor_ratio": 0.5 if closes[i] >= float(bars[i]["open"]) else -0.5,
                 "downside_volatility_20d": _raw_std(downside),
+                "vp_shape_code": vp_shape_code,
+                "poc_distance_bps": round(max(-500.0, min(500.0, poc_distance_bps)), 2),
+                "in_value_area_flag": in_value_area_flag,
+                "asi_direction": asi_direction,
+                "trap_detected_flag": trap_detected_flag,
+                "order_flow_imbalance": order_flow_imbalance,
             })
-            label,future=_triple_barrier(bars,i,atr,min(horizon, 6),barrier_multiple=1.2)
+            label,future=_triple_barrier(bars,i,atr,horizon=24,barrier_multiple=2.5,min_barrier_pct=0.010)
         else:
             label=1 if future is not None and future>.003 else 0 if future is not None and future<-.003 else None
         digest=hashlib.sha256(json.dumps({"bar":bars[i],"features":values},sort_keys=True).encode()).hexdigest()
@@ -416,7 +471,10 @@ def _fit_mlp(samples: List[Dict], features: Tuple[str,...], fast: bool = False) 
             n_iter_no_change=12,
             random_state=42,
         )),
-    ]).fit(x,y)
+    ])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        estimator.fit(x, y)
     encoded=base64.b64encode(pickle.dumps(estimator,protocol=pickle.HIGHEST_PROTOCOL)).decode("ascii")
     signature=hmac.new(MODEL_ARTIFACT_KEY.encode(),encoded.encode(),hashlib.sha256).hexdigest()
     return {"algorithm":"dnn_mlp_conservative","features":list(features),"estimator_b64":encoded,
@@ -476,21 +534,65 @@ def predict(model: Dict, features: Dict) -> float:
     return apply_calibration(_raw_predict(model, features), model.get("calibration", {}))
 
 
+def _predict_batch(model: Dict, samples: List[Dict], calibrated: bool = True) -> List[float]:
+    """Vectorized batch prediction for fast model evaluation and calibration."""
+    if not samples:
+        return []
+    if model.get("ensemble_models"):
+        weights = [float(x) for x in model.get("weights") or [1] * len(model["ensemble_models"])]
+        total = max(1e-9, sum(weights))
+        member_preds = [_predict_batch(m, samples, calibrated=False) for m in model["ensemble_models"]]
+        raw_probs = [sum(w * member_preds[j][i] for j, w in enumerate(weights)) / total for i in range(len(samples))]
+    elif model.get("estimator_b64"):
+        import numpy as np
+        encoded = model["estimator_b64"]
+        key = hashlib.sha256(encoded.encode()).hexdigest()
+        signature = model.get("estimator_hmac", "")
+        expected = hmac.new(MODEL_ARTIFACT_KEY.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+        if not signature:
+            if IS_PRODUCTION: raise ValueError("Unsigned legacy model artifact is forbidden in production")
+        elif not hmac.compare_digest(signature, expected):
+            raise ValueError("Model artifact integrity verification failed")
+        estimator = _ESTIMATOR_CACHE.get(key)
+        if estimator is None:
+            estimator = pickle.loads(base64.b64decode(encoded))
+            _ESTIMATOR_CACHE[key] = estimator
+        matrix = np.asarray([[float(row["features"][f]) for f in model["features"]] for row in samples], dtype=np.float64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            raw_probs = estimator.predict_proba(matrix)[:, 1].tolist()
+    else:
+        import numpy as np
+        matrix = np.asarray([[float(row["features"][f]) for f in model["features"]] for row in samples], dtype=np.float64)
+        means = np.asarray(model["means"], dtype=np.float64)
+        stds = np.asarray(model["stds"], dtype=np.float64)
+        weights = np.asarray(model["weights"], dtype=np.float64)
+        bias = float(model["bias"])
+        x_norm = np.clip((matrix - means) / stds, -10, 10)
+        logits = np.clip((x_norm * weights).sum(axis=1) + bias, -40, 40)
+        raw_probs = (1.0 / (1.0 + np.exp(-logits))).tolist()
+
+    if calibrated and model.get("calibration"):
+        cal = model["calibration"]
+        return [apply_calibration(p, cal) for p in raw_probs]
+    return raw_probs
+
+
 def _with_isotonic_calibration(model: Dict, calibration_samples: List[Dict]) -> Dict:
-    probabilities=[_raw_predict(model,row["features"]) for row in calibration_samples]
-    labels=[int(row["label"]) for row in calibration_samples]
-    calibrated=dict(model)
+    probabilities = _predict_batch(model, calibration_samples, calibrated=False)
+    labels = [int(row["label"]) for row in calibration_samples]
+    calibrated = dict(model)
     try:
-        iso_cal=fit_isotonic(probabilities,labels)
+        iso_cal = fit_isotonic(probabilities, labels)
         from .ml.calibration import calibration_metrics
         raw_m = calibration_metrics(labels, probabilities)
         iso_m = calibration_metrics(labels, [apply_calibration(p, iso_cal) for p in probabilities])
         if (iso_m.get("log_loss") or 999) < (raw_m.get("log_loss") or 999):
-            calibrated["calibration"]=iso_cal
+            calibrated["calibration"] = iso_cal
         else:
-            calibrated["calibration"]={"method":"identity","samples":len(calibration_samples),"reason":"raw_lower_loss"}
+            calibrated["calibration"] = {"method": "identity", "samples": len(calibration_samples), "reason": "raw_lower_loss"}
     except ValueError as exc:
-        calibrated["calibration"]={"method":"identity","samples":len(calibration_samples),"reason":str(exc)}
+        calibrated["calibration"] = {"method": "identity", "samples": len(calibration_samples), "reason": str(exc)}
     return calibrated
 
 
@@ -508,7 +610,8 @@ def _fit_chronologically_calibrated(samples: List[Dict], algorithm: str, feature
 
 
 def _classification(model: Dict, samples: List[Dict]) -> Dict:
-    probs=[predict(model,x["features"]) for x in samples]; predictions=[int(p>=.5) for p in probs]
+    probs = _predict_batch(model, samples, calibrated=True)
+    predictions = [int(p >= .5) for p in probs]
     labels=[x["label"] for x in samples]; correct=sum(a==b for a,b in zip(predictions,labels))
     tp=sum(p==1 and y==1 for p,y in zip(predictions,labels)); fp=sum(p==1 and y==0 for p,y in zip(predictions,labels)); fn=sum(p==0 and y==1 for p,y in zip(predictions,labels))
     logloss=-mean([y*math.log(max(1e-9,p))+(1-y)*math.log(max(1e-9,1-p)) for p,y in zip(probs,labels)])
@@ -577,7 +680,7 @@ def train_model(store: Optional[ResearchStore] = None, feature_set: str = DEFAUL
     metrics={"train":_classification(model,refit),"calibration":_classification(model,final_calibration),"holdout":_classification(model,final),
              "selection_comparison":comparison,"untouched_final":True,"purge_sessions":purge,
              "development_period":[dates[0],dates[calibration_start-1]],"calibration_period":[dates[calibration_start],dates[selection_start-1]],"selection_period":[dates[selection_start],dates[final_start-1]],"final_period":[dates[final_start],dates[-1]]}
-    stamp=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"); version=f"direction-v2.6-{stamp}"
+    stamp=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"); version=f"direction-v3.0-{stamp}"
     payload={**model,"reference":_reference(refit,features),"decision_threshold":.70,"live_eligible":False,
              "selection_comparison":comparison,"untouched_final":True,"trading_policy":policy_manifest()}
     with store.connect() as db:

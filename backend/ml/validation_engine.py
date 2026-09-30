@@ -178,7 +178,11 @@ def record_shadow_exit(engine,audit_id:int,exit_price:Decimal,exit_reason: str =
     if exit_price<=0: raise ValueError("Positive exit price required")
     with engine.begin() as connection:
         row=connection.execute(text("""SELECT a.*,i.exchange,i.instrument_type,i.symbol FROM shadow_execution_audits a
-            JOIN instrument_master i ON i.id=a.instrument_id WHERE a.id=:id AND a.audit_status='RECONCILED' FOR UPDATE"""),{"id":audit_id}).mappings().one()
+            JOIN instrument_master i ON i.id=a.instrument_id 
+            WHERE a.id=:id AND a.audit_status='RECONCILED' AND a.net_pnl IS NULL 
+            FOR UPDATE"""),{"id":audit_id}).mappings().one_or_none()
+        if not row:
+            return {"recorded":False,"status":"ALREADY_CLOSED_OR_NOT_FOUND","audit_id":audit_id}
         entry=Decimal(row["theoretical_fill_price"]); quantity=int(row["quantity"]); side=row["side"]
         exit_side="SELL" if side=="BUY" else "BUY"
         trade_mode = str(row.get("trade_mode") or "INTRADAY").upper()
@@ -189,7 +193,7 @@ def record_shadow_exit(engine,audit_id:int,exit_price:Decimal,exit_reason: str =
         mistake=_mistake_tags(row,net,exit_reason)
         connection.execute(text("""UPDATE shadow_execution_audits SET realised_exit_price=:exit,net_pnl=:net,
             exit_at=COALESCE(:exit_at,CURRENT_TIMESTAMP),exit_reason=:reason,mistake_tags=CAST(:tags AS jsonb),improvement_note=:note
-            WHERE id=:id"""),{"exit":exit_price,"net":net,"id":audit_id,"exit_at":exit_at,"reason":exit_reason,
+            WHERE id=:id AND net_pnl IS NULL"""),{"exit":exit_price,"net":net,"id":audit_id,"exit_at":exit_at,"reason":exit_reason,
                               "tags":json.dumps(mistake["tags"]),"note":mistake["note"]})
         publish_brain_event(connection,"ShadowTradeClosed","record_shadow_exit",
                             {"audit_id":audit_id,"instrument_id":int(row["instrument_id"]),"side":side,

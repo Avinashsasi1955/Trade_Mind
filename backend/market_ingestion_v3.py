@@ -8,7 +8,9 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, text
 
+from .candle_sanitizer import BarInvariantValidator, TickSanitizer
 from .zerodha_adapter import ZerodhaAdapter
+
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -75,6 +77,8 @@ class PostgresBarAggregator:
     def __init__(self,database_url: str,source: str="zerodha_kite"):
         self.engine=create_engine(database_url,pool_pre_ping=True,future=True)
         self.states={}; self.tokens={}; self.vix_tokens=set(); self.source=source
+        self.token_types={}
+        self.sanitizer = TickSanitizer()
         self.open_trades_cache={}
         self.last_open_trades_sync=0.0
         self.refresh_tokens()
@@ -88,6 +92,7 @@ class PostgresBarAggregator:
             else:
                 rows=connection.execute(text("SELECT id,instrument_token,exchange,symbol,instrument_type FROM instrument_master WHERE is_active AND instrument_token IS NOT NULL")).fetchall()
         self.tokens={int(row.instrument_token):int(row.id) for row in rows}
+        self.token_types={int(row.instrument_token):str(row.instrument_type or "EQ").upper() for row in rows}
         self.vix_tokens={int(row.instrument_token) for row in rows if row.symbol.replace(" ","").upper() in {"INDIAVIX","VIX"} and row.instrument_type=="INDEX"}
 
     def refresh_open_trades(self, force: bool = False):
@@ -174,6 +179,14 @@ class PostgresBarAggregator:
             observed=self._timestamp(tick)
             if not _is_continuous_market_bar(observed):
                 continue
+
+            # 5-Gate Tick Sanitizer: reject freak jumps, non-positive ticks, or stale timestamps
+            itype = self.token_types.get(token, "EQ")
+            raw_vol = int(tick.get("volume") or 0)
+            is_valid, _rejection = self.sanitizer.validate_tick(instrument, price, observed, raw_vol, itype)
+            if not is_valid:
+                continue
+
             if token in self.vix_tokens: self._save_vix(observed,price)
 
             # Sub-Second Trade Closer check on real-time tick price
@@ -243,11 +256,11 @@ class PostgresBarAggregator:
             for bar in bars:
                 if not _is_continuous_market_bar(bar["bar_time"]):
                     continue
-                volume=max(0,bar["last_volume"]-bar["first_volume"]); oi=bar["last_oi"] or None; oi_change=(bar["last_oi"]-bar["first_oi"]) if oi is not None else None
+                sanitized = BarInvariantValidator.sanitize_bar(bar)
                 connection.execute(text("""
                   INSERT INTO live_market_bars(instrument_id,interval,bar_time,open_price,high_price,low_price,close_price,volume,open_interest,oi_change,source,exchange_timestamp)
                   VALUES(:instrument_id,CAST(:interval AS bar_interval),:bar_time,:open,:high,:low,:close,:volume,:oi,:oi_change,:source,:exchange_timestamp)
                   ON CONFLICT(instrument_id,interval,bar_time) DO UPDATE SET high_price=GREATEST(live_market_bars.high_price,EXCLUDED.high_price),
                   low_price=LEAST(live_market_bars.low_price,EXCLUDED.low_price),close_price=EXCLUDED.close_price,volume=EXCLUDED.volume,
                   open_interest=EXCLUDED.open_interest,oi_change=EXCLUDED.oi_change,source=EXCLUDED.source,exchange_timestamp=EXCLUDED.exchange_timestamp,received_at=CURRENT_TIMESTAMP
-                """),{**bar,"volume":volume,"oi":oi,"oi_change":oi_change,"source":self.source})
+                """),{**sanitized,"source":self.source})

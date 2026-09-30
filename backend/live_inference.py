@@ -26,6 +26,9 @@ from .transaction_costs import estimate_zerodha_costs
 from .trade_quality import score_trade
 from .adaptive_trade_intelligence import sync_adaptive_rewards, trap_assessment
 from .intelligence_memory import publish_brain_event, refresh_intelligence_memory
+from .asi_indicator import detect_nse_trap
+from .pcr_engine import calculate_pcr, get_latest_pcr
+from .volume_profile import calculate_volume_profile, evaluate_volume_profile_verdict
 from .senior_market_intelligence import record_opportunity_scan, update_counterfactuals
 
 
@@ -425,8 +428,37 @@ def _chart_strategy_gate(item: Dict, signal: int) -> Dict:
         risk = max(atr * 1.2, last * .005)
     reward = max(atr * 3.0, last * .012)
     rr = reward / risk if risk else 0
-    if rr < 2.0:
-        return {"accepted": False, "reason": f"risk/reward {rr:.2f} below 2.0", "strategy": strategy}
+    # 1. Welles Wilder's ASI False Breakout / Trap Filter
+    asi_trap = detect_nse_trap(bars)
+    if asi_trap.get("is_trap"):
+        trap_type = asi_trap.get("trap_type")
+        if signal > 0 and trap_type == "BULL_TRAP":
+            return {"accepted": False, "reason": f"trade blocked by ASI Bull Trap detection ({asi_trap.get('reason')})",
+                    "strategy": "NO_TRADE", "trap_details": asi_trap}
+        elif signal < 0 and trap_type == "BEAR_TRAP":
+            return {"accepted": False, "reason": f"trade blocked by ASI Bear Trap detection ({asi_trap.get('reason')})",
+                    "strategy": "NO_TRADE", "trap_details": asi_trap}
+
+    # 2. Adverse Institutional Option Wall (PCR Filter)
+    atm_pcr = float(item.get("atm_pcr", 1.0) or 1.0)
+    if signal > 0 and atm_pcr < 0.50:
+        return {"accepted": False, "reason": f"Long trade blocked by adverse extreme Call writing wall (ATM PCR {atm_pcr:.2f} < 0.50)",
+                "strategy": "NO_TRADE"}
+    if signal < 0 and atm_pcr > 1.50:
+        return {"accepted": False, "reason": f"Short trade blocked by adverse extreme Put writing wall (ATM PCR {atm_pcr:.2f} > 1.50)",
+                "strategy": "NO_TRADE"}
+
+    # 3. Volume Profile Value Area Exhaustion Filter
+    vp_data = calculate_volume_profile(bars)
+    vp_eval = evaluate_volume_profile_verdict(last, signal, vp_data)
+    item["_volume_profile"] = vp_eval
+    if vp_eval.get("verdict") == "CAUTION_VAH_EXTENSION" and rvol < 1.5:
+        return {"accepted": False, "reason": f"Long trade blocked by Volume Profile VAH exhaustion without expansion volume (POC: {vp_data.get('poc')}, VAH: {vp_data.get('vah')})",
+                "strategy": "NO_TRADE", "volume_profile": vp_eval}
+    if vp_eval.get("verdict") == "CAUTION_VAL_EXTENSION" and rvol < 1.5:
+        return {"accepted": False, "reason": f"Short trade blocked by Volume Profile VAL exhaustion without expansion volume (POC: {vp_data.get('poc')}, VAL: {vp_data.get('val')})",
+                "strategy": "NO_TRADE", "volume_profile": vp_eval}
+
     return {"accepted": True, "reason": "fresh live feed, chart structure, BOS/CHoCH, volume and risk/reward passed",
             "strategy": strategy, "option_type": route[0], "side": route[1], "rr": round(rr, 2),
             "signal": signal, "structure": structure, "local_direction": local_direction,
@@ -521,6 +553,27 @@ def _learning_strategy_gate(item: Dict, signal: int) -> Dict:
     if structure.get("accepted") and signal and structure.get("direction") and structure["direction"] != signal:
         return {"accepted": False, "reason": "learning trade rejected because BOS/CHoCH structure conflicts with signal",
                 "strategy": "NO_TRADE", "structure": structure}
+
+    # 1. Welles Wilder's ASI False Breakout / Trap Filter
+    asi_trap = detect_nse_trap(bars)
+    if asi_trap.get("is_trap"):
+        trap_type = asi_trap.get("trap_type")
+        if signal > 0 and trap_type == "BULL_TRAP":
+            return {"accepted": False, "reason": f"learning trade blocked by ASI Bull Trap detection ({asi_trap.get('reason')})",
+                    "strategy": "NO_TRADE", "trap_details": asi_trap}
+        elif signal < 0 and trap_type == "BEAR_TRAP":
+            return {"accepted": False, "reason": f"learning trade blocked by ASI Bear Trap detection ({asi_trap.get('reason')})",
+                    "strategy": "NO_TRADE", "trap_details": asi_trap}
+
+    # 2. Adverse Institutional Option Wall (PCR Filter)
+    atm_pcr = float(item.get("atm_pcr", 1.0) or 1.0)
+    if signal > 0 and atm_pcr < 0.50:
+        return {"accepted": False, "reason": f"learning Long trade blocked by adverse extreme Call writing wall (ATM PCR {atm_pcr:.2f} < 0.50)",
+                "strategy": "NO_TRADE"}
+    if signal < 0 and atm_pcr > 1.50:
+        return {"accepted": False, "reason": f"learning Short trade blocked by adverse extreme Put writing wall (ATM PCR {atm_pcr:.2f} > 1.50)",
+                "strategy": "NO_TRADE"}
+
     return {"accepted": True, "reason": "learning paper trade: live candles, BOS/CHoCH context and non-zero range passed; not promotion evidence",
             "strategy": strategy, "option_type": route[0], "side": route[1], "rr": round(rr, 2),
             "signal": signal, "learning_mode": True, "structure": structure, "local_direction": local_direction,
@@ -549,24 +602,24 @@ class LivePaperInference:
         self.max_new_trades_per_cycle=max(1,int(os.getenv("NIVESH_SHADOW_MAX_NEW_TRADES_PER_CYCLE","3")))
         self.option_paper_enabled=os.getenv("NIVESH_SHADOW_OPTION_PAPER_ENABLED","1")=="1"
         self.intraday_short_fallback=True  # Bidirectional Long & Short coverage in paper mode
-        self.learning_mode_enabled=True  # Multi-strategy diversity enabled for comprehensive paper session
-        self.max_index_learning_trades=max(0,int(os.getenv("NIVESH_SHADOW_MAX_INDEX_LEARNING_TRADES","4")))
+        self.learning_mode_enabled=os.getenv("NIVESH_SHADOW_LEARNING_MODE_ENABLED","0")=="1"
+        self.max_index_learning_trades=max(0,int(os.getenv("NIVESH_SHADOW_MAX_INDEX_LEARNING_TRADES","0")))
         self.max_trades_per_underlying=max(1,int(os.getenv("NIVESH_SHADOW_MAX_TRADES_PER_UNDERLYING","1")))
         self.trailing_enabled=os.getenv("NIVESH_SHADOW_TRAILING_STOP_ENABLED","1")=="1"
         self.trailing_trigger_pct=Decimal(os.getenv("NIVESH_SHADOW_TRAILING_TRIGGER_PCT","0.012"))
         self.trailing_giveback_pct=Decimal(os.getenv("NIVESH_SHADOW_TRAILING_GIVEBACK_PCT","0.004"))
         self.breakeven_trigger_pct=Decimal(os.getenv("NIVESH_SHADOW_BREAKEVEN_TRIGGER_PCT","0.006"))
-        self.max_daily_loss=Decimal(os.getenv("NIVESH_SHADOW_MAX_DAILY_LOSS","3000"))
-        self.hard_kill_daily_loss=Decimal(os.getenv("NIVESH_SHADOW_HARD_KILL_DAILY_LOSS","10000"))
-        self.daily_trade_target=max(1,int(os.getenv("NIVESH_SHADOW_DAILY_TRADE_TARGET","40")))
-        self.max_daily_trades=max(self.daily_trade_target,int(os.getenv("NIVESH_SHADOW_MAX_DAILY_TRADES","40")))
+        self.max_daily_loss=Decimal(os.getenv("NIVESH_SHADOW_MAX_DAILY_LOSS","2000"))
+        self.hard_kill_daily_loss=Decimal(os.getenv("NIVESH_SHADOW_HARD_KILL_DAILY_LOSS","5000"))
+        self.daily_trade_target=max(1,int(os.getenv("NIVESH_SHADOW_DAILY_TRADE_TARGET","5")))
+        self.max_daily_trades=max(self.daily_trade_target,int(os.getenv("NIVESH_SHADOW_MAX_DAILY_TRADES","8")))
         self.session_trade_limit_enabled=os.getenv("NIVESH_SHADOW_SESSION_TRADE_LIMIT_ENABLED","1")=="1"
-        self.session_min_applicable_trades=max(0,int(os.getenv("NIVESH_SHADOW_SESSION_MIN_APPLICABLE_TRADES","10")))
+        self.session_min_applicable_trades=max(0,int(os.getenv("NIVESH_SHADOW_SESSION_MIN_APPLICABLE_TRADES","2")))
         self.session_max_applicable_trades=max(
             self.session_min_applicable_trades,
-            int(os.getenv("NIVESH_SHADOW_SESSION_MAX_APPLICABLE_TRADES","18")),
+            int(os.getenv("NIVESH_SHADOW_SESSION_MAX_APPLICABLE_TRADES","6")),
         )
-        self.max_daily_losses=max(1,int(os.getenv("NIVESH_SHADOW_MAX_DAILY_LOSSES","4")))
+        self.max_daily_losses=max(1,int(os.getenv("NIVESH_SHADOW_MAX_DAILY_LOSSES","2")))
         self.reentry_cooldown_minutes=max(0,int(os.getenv("NIVESH_SHADOW_REENTRY_COOLDOWN_MINUTES","30")))
         self.min_option_price=Decimal(os.getenv("NIVESH_SHADOW_MIN_OPTION_PRICE","20"))
         self.max_option_price=Decimal(os.getenv("NIVESH_SHADOW_MAX_OPTION_PRICE","450"))
@@ -574,7 +627,8 @@ class LivePaperInference:
         self.option_take_profit_pct=Decimal(os.getenv("NIVESH_PAPER_OPTION_TAKE_PROFIT_PCT","0.14"))
         self.max_option_loss_rupees=Decimal(os.getenv("NIVESH_SHADOW_MAX_OPTION_LOSS_RUPEES","375"))
         self.option_stop_to_capture_max_ratio=Decimal(os.getenv("NIVESH_SHADOW_OPTION_STOP_TO_CAPTURE_MAX_RATIO","1.50"))
-        self.active_trade_manager_enabled=os.getenv("NIVESH_SHADOW_ACTIVE_TRADE_MANAGER_ENABLED","1")=="1"
+        self.active_trade_manager_enabled=os.getenv("NIVESH_SHADOW_ACTIVE_TRADE_MANAGER_ENABLED","0")=="1"
+        self.inference_close_due_enabled=os.getenv("NIVESH_INFERENCE_CLOSE_DUE_ENABLED","0")=="1"
         self.manager_breakeven_buffer_pct=Decimal(os.getenv("NIVESH_SHADOW_MANAGER_BREAKEVEN_BUFFER_PCT","0.01"))
         self.manager_atr_stop_multiple=Decimal(os.getenv("NIVESH_SHADOW_MANAGER_ATR_STOP_MULTIPLE","1.6"))
         self.manager_profit_lock_trigger_pct=Decimal(os.getenv("NIVESH_SHADOW_MANAGER_PROFIT_LOCK_TRIGGER_PCT","0.006"))
@@ -1784,6 +1838,16 @@ class LivePaperInference:
         }
         cautions=[]
         blockers=[]
+        vp_eval = item.get("_volume_profile")
+        if not vp_eval and item.get("intraday"):
+            vp_eval = evaluate_volume_profile_verdict(float(target.get("price") or 0), 1 if direction=="bullish" else -1, calculate_volume_profile(item["intraday"]))
+        if vp_eval and vp_eval.get("cautions"):
+            cautions.extend(vp_eval["cautions"])
+        if vp_eval:
+            components["volume_profile_verdict"] = vp_eval.get("verdict")
+            components["poc"] = vp_eval.get("poc")
+            components["vah"] = vp_eval.get("vah")
+            components["val"] = vp_eval.get("val")
         if not structure.get("accepted",False):
             blockers.append("structure not strong enough for promotion-grade evidence")
         if option_grade and not option_grade.get("accepted",True):
@@ -3006,10 +3070,17 @@ class LivePaperInference:
                 item["_instrument_local_direction"]=local_direction
                 item["_model_signal_context"]=model_signal
                 signal=chart_signal
+                sym_upper = str(item.get("symbol", "")).upper()
+                try:
+                    pcr_info = get_latest_pcr(self.engine, sym_upper, float(price))
+                    item["atm_pcr"] = pcr_info.get("atm_pcr", 1.0)
+                    item["pcr_info"] = pcr_info
+                except Exception:
+                    item["atm_pcr"] = 1.0
+
                 chart_gate=_chart_strategy_gate(item,chart_signal)
                 if not chart_gate["accepted"] and self.learning_mode_enabled:
                     chart_gate=_learning_strategy_gate(item,chart_signal)
-                sym_upper = str(item.get("symbol", "")).upper()
                 if sym_upper in quant_opportunities:
                     q_setup = quant_opportunities[sym_upper]
                     item["_quant_strategy"] = q_setup["strategy"]
@@ -3046,8 +3117,8 @@ class LivePaperInference:
             except Exception as exc:
                 failures.append({"exchange":item["exchange"],"symbol":item["symbol"],"error":type(exc).__name__})
         reconciled=reconcile_shadow_costs(self.engine)
-        risk_adjustments=self._manage_open_trade_risk(causal_watermark)
-        closed=self._close_due(causal_watermark)
+        risk_adjustments=self._manage_open_trade_risk(causal_watermark) if self.active_trade_manager_enabled else {"status":"delegated_to_position_manager"}
+        closed=self._close_due(causal_watermark) if self.inference_close_due_enabled else 0
         adaptive_rewards=sync_adaptive_rewards(self.engine,score_trade) if self.adaptive_learning_enabled else {"status":"disabled"}
         audits=0; rejected=0
         policy_enabled=bool(model["payload"].get("trading_policy"))

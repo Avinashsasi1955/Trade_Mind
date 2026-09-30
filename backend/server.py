@@ -18,6 +18,9 @@ from .security import create_token, decode_token, hash_password, password_needs_
 from .service import ai_gateway_status, apply_coach_proposal_service, approve_order_intent, backtest_report, bot_chat, bot_conversation, bot_conversations, brain_memory_status, broker_disconnect, broker_login, create_order_intent, daily_executive_journal, dashboard, derivative_plan, derivative_plans, derivatives_greeks, derivatives_spreads, dismiss_coach_proposal_service, execution_status, exit_shadow_trade, get_coach_audit, get_coach_proposals_service, glossary, ingest_finnhub_webhook, latest_analysis, listed_securities, market_history_status, market_update, ml_alpha_fragility, ml_drift, ml_quant_models, ml_shadow, ml_status, ml_train, ml_validate, model_review_status, model_status, notifications_status_service, notifications_test_service, operations_copilot_status, pre_market_health_status, production_status, reconcile_orders, repair_today_missing_bars, reset_portfolio, run_agent, sentiment_dashboard, shadow_counterfactual_summary_service, shadow_session_status_api, shadow_trade_book, stock_analysis, stock_chart, submit_order_intent, trigger_counterfactual_replay_service, update_kill_switch, update_risk_policy, update_settings, update_shadow_trade_risk
 from .broker_gateway import complete_login
 from .scheduler import start_scheduler
+from .asi_indicator import calculate_asi, detect_nse_trap
+from .volume_profile import calculate_volume_profile, evaluate_volume_profile_verdict
+from .pcr_engine import get_latest_pcr
 
 
 class APIError(Exception):
@@ -274,6 +277,36 @@ class Handler(BaseHTTPRequestHandler):
             self._user_id()
             query = parse_qs(urlparse(self.path).query)
             return self._json(200, stock_chart(query.get("symbol", ["RELIANCE"])[0], query.get("timeframe", ["5m"])[0]))
+        if path == "/api/market/pcr" and method == "GET":
+            self._user_id()
+            query = parse_qs(urlparse(self.path).query)
+            sym = query.get("symbol", ["NIFTY 50"])[0]
+            from .config import DATABASE_URL
+            from sqlalchemy import create_engine
+            engine = create_engine(DATABASE_URL)
+            with engine.connect() as conn:
+                return self._json(200, get_latest_pcr(conn, sym))
+        if path == "/api/indicators/asi" and method == "GET":
+            self._user_id()
+            query = parse_qs(urlparse(self.path).query)
+            sym = query.get("symbol", ["RELIANCE"])[0]
+            tf = query.get("timeframe", ["5m"])[0]
+            chart = stock_chart(sym, tf)
+            candles = chart.get("candles") or []
+            asi = calculate_asi(candles)
+            trap = detect_nse_trap(candles, asi)
+            return self._json(200, {"symbol": sym, "timeframe": tf, "trap_analysis": trap, "asi": asi[-50:]})
+        if path == "/api/indicators/volume_profile" and method == "GET":
+            self._user_id()
+            query = parse_qs(urlparse(self.path).query)
+            sym = query.get("symbol", ["RELIANCE"])[0]
+            tf = query.get("timeframe", ["5m"])[0]
+            chart = stock_chart(sym, tf)
+            candles = chart.get("candles") or []
+            profile = calculate_volume_profile(candles)
+            last_p = float(chart.get("price") or (candles[-1]["close"] if candles else 100))
+            vp_eval = evaluate_volume_profile_verdict(last_p, 1, profile)
+            return self._json(200, {"symbol": sym, "timeframe": tf, "profile": profile, "evaluation": vp_eval})
         if path == "/api/securities" and method == "GET":
             self._user_id()
             query = parse_qs(urlparse(self.path).query)
