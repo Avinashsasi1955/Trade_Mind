@@ -15,7 +15,7 @@ from .config import (ADMIN_EMAILS, ALLOWED_ORIGINS, COOKIE_SECURE, DEMO_MODE, HO
                      validate_runtime_security)
 from .database import connect, create_user, find_user_by_email, initialize
 from .security import create_token, decode_token, hash_password, password_needs_rehash, token_hash, verify_password
-from .service import ai_gateway_status, apply_coach_proposal_service, approve_order_intent, backtest_report, bot_chat, bot_conversation, bot_conversations, brain_memory_status, broker_disconnect, broker_login, create_order_intent, daily_executive_journal, dashboard, derivative_plan, derivative_plans, derivatives_greeks, derivatives_spreads, dismiss_coach_proposal_service, execution_status, exit_shadow_trade, get_coach_audit, get_coach_proposals_service, glossary, ingest_finnhub_webhook, latest_analysis, listed_securities, market_history_status, market_update, ml_alpha_fragility, ml_drift, ml_quant_models, ml_shadow, ml_status, ml_train, ml_validate, model_review_status, model_status, notifications_status_service, notifications_test_service, operations_copilot_status, pre_market_health_status, production_status, reconcile_orders, repair_today_missing_bars, reset_portfolio, run_agent, sentiment_dashboard, shadow_counterfactual_summary_service, shadow_session_status_api, shadow_trade_book, stock_analysis, stock_chart, submit_order_intent, trigger_counterfactual_replay_service, update_kill_switch, update_risk_policy, update_settings, update_shadow_trade_risk
+from .service import ai_gateway_status, apply_coach_proposal_service, approve_order_intent, backtest_report, bot_chat, bot_conversation, bot_conversations, brain_memory_status, broker_disconnect, broker_login, create_order_intent, daily_executive_journal, dashboard, derivative_plan, derivative_plans, derivatives_greeks, derivatives_spreads, dismiss_coach_proposal_service, execution_status, exit_shadow_trade, get_coach_audit, get_coach_proposals_service, glossary, ingest_finnhub_webhook, latest_analysis, listed_securities, market_history_status, market_update, ml_alpha_fragility, ml_drift, ml_quant_models, ml_shadow, ml_status, ml_train, ml_validate, model_review_status, model_status, notifications_status_service, notifications_test_service, operations_copilot_status, pre_market_health_status, production_status, reconcile_orders, repair_today_missing_bars, reset_portfolio, rl_controller_status, run_agent, sentiment_dashboard, shadow_counterfactual_summary_service, shadow_session_status_api, shadow_trade_book, spider_bot_status, stock_analysis, stock_chart, submit_order_intent, trade_funnel_diagnostic, trigger_counterfactual_replay_service, update_kill_switch, update_risk_policy, update_settings, update_shadow_trade_risk
 from .broker_gateway import complete_login
 from .scheduler import start_scheduler
 from .asi_indicator import calculate_asi, detect_nse_trap
@@ -498,6 +498,11 @@ class Handler(BaseHTTPRequestHandler):
             data = self._body()
             date_val = data.get("date") or data.get("target_date") or None
             return self._json(200, trigger_counterfactual_replay_service(date_val))
+        if path == "/api/shadow/diagnostic/funnel" and method == "GET":
+            self._require_admin()
+            query = parse_qs(urlparse(self.path).query)
+            days = int(query.get("days", [4])[0])
+            return self._json(200, trade_funnel_diagnostic(days))
         if path == "/api/notifications/status" and method == "GET":
             self._require_admin()
             return self._json(200, notifications_status_service())
@@ -579,6 +584,14 @@ class Handler(BaseHTTPRequestHandler):
             symbol = parse_qs(urlparse(self.path).query).get("symbol", ["NIFTY"])[0]
             self._user_id()
             return self._json(200, derivatives_greeks(symbol))
+        if path == "/api/derivatives/spider" and method == "GET":
+            symbol = parse_qs(urlparse(self.path).query).get("symbol", ["NIFTY"])[0]
+            self._user_id()
+            return self._json(200, spider_bot_status(symbol))
+        if path == "/api/rl/status" and method == "GET":
+            symbol = parse_qs(urlparse(self.path).query).get("symbol", ["NIFTY"])[0]
+            self._user_id()
+            return self._json(200, rl_controller_status(symbol))
         if path == "/api/reports/daily-executive-journal" and method == "GET":
             with connect() as db:
                 return self._json(200, daily_executive_journal(db, self._user_id()))
@@ -611,7 +624,8 @@ class Handler(BaseHTTPRequestHandler):
         relative = "index.html" if path in {"", "/"} else path.lstrip("/")
         if relative not in {"index.html", "app.js", "styles.css"}:
             raise APIError(HTTPStatus.NOT_FOUND, "File not found")
-        target = (ROOT / relative).resolve()
+        frontend_target = (ROOT / "frontend" / relative).resolve()
+        target = frontend_target if frontend_target.is_file() else (ROOT / relative).resolve()
         if ROOT not in target.parents and target != ROOT:
             raise APIError(HTTPStatus.FORBIDDEN, "Forbidden")
         if not target.is_file():

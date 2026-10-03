@@ -125,7 +125,7 @@ def start_redis_listener(redis_url: Optional[str] = None) -> None:
             import redis
             while True:
                 try:
-                    r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=10)
+                    r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=None, health_check_interval=30)
                     pubsub = r.pubsub()
                     pubsub.subscribe(REDIS_CHANNEL)
                     print(f"[nivesh] Subscribed to Redis SSE channel '{REDIS_CHANNEL}'", flush=True)

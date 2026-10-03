@@ -397,6 +397,45 @@ def _live_chart(security: Dict, timeframe: str) -> Dict:
 def _daily_chart(security: Dict) -> Dict:
     stored = HistoryStore().candles(security["symbol"], security["exchange"], "day", 500)
     candles = [{"time": item["timestamp"], "open": item["open"], "high": item["high"], "low": item["low"], "close": item["close"], "volume": item["volume"]} for item in stored]
+    
+    # Synthesize missing daily bars from stored intraday 1m/5m bars if there is a gap
+    if DATABASE_URL:
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+        try:
+            with engine.connect() as connection:
+                intraday_days = connection.execute(text("""
+                    SELECT (b.bar_time AT TIME ZONE 'Asia/Kolkata')::date AS trade_date,
+                           (ARRAY_AGG(b.open_price ORDER BY b.bar_time ASC))[1] AS open_price,
+                           MAX(b.high_price) AS high_price,
+                           MIN(b.low_price) AS low_price,
+                           (ARRAY_AGG(b.close_price ORDER BY b.bar_time DESC))[1] AS close_price,
+                           SUM(COALESCE(b.volume, 0)) AS volume
+                    FROM live_market_bars b
+                    JOIN instrument_master i ON i.id = b.instrument_id
+                    WHERE i.exchange = :exchange AND i.symbol = :symbol
+                      AND b.interval IN ('1minute', '5minute')
+                    GROUP BY (b.bar_time AT TIME ZONE 'Asia/Kolkata')::date
+                    ORDER BY trade_date ASC
+                """), {"exchange": security["exchange"], "symbol": security["symbol"]}).mappings().all()
+                existing_dates = {str(c["time"])[:10] for c in candles}
+                for r in intraday_days:
+                    d_str = str(r["trade_date"])
+                    if d_str not in existing_dates:
+                        candles.append({
+                            "time": f"{d_str}T15:30:00+05:30",
+                            "open": float(r["open_price"]),
+                            "high": float(r["high_price"]),
+                            "low": float(r["low_price"]),
+                            "close": float(r["close_price"]),
+                            "volume": int(r["volume"] or 0),
+                            "source": "aggregated_intraday"
+                        })
+            candles.sort(key=lambda x: str(x["time"]))
+        except Exception:
+            pass
+        finally:
+            engine.dispose()
+
     live = _live_chart(security, "1m")
     has_live_session = False
     if live and live.get("candles"):

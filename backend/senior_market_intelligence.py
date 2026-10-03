@@ -179,7 +179,8 @@ def _candidate_row(item: Dict, accepted_ids: set) -> Dict:
         "rejection_reason": rejection,
         "details": {"chart_gate": chart, "scan": scan,
                     "instrument_local_direction": item.get("_instrument_local_direction") or chart.get("local_direction") or {},
-                    "session": item.get("_session_case") or {}, "policy_signal": int(item.get("signal") or 0)},
+                    "session": item.get("_session_case") or {}, "policy_signal": int(item.get("signal") or 0),
+                    "derivative_ticket": item.get("derivative_ticket")},
     }
 
 

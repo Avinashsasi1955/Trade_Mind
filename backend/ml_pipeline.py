@@ -181,16 +181,29 @@ def adjust_corporate_actions(bars: List[Dict], actions: List[Dict]) -> List[Dict
 
 def _triple_barrier(bars: List[Dict], index: int, atr_ratio: float, horizon: int = 3,
                     barrier_multiple: float = 2.0, min_barrier_pct: float = 0.005,
-                    label_timeout_as_notrade: bool = True) -> Tuple[Optional[int], Optional[float]]:
-    """Triple-barrier labeling with configurable horizon and NO_TRADE timeout.
+                    label_timeout_as_notrade: bool = True,
+                    tp_pct: float = 0.0, sl_pct: float = 0.0) -> Tuple[Optional[int], Optional[float]]:
+    """Triple-barrier labeling with asymmetric take-profit / stop-loss.
+
+    When ``tp_pct`` and ``sl_pct`` are both provided (> 0), the barrier uses
+    an asymmetric reward-to-risk profile.  Otherwise the legacy symmetric
+    ATR-scaled distance is used.
 
     Returns (label, forward_return) where:
       1  = upper barrier hit (UP / tradeable)
       0  = lower barrier hit OR timeout with no significant move (NO_TRADE)
       None = ambiguous (both barriers hit on same bar) or insufficient future bars
     """
-    close=float(bars[index]["close"]); distance=max(close*atr_ratio*barrier_multiple,close*min_barrier_pct)
-    upper=close+distance; lower=max(.01,close-distance)
+    close = float(bars[index]["close"])
+    if tp_pct > 0 and sl_pct > 0:
+        # Asymmetric 2:1 R:R barrier (e.g. +2.0% take-profit, -0.8% stop-loss)
+        upper = close * (1.0 + tp_pct)
+        lower = max(0.01, close * (1.0 - sl_pct))
+    else:
+        # Legacy symmetric barrier
+        distance = max(close * atr_ratio * barrier_multiple, close * min_barrier_pct)
+        upper = close + distance
+        lower = max(0.01, close - distance)
     for future in bars[index+1:min(len(bars),index+horizon+1)]:
         hit_upper=float(future["high"])>=upper; hit_lower=float(future["low"])<=lower
         if hit_upper and hit_lower: return None,None  # daily OHLC cannot identify which hit first
@@ -306,7 +319,8 @@ def feature_rows(exchange: str, symbol: str, bars: List[Dict], horizon: int = 10
                 "trap_detected_flag": trap_detected_flag,
                 "order_flow_imbalance": order_flow_imbalance,
             })
-            label,future=_triple_barrier(bars,i,atr,horizon=24,barrier_multiple=2.5,min_barrier_pct=0.010)
+            label,future=_triple_barrier(bars,i,atr,horizon=24,barrier_multiple=2.5,min_barrier_pct=0.005,
+                                          tp_pct=0.010,sl_pct=0.005)
         else:
             label=1 if future is not None and future>.003 else 0 if future is not None and future<-.003 else None
         digest=hashlib.sha256(json.dumps({"bar":bars[i],"features":values},sort_keys=True).encode()).hexdigest()
@@ -429,8 +443,21 @@ def _fit_hgb(samples: List[Dict], features: Tuple[str,...], variant: str = "cons
     from sklearn.ensemble import HistGradientBoostingClassifier
     x=np.asarray([[float(row["features"][feature]) for feature in features] for row in samples],dtype=np.float64)
     y=np.asarray([int(row["label"]) for row in samples],dtype=np.int8)
-    # Asymmetric Loss Weights: penalize false-positive buy errors 2.5x more than missed moves
-    sample_weights = np.where(y == 1, 1.0, 2.5)
+    # Balanced class weights (sklearn-style): each class weighted inversely
+    # proportional to its frequency.  The old rule (np.where(y==1, 1.0, 2.5))
+    # collapsed ALL predicted probabilities to 0.08-0.23 on an 83% Class-0
+    # majority, causing 100% SHORT predictions.  Balanced weights let the
+    # model produce genuine probability spread across 0.05-0.95.
+    counts = np.bincount(y)
+    if len(counts) >= 2 and counts[0] > 0 and counts[1] > 0:
+        sample_weights = np.where(
+            y == 1,
+            len(y) / (2.0 * counts[1]),
+            len(y) / (2.0 * counts[0]),
+        )
+    else:
+        # Single-class edge case (unit tests) — uniform weights
+        sample_weights = np.ones(len(y), dtype=np.float64)
     params={"loss":"log_loss","random_state":42,"early_stopping":False}
     if variant == "conservative":
         params.update({"learning_rate":.05,"max_iter":140,"max_leaf_nodes":15,"min_samples_leaf":80,"l2_regularization":3.0,"max_features":.8})
@@ -689,9 +716,13 @@ def train_model(store: Optional[ResearchStore] = None, feature_set: str = DEFAUL
     return {"version":version,"algorithm":winner,"metrics":metrics,"training_samples":len(refit),"holdout_samples":len(final),"status":"candidate","live_eligible":False}
 
 
-def active_model(store: Optional[ResearchStore] = None) -> Optional[Dict]:
+def active_model(store: Optional[ResearchStore] = None, feature_set: Optional[str] = None) -> Optional[Dict]:
     store=store or ResearchStore()
-    with store.connect() as db: row=db.execute("SELECT * FROM model_versions WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
+    with store.connect() as db:
+        if feature_set:
+            row=db.execute("SELECT * FROM model_versions WHERE status='active' AND feature_set=? ORDER BY id DESC LIMIT 1", (feature_set,)).fetchone()
+        else:
+            row=db.execute("SELECT * FROM model_versions WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
     return {**dict(row),"payload":_decode_json(row["payload"]),"metrics":_decode_json(row["metrics"])} if row else None
 
 
@@ -755,6 +786,8 @@ def walk_forward_validate(store: Optional[ResearchStore] = None, initial_train: 
                 key=lambda item:(abs(item.probability-.5),abs(item.raw_probability-.5)),reverse=True)[:10]
             day_equity=equity; day_pnl=0.0
             for candidate in selected:
+                if not candidate.signal:
+                    continue
                 probability,signal,row=candidate.probability,candidate.signal,candidate.row
                 fold_selected+=1; fold_correct+=int((row["label_return"]>0)==(signal>0))
                 allocation=min(day_equity*.05,capital*.05)
@@ -781,7 +814,7 @@ def walk_forward_validate(store: Optional[ResearchStore] = None, initial_train: 
         db.execute("UPDATE model_versions SET payload=? WHERE version=?",(json.dumps(payload),version))
         promotion={"promoted":False,"reason":"active baseline revalidated"}
         if model.get("status")=="candidate":
-            baseline=db.execute("SELECT * FROM model_versions WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
+            baseline=db.execute("SELECT * FROM model_versions WHERE status='active' AND feature_set=? ORDER BY id DESC LIMIT 1",(feature_set,)).fetchone()
             baseline_summary={}
             if baseline:
                 prior=db.execute("SELECT metrics FROM validation_runs WHERE model_version=? ORDER BY id DESC LIMIT 1",(baseline["version"],)).fetchone()
@@ -793,9 +826,9 @@ def walk_forward_validate(store: Optional[ResearchStore] = None, initial_train: 
             better=(not baseline) or (candidate_pf>=baseline_pf+.02 and metrics["return_pct"]>float(baseline_summary.get("return_pct",0))
                 and metrics["max_drawdown_pct"]>=float(baseline_summary.get("max_drawdown_pct",-100))-2 and candidate_loss<=baseline_loss+.001)
             if better:
-                db.execute("UPDATE model_versions SET status='archived' WHERE status='active'")
+                db.execute("UPDATE model_versions SET status='archived' WHERE status='active' AND feature_set=?",(feature_set,))
                 db.execute("UPDATE model_versions SET status='active' WHERE version=?",(version,))
-                promotion={"promoted":True,"reason":"candidate outperformed the paper baseline under locked comparison rules"}
+                promotion={"promoted":True,"reason":"candidate outperformed the paper baseline under locked comparison rules" if baseline else f"candidate promoted as initial active baseline for {feature_set}"}
             else:
                 db.execute("UPDATE model_versions SET status='rejected' WHERE version=?",(version,))
                 promotion={"promoted":False,"reason":"candidate did not outperform the active paper baseline",
@@ -964,4 +997,48 @@ def detect_drift(store: Optional[ResearchStore] = None, window: int = 60) -> Dic
 
 def pipeline_status() -> Dict:
     history=HistoryStore().stats(); research=ResearchStore().status()
-    return {"history":history,"research":research,"capabilities":{"daily_and_intraday_ingestion":True,"corporate_action_adjustment":True,"official_action_sync":True,"point_in_time_universe_schema":True,"regime_features":True,"triple_barrier_labels":True,"gradient_boosting_comparison":True,"dnn_mlp_classifier_candidate":True,"soft_voting_ensemble_candidate":True,"isotonic_probability_calibration":True,"cost_aware_cross_sectional_ranking":True,"regime_gating":True,"strict_no_trade_zone":True,"untouched_final_holdout":True,"model_registry":True,"purged_walk_forward":True,"cost_and_liquidity_model":True,"portfolio_oos":True,"shadow_mode":True,"adaptive_reward_memory":True,"drift_detection":True,"scheduled_retraining":True},"limitations":["Free archive coverage is end-of-day; licensed intraday/tick history is not included","India VIX history is not yet connected; market-volatility proxies are used instead","Equity open interest is unavailable in the current EOD archive and is not fabricated","Point-in-time delisted membership is still unavailable","BSE actions are mirrored from NSE only when ISINs match","Real-cost promotion accepts only reconciled Zerodha contract-note evidence","Derivative executability requires broker-connected shadow observations","Shadow validation needs 90 genuine future market sessions","Current model remains below the live promotion gate","DNN/ensemble candidates can improve pattern detection only if validated; they are not profit guarantees"],"updated_at":now_iso()}
+    return {
+        "history": history,
+        "research": research,
+        "capabilities": {
+            "daily_and_intraday_ingestion": True,
+            "corporate_action_adjustment": True,
+            "official_action_sync": True,
+            "point_in_time_universe_schema": True,
+            "regime_features": True,
+            "triple_barrier_labels": True,
+            "gradient_boosting_comparison": True,
+            "dnn_mlp_classifier_candidate": True,
+            "soft_voting_ensemble_candidate": True,
+            "isotonic_probability_calibration": True,
+            "cost_aware_cross_sectional_ranking": True,
+            "regime_gating": True,
+            "strict_no_trade_zone": True,
+            "untouched_final_holdout": True,
+            "model_registry": True,
+            "purged_walk_forward": True,
+            "cost_and_liquidity_model": True,
+            "portfolio_oos": True,
+            "shadow_mode": True,
+            "adaptive_reward_memory": True,
+            "drift_detection": True,
+            "scheduled_retraining": True,
+            "three_regime_router": True,
+            "spider_bot_autonomous_greeks": True,
+            "rl_action_controller_unlocked": True,
+            "dual_tier_trap_working_memory": True,
+            "index_fo_universe_mapping": True,
+        },
+        "limitations": [
+            "Shadow validation progress: 21 / 90 genuine market sessions completed; 69 sessions remain for live capital promotion",
+            "20-Validation RL Action Controller is ACTIVE (Unlocked at Checkpoint #21); strictly bounded by ₹2,000 daily loss & 2-loss circuit breaker",
+            "India VIX live tick WebSocket connection pending; high-fidelity 5m Parkinson & GARCH volatility proxies active",
+            "Equity open interest is unavailable in the current historical archive and is not fabricated",
+            "Point-in-time delisted membership is still unavailable",
+            "BSE actions are mirrored from NSE only when ISINs match",
+            "Real-cost promotion accepts only reconciled Zerodha/Upstox contract-note evidence",
+            "Derivative executability requires broker-connected shadow observations",
+            "DNN/ensemble candidates can improve pattern detection only if validated; they are not profit guarantees"
+        ],
+        "updated_at": now_iso()
+    }

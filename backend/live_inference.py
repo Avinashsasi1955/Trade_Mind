@@ -374,20 +374,21 @@ def _chart_strategy_gate(item: Dict, signal: int) -> Dict:
         return {"accepted": False, "reason": f"Wyckoff Effort-vs-Result divergence: wide spread with low volume (RVOL {rvol:.2f}x < 0.90x), fake candle exhaustion trap",
                 "strategy": "NO_TRADE", "local_direction": local_direction}
 
-    # Anti-Chasing Overextension Guard: Never buy the peak or short the bottom
+    # Anti-Chasing Overextension Guard: Volatility-adaptive threshold
     vwap_distance_pct = (last - vwap) / vwap
-    if signal > 0 and vwap_distance_pct > 0.008:
-        return {"accepted": False, "reason": f"overextended above VWAP (+{vwap_distance_pct*100:.2f}% > +0.8%), high probability pullback trap",
+    max_vwap_dist = max(0.012, min(0.025, (atr / max(1e-9, last)) * 1.5))
+    if signal > 0 and vwap_distance_pct > max_vwap_dist:
+        return {"accepted": False, "reason": f"overextended above VWAP (+{vwap_distance_pct*100:.2f}% > +{max_vwap_dist*100:.2f}%), high probability pullback trap",
                 "strategy": "NO_TRADE", "local_direction": local_direction}
-    if signal < 0 and vwap_distance_pct < -0.008:
-        return {"accepted": False, "reason": f"overextended below VWAP ({vwap_distance_pct*100:.2f}% < -0.8%), oversold bounce trap",
+    if signal < 0 and vwap_distance_pct < -max_vwap_dist:
+        return {"accepted": False, "reason": f"overextended below VWAP ({vwap_distance_pct*100:.2f}% < -{max_vwap_dist*100:.2f}%), oversold bounce trap",
                 "strategy": "NO_TRADE", "local_direction": local_direction}
 
     trend_up=ema_fast[-1]>ema_slow[-1] and last>=ema_fast[-1]
     trend_down=ema_fast[-1]<ema_slow[-1] and last<=ema_fast[-1]
     breakout_volume_ok = rvol >= 1.20 and volume_ok
-    breakout_up=last>prior_high and breakout_volume_ok and not is_choppy
-    breakout_down=last<prior_low and breakout_volume_ok and not is_choppy
+    breakout_up=last>prior_high and breakout_volume_ok
+    breakout_down=last<prior_low and breakout_volume_ok
     pullback_buy=trend_up and (lows[-1]<=ema_fast[-1]*1.002 or last>=ema_fast[-1]>=lows[-2]) and last>=previous and not is_choppy
     pullback_sell=trend_down and (highs[-1]>=ema_fast[-1]*0.998 or last<=ema_fast[-1]<=highs[-2]) and last<=previous and not is_choppy
     momentum_up=trend_up and last>previous and ema_fast[-1]>ema_fast[-2] and not is_choppy
@@ -654,7 +655,7 @@ class LivePaperInference:
         self.min_option_grade=os.getenv("NIVESH_SHADOW_MIN_OPTION_GRADE","B").upper().strip() or "B"
         self.option_grade_a_score=float(os.getenv("NIVESH_SHADOW_OPTION_GRADE_A_SCORE","78"))
         self.option_grade_b_score=float(os.getenv("NIVESH_SHADOW_OPTION_GRADE_B_SCORE",str(self.min_option_entry_quality)))
-        self.min_professional_rr=float(os.getenv("NIVESH_SHADOW_MIN_PROFESSIONAL_RR","2.20"))
+        self.min_professional_rr=float(os.getenv("NIVESH_SHADOW_MIN_PROFESSIONAL_RR","1.50"))
         self.min_expected_net_edge_bps=float(os.getenv("NIVESH_SHADOW_MIN_EXPECTED_NET_EDGE_BPS","40"))
         self.session_case_enabled=os.getenv("NIVESH_SHADOW_SESSION_CASE_ENABLED","1")=="1"
         self.learning_best_min_rr=float(os.getenv("NIVESH_SHADOW_LEARNING_BEST_MIN_RR","1.80"))
@@ -706,7 +707,7 @@ class LivePaperInference:
         self.microstructure_lookback_seconds=max(5,int(os.getenv("NIVESH_SHADOW_1S_LOOKBACK_SECONDS","20")))
         self.microstructure_min_bars=max(3,int(os.getenv("NIVESH_SHADOW_1S_MIN_BARS","8")))
         self.microstructure_max_adverse_bps=Decimal(os.getenv("NIVESH_SHADOW_1S_MAX_ADVERSE_BPS","8"))
-        self.require_microstructure_for_entries=os.getenv("NIVESH_SHADOW_REQUIRE_1S_FOR_ENTRIES","1")=="1"
+        self.require_microstructure_for_entries=os.getenv("NIVESH_SHADOW_REQUIRE_1S_FOR_ENTRIES","0")=="1"
         self.multi_timeframe_gate_enabled=os.getenv("NIVESH_SHADOW_MULTI_TIMEFRAME_GATE_ENABLED","1")=="1"
         self.require_multi_timeframe_for_entries=os.getenv("NIVESH_SHADOW_REQUIRE_MULTI_TIMEFRAME_FOR_ENTRIES","1")=="1"
         self.mtf_min_required_frames=max(2,int(os.getenv("NIVESH_SHADOW_MTF_MIN_REQUIRED_FRAMES","2")))
@@ -1130,7 +1131,8 @@ class LivePaperInference:
                 ready+=1
             if strategy_direction and direction==strategy_direction and confidence>=45:
                 aligned+=1
-            if strategy_direction and direction and direction!=strategy_direction and confidence>=self.mtf_strong_conflict_threshold:
+            conflict_thresh = max(75.0, self.mtf_strong_conflict_threshold + 15.0) if name == "1m" else self.mtf_strong_conflict_threshold
+            if strategy_direction and direction and direction!=strategy_direction and confidence>=conflict_thresh:
                 conflicts.append(name)
             analysed.append({
                 "timeframe":name,
@@ -2211,12 +2213,25 @@ class LivePaperInference:
             min_rr=self.learning_neutral_min_rr; min_quality=self.learning_neutral_min_quality; min_edge=self.learning_neutral_min_edge_bps
             strategy_mode="mixed_selective"
             allowed_routes=["CE_BUY","PE_BUY","EQ_BUY","EQ_INTRADAY_SHORT"]
+
+        regime_classification = None
+        regime_name = "RANGE_MEAN_REVERSION"
+        try:
+            from backend.regime_router import RegimeRouter
+            router = RegimeRouter()
+            regime_classification = router.classify(bars, symbol="NIFTY")
+            regime_name = regime_classification.get("regime", "RANGE_MEAN_REVERSION")
+        except Exception:
+            pass
+
         return {"enabled":True,"session":session,"case":case,"bias":bias,"bars":len(bars),
                 "move_pct":round(move_pct,5),"recent_pct":round(recent_pct,5),
                 "range_pct":round(range_pct,5),"direction_changes":direction_changes,
                 "strategy_mode":strategy_mode,"allowed_routes":allowed_routes,
                 "learning_min_rr":min_rr,"learning_min_quality":min_quality,
-                "learning_min_edge_bps":min_edge}
+                "learning_min_edge_bps":min_edge,
+                "regime_classification":regime_classification,
+                "regime_name":regime_name}
 
     def _effective_thresholds(self,item: Dict,chart: Dict,policy,session_case: Dict) -> Dict:
         learning_candidate=bool(chart.get("learning_mode") or item.get("probe_trade") or not getattr(policy,"accepted",False))
@@ -2870,6 +2885,18 @@ class LivePaperInference:
                     item["option_type"]=gate.get("option_type")
                     item["option_side"]=gate.get("side","BUY")
                     item["senior_opportunity"]=bool(gate.get("senior_opportunity"))
+                    try:
+                        from backend.derivatives import build_index_spread_ticket
+                        spot_val = float(session["close"])
+                        regime_name = (session_case or {}).get("case", "neutral")
+                        item["derivative_ticket"] = build_index_spread_ticket(
+                            symbol=symbol,
+                            spot=spot_val,
+                            signal=int(item["signal"]),
+                            regime=regime_name,
+                        )
+                    except Exception:
+                        pass
                     items.append(item)
             return items
 
@@ -3281,6 +3308,22 @@ class LivePaperInference:
                                                      payload=payload))
                 except Exception:
                     pass
+            else:
+                # Execution layer rejected or dropped trade - synchronize candidate audit to prevent bleed
+                try:
+                    rejection_reason = result.get("rejection_reason") or "execution_layer_dropped"
+                    with self.engine.begin() as connection:
+                        connection.execute(text("""
+                            UPDATE trade_candidate_audits
+                            SET accepted = FALSE,
+                                rejection_reason = :reason
+                            WHERE symbol = :symbol 
+                              AND observed_at >= :watermark - INTERVAL '1 minute'
+                              AND observed_at <= :watermark + INTERVAL '1 minute'
+                              AND accepted = TRUE
+                        """), {"symbol": item.get("symbol"), "watermark": item["session"]["timestamp"], "reason": rejection_reason})
+                except Exception:
+                    pass
         if audits<available_slots and self.learning_mode_enabled:
             open_state_after=self._open_trade_state()
             fresh_blocked=self._blocked_underlyings(open_state_after,risk_state)
@@ -3365,6 +3408,7 @@ class LivePaperInference:
                                                                       "multi_timeframe_confirmation":consistency.get("multi_timeframe"),
                                                                       "session_case":session_case,
                                                                       "effective_thresholds":thresholds,
+                                                                      "derivative_ticket":item.get("derivative_ticket"),
                                                                       "paper_only":True},default=str))
                 audits+=int(result["recorded"])
                 if result.get("recorded"):
