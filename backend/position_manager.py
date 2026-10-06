@@ -53,11 +53,11 @@ class PositionManager:
         )
 
         # Risk parameters
-        self.breakeven_trigger_r = Decimal("0.70")
-        self.profit_lock_trigger_r = Decimal("1.20")
-        self.profit_lock_guaranteed_r = Decimal("0.60")
-        self.trailing_trigger_pct = Decimal("0.012")  # 1.2%
-        self.trailing_giveback_pct = Decimal("0.004")  # 0.4%
+        self.breakeven_trigger_r = Decimal(os.getenv("NIVESH_SHADOW_BREAKEVEN_TRIGGER_R", "1.10"))
+        self.profit_lock_trigger_r = Decimal(os.getenv("NIVESH_SHADOW_PROFIT_LOCK_TRIGGER_R", "1.60"))
+        self.profit_lock_guaranteed_r = Decimal(os.getenv("NIVESH_SHADOW_PROFIT_LOCK_GUARANTEED_R", "1.00"))
+        self.trailing_trigger_r = Decimal(os.getenv("NIVESH_SHADOW_TRAILING_TRIGGER_R", "1.50"))
+        self.trailing_giveback_r = Decimal(os.getenv("NIVESH_SHADOW_TRAILING_GIVEBACK_R", "0.40"))
         
         self.adverse_cut_window_seconds = 90.0
         self.adverse_cut_threshold_r = Decimal("0.40")
@@ -86,7 +86,8 @@ class PositionManager:
                     COALESCE(a.trade_mode, 'INTRADAY') AS trade_mode,
                     COALESCE(a.holding_days, 0) AS holding_days,
                     COALESCE(a.max_holding_days, 15) AS max_holding_days,
-                    i.symbol, i.exchange, i.instrument_type,
+                    a.improvement_note, a.reasoning_chain,
+                    i.symbol, i.exchange, i.instrument_type, i.expiry,
                     COALESCE(i.underlying_symbol, i.symbol) AS underlying_symbol
                 FROM shadow_execution_audits a
                 JOIN instrument_master i ON i.id = a.instrument_id
@@ -127,6 +128,41 @@ class PositionManager:
             ).mappings().one_or_none()
             if row and row["close_price"] is not None:
                 return Decimal(str(row["close_price"]))
+
+            # Option contract mark-to-market derivation from underlying spot
+            opt_meta = conn.execute(
+                text("""
+                    SELECT symbol, underlying_symbol, strike, expiry, instrument_type
+                    FROM instrument_master WHERE id = :id
+                """),
+                {"id": instrument_id}
+            ).mappings().one_or_none()
+            if opt_meta and opt_meta.get("instrument_type") in ("CE", "PE") and opt_meta.get("strike"):
+                und = opt_meta.get("underlying_symbol") or opt_meta["symbol"].split()[0]
+                und_id = conn.execute(
+                    text("SELECT id FROM instrument_master WHERE (symbol = :und OR underlying_symbol = :und) AND instrument_type = 'EQ' LIMIT 1"),
+                    {"und": und}
+                ).scalar_one_or_none()
+                if und_id:
+                    und_row = conn.execute(
+                        text("""
+                            SELECT close_price FROM live_market_bars
+                            WHERE instrument_id = :und_id
+                              AND interval IN ('1second', '1minute', '5minute', 'day')
+                              AND bar_time <= :watermark
+                              AND source = ANY(:sources)
+                            ORDER BY bar_time DESC LIMIT 1
+                        """),
+                        {"und_id": und_id, "watermark": watermark, "sources": list(TRADE_BAR_SOURCES)}
+                    ).mappings().one_or_none()
+                    if und_row and und_row["close_price"]:
+                        spot = float(und_row["close_price"])
+                        strike = float(opt_meta["strike"])
+                        wm_date = (watermark.astimezone(IST) if getattr(watermark, "tzinfo", None) else watermark).date() if hasattr(watermark, "date") else watermark
+                        dte = max(0.5, float((opt_meta["expiry"] - wm_date).days)) if opt_meta.get("expiry") else 4.0
+                        from backend.greeks_engine import calculate_black_scholes_greeks
+                        greeks = calculate_black_scholes_greeks(spot, strike, dte, iv=0.145, option_type=opt_meta["instrument_type"])
+                        return Decimal(str(max(0.05, round(greeks["price"], 2))))
         return None
 
     def get_exit_bars(self, instrument_id: int, signal_at: datetime, watermark: datetime) -> List[Dict]:
@@ -153,6 +189,54 @@ class PositionManager:
                 ).mappings().all()
                 if len(rows) >= minimum:
                     return [dict(r, interval=interval) for r in rows]
+
+            # Fallback: synthesize option excursion bars from underlying stock movement
+            opt_meta = conn.execute(
+                text("SELECT symbol, underlying_symbol, strike, expiry, instrument_type FROM instrument_master WHERE id = :id"),
+                {"id": instrument_id}
+            ).mappings().one_or_none()
+            if opt_meta and opt_meta.get("instrument_type") in ("CE", "PE") and opt_meta.get("strike"):
+                und = opt_meta.get("underlying_symbol") or opt_meta["symbol"].split()[0]
+                und_id = conn.execute(
+                    text("SELECT id FROM instrument_master WHERE (symbol = :und OR underlying_symbol = :und) AND instrument_type IN ('EQ', 'INDEX') LIMIT 1"),
+                    {"und": und}
+                ).scalar_one_or_none()
+                und_bars = []
+                if und_id:
+                    und_bars = conn.execute(
+                        text("""
+                            SELECT bar_time, high_price, low_price, close_price, volume
+                            FROM live_market_bars
+                            WHERE instrument_id = :und_id
+                              AND interval IN ('1minute', '5minute')
+                              AND source = ANY(:sources)
+                              AND bar_time >= :signal_at AND bar_time <= :watermark
+                            ORDER BY bar_time ASC
+                        """),
+                        {"und_id": und_id, "sources": list(TRADE_BAR_SOURCES), "signal_at": signal_at, "watermark": watermark}
+                    ).mappings().all()
+                if und_bars:
+                    from backend.greeks_engine import calculate_black_scholes_greeks
+                    strike = float(opt_meta["strike"])
+                    wm_date = (watermark.astimezone(IST) if getattr(watermark, "tzinfo", None) else watermark).date() if hasattr(watermark, "date") else watermark
+                    dte = max(0.5, float((opt_meta["expiry"] - wm_date).days)) if opt_meta.get("expiry") else 4.0
+                    opt_bars = []
+                    for ub in und_bars:
+                        g_high = calculate_black_scholes_greeks(float(ub["high_price"]), strike, dte, iv=0.145, option_type=opt_meta["instrument_type"])
+                        g_low = calculate_black_scholes_greeks(float(ub["low_price"]), strike, dte, iv=0.145, option_type=opt_meta["instrument_type"])
+                        g_close = calculate_black_scholes_greeks(float(ub["close_price"]), strike, dte, iv=0.145, option_type=opt_meta["instrument_type"])
+                        h_p = max(0.05, round(max(g_high["price"], g_low["price"]), 2))
+                        l_p = max(0.05, round(min(g_high["price"], g_low["price"]), 2))
+                        c_p = max(0.05, round(g_close["price"], 2))
+                        opt_bars.append({
+                            "bar_time": ub["bar_time"],
+                            "high_price": h_p,
+                            "low_price": l_p,
+                            "close_price": c_p,
+                            "volume": ub["volume"],
+                            "interval": "synthesized_option"
+                        })
+                    return opt_bars
         return []
 
     def evaluate_position(self, pos: Dict, watermark: datetime) -> Optional[Dict]:
@@ -176,6 +260,17 @@ class PositionManager:
 
         stop_loss = Decimal(str(pos["stop_loss_price"])) if pos.get("stop_loss_price") else None
         take_profit = Decimal(str(pos["take_profit_price"])) if pos.get("take_profit_price") else None
+        instrument_type = str(pos.get("instrument_type") or "").upper()
+
+        # Institutional Short Options Discipline (CBOE & tastytrade benchmark):
+        # 1. 50% Max Profit Target: Holding short options past 50% decay yields severe negative gamma risk.
+        #    Take profit when premium reaches 50% of credit received (LTP <= entry * 0.50).
+        # 2. 1.5x Hard Loss Ceiling: Cap short option loss at 1.5x entry price to prevent naked tail risk.
+        if side == "SELL" and instrument_type in ("CE", "PE"):
+            opt_tp_50 = entry * Decimal("0.50")
+            take_profit = max(take_profit, opt_tp_50) if take_profit else opt_tp_50
+            opt_sl_150 = entry * Decimal("1.50")
+            stop_loss = min(stop_loss, opt_sl_150) if stop_loss else opt_sl_150
 
         # 1. Calculate baseline risk (R-points)
         fallback_risk = max(Decimal("0.50"), entry * Decimal("0.006"))
@@ -193,134 +288,279 @@ class PositionManager:
         bars = self.get_exit_bars(pos["instrument_id"], signal_at, watermark)
         best_favourable = entry
         worst_adverse = entry
-        for bar in bars:
-            h = Decimal(str(bar["high_price"]))
-            l = Decimal(str(bar["low_price"]))
-            if side == "BUY":
-                best_favourable = max(best_favourable, h)
-                worst_adverse = min(worst_adverse, l)
-            else:
-                best_favourable = min(best_favourable, l)
-                worst_adverse = max(worst_adverse, h)
-
-        # Also incorporate latest price into excursion
-        if side == "BUY":
-            best_favourable = max(best_favourable, latest_price)
-            worst_adverse = min(worst_adverse, latest_price)
-            favorable_r = (best_favourable - entry) / r_points
-            current_r = (latest_price - entry) / r_points
-        else:
-            best_favourable = min(best_favourable, latest_price)
-            worst_adverse = max(worst_adverse, latest_price)
-            favorable_r = (entry - best_favourable) / r_points
-            current_r = (entry - latest_price) / r_points
+        # Multi-day holding invariant: swing trades stay open and mature
+        is_multi_day = trade_mode in ("SWING", "POSITIONAL")
 
         exit_price: Optional[Decimal] = None
         exit_reason: Optional[str] = None
+        exit_bar_time: Optional[datetime] = None
 
         # -------------------------------------------------------------
-        # RULE 1: Immediate Adverse Excursion Early-Cut (0 to 90 seconds)
+        # Chronological Bar-by-Bar Replay (Guarantees Perfect Execution Even After Offline/Reboots)
         # -------------------------------------------------------------
-        if elapsed_seconds <= self.adverse_cut_window_seconds:
-            if current_r <= -self.adverse_cut_threshold_r and favorable_r <= Decimal("0.10"):
-                exit_price = latest_price
-                exit_reason = "EARLY_ADVERSE_CUT"
+        best_favourable = entry
+        worst_adverse = entry
+        running_sl = stop_loss
 
-        # -------------------------------------------------------------
-        # RULE 2: Dynamic Stop-Loss Tightening at 5 Minutes (Scratch Stop)
-        # -------------------------------------------------------------
-        effective_sl = stop_loss
-        if elapsed_seconds >= self.stagnation_tighten_seconds and favorable_r < Decimal("0.20"):
-            # Setup is hovering flat; tighten stop to -0.35R
+        # Ensure excursion R metrics are always initialized
+        favorable_r = Decimal("0.0")
+        current_r = Decimal("0.0")
+
+        tp_candidate_bar = None
+        tp_candidate_price = None
+        tp_candidate_reason = None
+
+        sl_candidate_bar = None
+        sl_candidate_price = None
+        sl_candidate_reason = None
+
+        for bar in bars:
+            h = Decimal(str(bar.get("high_price") or entry))
+            l = Decimal(str(bar.get("low_price") or entry))
+            c = Decimal(str(bar.get("close_price") or bar.get("high_price") or entry))
+            b_time = bar.get("bar_time")
+
             if side == "BUY":
-                tightened_sl = entry - self.stagnation_tighten_r * r_points
-                effective_sl = max(effective_sl, tightened_sl) if effective_sl else tightened_sl
-            else:
-                tightened_sl = entry + self.stagnation_tighten_r * r_points
-                effective_sl = min(effective_sl, tightened_sl) if effective_sl else tightened_sl
+                best_favourable = max(best_favourable, h)
+                worst_adverse = min(worst_adverse, l)
+                favorable_r = max(favorable_r, (best_favourable - entry) / r_points)
+                # Check Take Profit
+                if take_profit and h >= take_profit and not tp_candidate_bar:
+                    tp_candidate_price = take_profit
+                    tp_candidate_reason = "TAKE_PROFIT"
+                    tp_candidate_bar = b_time
+                # Check +2.5R Spike
+                fav_r = (best_favourable - entry) / r_points
+                if fav_r >= Decimal("2.50") and not tp_candidate_bar:
+                    tp_candidate_price = entry + Decimal("2.5") * r_points
+                    tp_candidate_reason = "PROFIT_CAPTURE"
+                    tp_candidate_bar = b_time
+                # Check Stop Loss
+                if running_sl and l <= running_sl and not sl_candidate_bar:
+                    sl_candidate_price = running_sl
+                    sl_candidate_reason = "STOP_LOSS"
+                    sl_candidate_bar = b_time
 
-        # -------------------------------------------------------------
-        # RULE 3: 15-Minute STAGNATION_GUARD (Cures INFY / ULTRACEMCO Bleed)
-        # -------------------------------------------------------------
-        if not exit_reason and trade_mode == "INTRADAY" and elapsed_seconds >= self.stagnation_scratch_seconds:
-            if favorable_r < self.stagnation_min_expansion_r:
-                exit_price = latest_price
-                exit_reason = "STAGNATION_GUARD"
+                # If purely intraday, break on first exit triggered
+                if not is_multi_day:
+                    if tp_candidate_bar and sl_candidate_bar:
+                        # Which occurred first?
+                        if tp_candidate_bar <= sl_candidate_bar:
+                            exit_price = tp_candidate_price
+                            exit_reason = tp_candidate_reason
+                            exit_bar_time = tp_candidate_bar
+                        else:
+                            exit_price = sl_candidate_price
+                            exit_reason = sl_candidate_reason
+                            exit_bar_time = sl_candidate_bar
+                        break
+                    elif tp_candidate_bar:
+                        exit_price = tp_candidate_price
+                        exit_reason = tp_candidate_reason
+                        exit_bar_time = tp_candidate_bar
+                        break
+                    elif sl_candidate_bar:
+                        exit_price = sl_candidate_price
+                        exit_reason = sl_candidate_reason
+                        exit_bar_time = sl_candidate_bar
+                        break
+            else:  # SELL
+                best_favourable = min(best_favourable, l)
+                worst_adverse = max(worst_adverse, h)
+                favorable_r = max(favorable_r, (entry - best_favourable) / r_points)
+                # Check Take Profit
+                if take_profit and l <= take_profit and not tp_candidate_bar:
+                    tp_candidate_price = take_profit
+                    tp_candidate_reason = "TAKE_PROFIT"
+                    tp_candidate_bar = b_time
+                # Check +2.5R Spike
+                fav_r = (entry - best_favourable) / r_points
+                if fav_r >= Decimal("2.50") and not tp_candidate_bar:
+                    tp_candidate_price = entry - Decimal("2.5") * r_points
+                    tp_candidate_reason = "PROFIT_CAPTURE"
+                    tp_candidate_bar = b_time
+                # Check Stop Loss
+                if running_sl and h >= running_sl and not sl_candidate_bar:
+                    sl_candidate_price = running_sl
+                    sl_candidate_reason = "STOP_LOSS"
+                    sl_candidate_bar = b_time
 
-        # -------------------------------------------------------------
-        # RULE 4: +2.5R Spike Exit (Immediate Profit Target)
-        # -------------------------------------------------------------
-        if not exit_reason and favorable_r >= Decimal("2.50"):
-            exit_price = (entry + Decimal("2.5") * r_points) if side == "BUY" else (entry - Decimal("2.5") * r_points)
-            exit_reason = "PROFIT_CAPTURE"
+                # If purely intraday, break on first exit triggered
+                if not is_multi_day:
+                    if tp_candidate_bar and sl_candidate_bar:
+                        if tp_candidate_bar <= sl_candidate_bar:
+                            exit_price = tp_candidate_price
+                            exit_reason = tp_candidate_reason
+                            exit_bar_time = tp_candidate_bar
+                        else:
+                            exit_price = sl_candidate_price
+                            exit_reason = sl_candidate_reason
+                            exit_bar_time = sl_candidate_bar
+                        break
+                    elif tp_candidate_bar:
+                        exit_price = tp_candidate_price
+                        exit_reason = tp_candidate_reason
+                        exit_bar_time = tp_candidate_bar
+                        break
+                    elif sl_candidate_bar:
+                        exit_price = sl_candidate_price
+                        exit_reason = sl_candidate_reason
+                        exit_bar_time = sl_candidate_bar
+                        break
 
-        # -------------------------------------------------------------
-        # RULE 5: Stage 2 +1.2R Profit Lock (Guarantees +0.6R)
-        # -------------------------------------------------------------
-        profit_lock_price = None
-        if favorable_r >= self.profit_lock_trigger_r:
-            profit_lock_price = (entry + self.profit_lock_guaranteed_r * r_points) if side == "BUY" else (entry - self.profit_lock_guaranteed_r * r_points)
+        # Multi-day / Swing evaluation:
+        if is_multi_day:
+            if tp_candidate_bar and (not sl_candidate_bar or tp_candidate_bar <= sl_candidate_bar):
+                # Favorable exit condition: If trade reached Take Profit or +2.5R before any stop loss, bank the profit!
+                exit_price = tp_candidate_price
+                exit_reason = tp_candidate_reason
+                exit_bar_time = tp_candidate_bar
+            elif sl_candidate_bar:
+                # Trade never reached TP and breached Stop Loss:
+                # Enforce Stop Loss protection at defined protective barrier (e.g. 47.45) to prevent runaway loss
+                exit_price = sl_candidate_price
+                exit_reason = "STOP_LOSS"
+                exit_bar_time = sl_candidate_bar
 
-        # -------------------------------------------------------------
-        # RULE 6: Stage 1 +0.7R Fee-Padded Breakeven
-        # -------------------------------------------------------------
-        breakeven_price = None
-        if favorable_r >= self.breakeven_trigger_r:
-            breakeven_price = (entry + fee_buffer_per_share) if side == "BUY" else (entry - fee_buffer_per_share)
-
-        # -------------------------------------------------------------
-        # RULE 7: Trailing Stop (+1.4R / 1.2% with 0.4% Giveback)
-        # -------------------------------------------------------------
-        trailing_stop_price = None
-        if (side == "BUY" and best_favourable >= entry * (Decimal("1") + self.trailing_trigger_pct)) or \
-           (side == "SELL" and best_favourable <= entry * (Decimal("1") - self.trailing_trigger_pct)):
-            if side == "BUY":
-                trailing_stop_price = best_favourable * (Decimal("1") - self.trailing_giveback_pct)
-            else:
-                trailing_stop_price = best_favourable * (Decimal("1") + self.trailing_giveback_pct)
-
-        # -------------------------------------------------------------
-        # Evaluate Stops & Targets Against Current Live Price
-        # -------------------------------------------------------------
+        # Also incorporate latest live price into excursion if no historical exit triggered
         if not exit_reason:
             if side == "BUY":
-                if trailing_stop_price and latest_price <= trailing_stop_price:
-                    exit_price = max(trailing_stop_price, breakeven_price or trailing_stop_price)
-                    exit_reason = "TRAILING_STOP"
-                elif profit_lock_price and latest_price <= profit_lock_price:
-                    exit_price = profit_lock_price
-                    exit_reason = "PROFIT_LOCK_STOP"
-                elif breakeven_price and latest_price <= breakeven_price:
-                    exit_price = breakeven_price
-                    exit_reason = "BREAKEVEN_STOP"
-                elif effective_sl and latest_price <= effective_sl:
-                    exit_price = effective_sl
-                    exit_reason = "STOP_LOSS"
-                elif take_profit and latest_price >= take_profit:
-                    exit_price = take_profit
-                    exit_reason = "TAKE_PROFIT"
+                best_favourable = max(best_favourable, latest_price)
+                worst_adverse = min(worst_adverse, latest_price)
+                favorable_r = max(favorable_r, (best_favourable - entry) / r_points)
+                current_r = (latest_price - entry) / r_points
             else:
-                if trailing_stop_price and latest_price >= trailing_stop_price:
-                    exit_price = min(trailing_stop_price, breakeven_price or trailing_stop_price)
-                    exit_reason = "TRAILING_STOP"
-                elif profit_lock_price and latest_price >= profit_lock_price:
-                    exit_price = profit_lock_price
-                    exit_reason = "PROFIT_LOCK_STOP"
-                elif breakeven_price and latest_price >= breakeven_price:
-                    exit_price = breakeven_price
-                    exit_reason = "BREAKEVEN_STOP"
-                elif effective_sl and latest_price >= effective_sl:
-                    exit_price = effective_sl
-                    exit_reason = "STOP_LOSS"
-                elif take_profit and latest_price <= take_profit:
-                    exit_price = take_profit
-                    exit_reason = "TAKE_PROFIT"
+                best_favourable = min(best_favourable, latest_price)
+                worst_adverse = max(worst_adverse, latest_price)
+                favorable_r = max(favorable_r, (entry - best_favourable) / r_points)
+                current_r = (entry - latest_price) / r_points
+
+            # -------------------------------------------------------------
+            # Intraday-Only Protections (Bypassed For Multi-Day / Swing Setups)
+            # -------------------------------------------------------------
+            if not is_multi_day:
+                # RULE 1: Immediate Adverse Cut (0 to 90 seconds)
+                if elapsed_seconds <= self.adverse_cut_window_seconds:
+                    if current_r <= -self.adverse_cut_threshold_r and favorable_r <= Decimal("0.10"):
+                        exit_price = latest_price
+                        exit_reason = "EARLY_ADVERSE_CUT"
+
+                # RULE 2: Dynamic Stop Tightening at 5m
+                if not exit_reason and elapsed_seconds >= self.stagnation_tighten_seconds and favorable_r < Decimal("0.20"):
+                    if side == "BUY":
+                        tightened_sl = entry - self.stagnation_tighten_r * r_points
+                        running_sl = max(running_sl, tightened_sl) if running_sl else tightened_sl
+                    else:
+                        tightened_sl = entry + self.stagnation_tighten_r * r_points
+                        running_sl = min(running_sl, tightened_sl) if running_sl else tightened_sl
+
+                # RULE 3: 15-Minute STAGNATION_GUARD
+                if not exit_reason and elapsed_seconds >= self.stagnation_scratch_seconds:
+                    if favorable_r < self.stagnation_min_expansion_r:
+                        exit_price = latest_price
+                        exit_reason = "STAGNATION_GUARD"
+
+            # -------------------------------------------------------------
+            # Trailing Stops, Profit Locks & Breakeven Stops
+            # -------------------------------------------------------------
+            profit_lock_price = None
+            if favorable_r >= self.profit_lock_trigger_r:
+                profit_lock_price = (entry + self.profit_lock_guaranteed_r * r_points) if side == "BUY" else (entry - self.profit_lock_guaranteed_r * r_points)
+
+            breakeven_price = None
+            if favorable_r >= self.breakeven_trigger_r:
+                breakeven_price = (entry + fee_buffer_per_share) if side == "BUY" else (entry - fee_buffer_per_share)
+
+            trailing_stop_price = None
+            if favorable_r >= self.trailing_trigger_r:
+                if side == "BUY":
+                    trailing_stop_price = best_favourable - self.trailing_giveback_r * r_points
+                else:
+                    trailing_stop_price = best_favourable + self.trailing_giveback_r * r_points
+
+            # Trailing Stop & Profit Lock Level Update & Database Persistence
+            trailed_sl = running_sl
+            if side == "BUY":
+                candidates = [p for p in (running_sl, profit_lock_price, breakeven_price, trailing_stop_price) if p is not None]
+                if candidates:
+                    trailed_sl = max(candidates)
+            else:
+                candidates = [p for p in (running_sl, profit_lock_price, breakeven_price, trailing_stop_price) if p is not None]
+                if candidates:
+                    trailed_sl = min(candidates)
+
+            # Persist trailed stop loss to DB if it has improved and position is still open
+            orig_sl = Decimal(str(pos["stop_loss_price"])) if pos.get("stop_loss_price") else None
+            improved = False
+            if trailed_sl is not None:
+                if orig_sl is None:
+                    improved = True
+                elif side == "BUY" and trailed_sl > orig_sl:
+                    improved = True
+                elif side == "SELL" and trailed_sl < orig_sl:
+                    improved = True
+
+            if improved:
+                running_sl = trailed_sl
+                try:
+                    with self.engine.begin() as conn:
+                        conn.execute(
+                            text("UPDATE shadow_execution_audits SET stop_loss_price = :sl WHERE id = :id AND net_pnl IS NULL"),
+                            {"sl": round(float(trailed_sl), 4), "id": int(pos["id"])}
+                        )
+                    logger.info(f"PositionManager Trailed SL for #{pos['id']} {pos['symbol']}: {orig_sl} -> {round(float(trailed_sl), 4)}")
+                except Exception as upd_err:
+                    logger.warning(f"Could not persist trailed stop for #{pos['id']}: {upd_err}")
+
+            # Evaluate Stops & Targets Against Current Live Price
+            if not exit_reason:
+                if side == "BUY":
+                    if trailing_stop_price and latest_price <= trailing_stop_price:
+                        exit_price = max(trailing_stop_price, profit_lock_price or breakeven_price or trailing_stop_price)
+                        exit_reason = "TRAILING_STOP"
+                    elif profit_lock_price and latest_price <= profit_lock_price:
+                        exit_price = profit_lock_price
+                        exit_reason = "PROFIT_LOCK_STOP"
+                    elif breakeven_price and latest_price <= breakeven_price:
+                        exit_price = breakeven_price
+                        exit_reason = "BREAKEVEN_STOP"
+                    elif running_sl and latest_price <= running_sl:
+                        exit_price = running_sl
+                        exit_reason = "STOP_LOSS"
+                    elif take_profit and latest_price >= take_profit:
+                        exit_price = take_profit
+                        exit_reason = "TAKE_PROFIT"
+                else:
+                    if trailing_stop_price and latest_price >= trailing_stop_price:
+                        exit_price = min(trailing_stop_price, profit_lock_price or breakeven_price or trailing_stop_price)
+                        exit_reason = "TRAILING_STOP"
+                    elif profit_lock_price and latest_price >= profit_lock_price:
+                        exit_price = profit_lock_price
+                        exit_reason = "PROFIT_LOCK_STOP"
+                    elif breakeven_price and latest_price >= border_sl if (border_sl := breakeven_price) else False:
+                        exit_price = breakeven_price
+                        exit_reason = "BREAKEVEN_STOP"
+                    elif running_sl and latest_price >= running_sl:
+                        exit_price = running_sl
+                        exit_reason = "STOP_LOSS"
+                    elif take_profit and latest_price <= take_profit:
+                        exit_price = take_profit
+                        exit_reason = "TAKE_PROFIT"
+        else:
+            # If historical exit triggered, calculate current_r and favorable_r accurately
+            if side == "BUY":
+                favorable_r = max(favorable_r, (best_favourable - entry) / r_points)
+                current_r = ((exit_price or latest_price) - entry) / r_points
+            else:
+                favorable_r = max(favorable_r, (entry - best_favourable) / r_points)
+                current_r = (entry - (exit_price or latest_price)) / r_points
 
         # -------------------------------------------------------------
         # Mode-Specific Exits: Swing Multi-Day vs Intraday 15:15 RMS Cutoff
         # -------------------------------------------------------------
         if not exit_reason:
-            if trade_mode == "SWING":
+            if is_multi_day:
+                # Multi-day holding condition: continue holding up to max holding days / expiry week
                 signal_date = signal_at.astimezone(IST).date()
                 current_date = watermark.astimezone(IST).date()
                 days_held = (current_date - signal_date).days
@@ -354,7 +594,7 @@ class PositionManager:
         # If exit condition triggered, record shadow exit immediately with non-blocking call
         if exit_reason and exit_price:
             logger.info(f"PositionManager Triggered Exit: #{pos['id']} {pos['symbol']} via {exit_reason} at {exit_price}")
-            record_shadow_exit(self.engine, int(pos["id"]), exit_price, exit_reason, exit_at=watermark)
+            record_shadow_exit(self.engine, int(pos["id"]), exit_price, exit_reason, exit_at=exit_bar_time or watermark)
             telemetry["closed"] = True
 
         return telemetry

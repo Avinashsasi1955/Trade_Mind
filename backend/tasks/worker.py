@@ -134,7 +134,7 @@ celery_app.conf.beat_schedule = {
     },
     "continuous-high-frequency-position-defense": {
         "task": "backend.tasks.worker.run_position_defense_loop",
-        "schedule": 5.0,
+        "schedule": 1.0,
     },
 }
 
@@ -357,7 +357,7 @@ def run_live_paper_inference(self) -> Dict:
 def run_position_defense_loop(self) -> Dict:
     """High-frequency position defense loop: cuts adverse moves, tightens stagnation stops, and locks profits."""
     global _position_manager
-    lock = _acquire_lock("position-defense", 8)
+    lock = _acquire_lock("position-defense", 2)
     if not lock:
         return {"status": "skipped", "reason": "another worker holds position-defense lock"}
     try:

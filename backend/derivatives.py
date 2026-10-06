@@ -202,6 +202,10 @@ def choose_derivative_strategy(market_view: str, volatility: str = "neutral", ha
         return "Protective Collar"
     if has_position and view in {"neutral", "mildly bullish", "sideways"}:
         return "Covered Call"
+    if vol in {"expanding", "high", "volatile", "extreme"} and view in {"bearish", "strong_bearish"}:
+        return "Bearish Collar"
+    if vol in {"expanding", "high", "volatile", "extreme"} and view in {"bullish", "strong_bullish"}:
+        return "Bullish Collar"
     if vol in {"expanding", "high"} and view in {"neutral", "sideways"}:
         return "Long Straddle"
     if vol in {"contracting", "low"} and view in {"neutral", "sideways"}:
@@ -326,6 +330,22 @@ def build_derivative_plan(symbol: str, spot: float, market_view: str, volatility
             _leg("BUY", format_tradable_option_symbol(norm, expiry_dt, atm, "CE")["trading_symbol"], atm, "CE", 1, p_c, g_c),
             _leg("BUY", format_tradable_option_symbol(norm, expiry_dt, atm, "PE")["trading_symbol"], atm, "PE", 1, p_p, g_p),
         ]
+    elif selected in {"Bearish Collar", "Short Risk Reversal"}:
+        # Senior Trader Volatile Crash Hedge: Sell OTM Call (Resistance) + Buy ATM Put (Protection)
+        p_sc, g_sc = _price_opt(otm_1_call, "CE")
+        p_bp, g_bp = _price_opt(atm, "PE")
+        legs = [
+            _leg("SELL", format_tradable_option_symbol(norm, expiry_dt, otm_1_call, "CE")["trading_symbol"], otm_1_call, "CE", 1, p_sc, g_sc),
+            _leg("BUY", format_tradable_option_symbol(norm, expiry_dt, atm, "PE")["trading_symbol"], atm, "PE", 1, p_bp, g_bp),
+        ]
+    elif selected in {"Bullish Collar", "Long Risk Reversal"}:
+        # Volatile Dip Hedge: Sell OTM Put (Support) + Buy ATM Call (Upside)
+        p_sp, g_sp = _price_opt(otm_1_put, "PE")
+        p_bc, g_bc = _price_opt(atm, "CE")
+        legs = [
+            _leg("SELL", format_tradable_option_symbol(norm, expiry_dt, otm_1_put, "PE")["trading_symbol"], otm_1_put, "PE", 1, p_sp, g_sp),
+            _leg("BUY", format_tradable_option_symbol(norm, expiry_dt, atm, "CE")["trading_symbol"], atm, "CE", 1, p_bc, g_bc),
+        ]
     elif selected == "Long Future":
         legs = [_leg("BUY", f"{norm}-FUT", None, None, 1, 0.0, {"delta": 1.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0})]
     elif selected in {"Short Future", "Index Futures Hedge"}:
@@ -357,10 +377,14 @@ def build_derivative_plan(symbol: str, spot: float, market_view: str, volatility
 
     # Payoff calculations
     width = step
-    defined = selected not in {"Long Future", "Short Future", "Index Futures Hedge", "Covered Call"}
+    defined = selected not in {
+        "Long Future", "Short Future", "Index Futures Hedge", "Covered Call",
+        "Bearish Collar", "Short Risk Reversal", "Bullish Collar", "Long Risk Reversal"
+    }
     max_gain = None
     max_loss = None
     breakeven = None
+    stop_based_loss_estimate = None
 
     if selected in {"Bull Call Spread", "Bear Put Spread"}:
         debit = abs(net_cashflow)
@@ -382,6 +406,20 @@ def build_derivative_plan(symbol: str, spot: float, market_view: str, volatility
         max_gain = "Unlimited"
         max_loss = round(debit * lot_size, 2)
         breakeven = f"{round(atm - debit, 2)} / {round(atm + debit, 2)}"
+    elif selected in {"Bearish Collar", "Short Risk Reversal"}:
+        net_debit = -net_cashflow
+        breakeven = round(atm - net_debit, 2)
+        max_gain = round(max(0.0, atm - net_debit) * lot_size, 2)
+        p_call = next((l["estimated_premium"] for l in legs if l["side"] == "SELL"), 50.0)
+        stop_based_loss_estimate = round((1.5 * p_call + max(0.0, net_debit)) * lot_size, 2)
+        max_loss = "Unlimited"
+    elif selected in {"Bullish Collar", "Long Risk Reversal"}:
+        net_debit = -net_cashflow
+        breakeven = round(atm + net_debit, 2)
+        max_gain = "Unlimited"
+        p_put = next((l["estimated_premium"] for l in legs if l["side"] == "SELL"), 50.0)
+        stop_based_loss_estimate = round((1.5 * p_put + max(0.0, net_debit)) * lot_size, 2)
+        max_loss = round(max(0.0, otm_1_put + net_debit) * lot_size, 2)
     elif defined:
         max_gain = round(abs(net_cashflow) * lot_size, 2)
         max_loss = round(width * lot_size, 2)
@@ -396,6 +434,9 @@ def build_derivative_plan(symbol: str, spot: float, market_view: str, volatility
     total_fo_fee = round(brokerage_fee + stt_fee + 15.0, 2)  # exchange txn + GST
     spread_notional = max(100.0, width * lot_size)
     fee_drag_pct = round((total_fo_fee / spread_notional) * 100.0, 2)
+
+    margin_benefit = 68.5 if any(k in selected for k in ("Spread", "Condor", "Butterfly")) else 0.0
+    margin_req = 38000.0 if any(k in selected for k in ("Spread", "Condor", "Butterfly")) else 125000.0
 
     return {
         "symbol": norm,
@@ -423,10 +464,11 @@ def build_derivative_plan(symbol: str, spot: float, market_view: str, volatility
             "strike_width": width,
             "max_profit": max_gain,
             "max_loss": max_loss,
+            "stop_based_loss_estimate": stop_based_loss_estimate,
             "breakeven": breakeven,
             "risk_reward_ratio": round(float(max_gain) / max(1.0, float(max_loss)), 2) if (isinstance(max_gain, (int, float)) and isinstance(max_loss, (int, float)) and max_loss > 0) else None,
-            "margin_benefit_pct": 68.5 if "Spread" in selected or "Condor" in selected or "Butterfly" in selected else 0.0,
-            "estimated_margin_required": round(35000 if ("Spread" in selected or "Condor" in selected) else 125000, 2),
+            "margin_benefit_pct": margin_benefit,
+            "estimated_margin_required": margin_req,
             "fee_drag_pct": fee_drag_pct,
             "total_estimated_fee_inr": total_fo_fee,
         },
@@ -441,11 +483,51 @@ def build_derivative_plan(symbol: str, spot: float, market_view: str, volatility
     }
 
 
+def classify_market_regime(vix: Optional[float] = None, atr_ratio: Optional[float] = None,
+                           breadth_ratio: Optional[float] = None, trend: str = "neutral") -> Dict[str, str]:
+    """Classifies market into quantitative volatility and structural regimes.
+
+    Returns dict with 'regime', 'volatility', and 'recommended_strategy'.
+    """
+    is_high_vol = (vix is not None and vix >= 15.5) or (atr_ratio is not None and atr_ratio >= 1.35)
+    is_extreme_vol = (vix is not None and vix >= 20.0) or (atr_ratio is not None and atr_ratio >= 1.8)
+    tr = trend.lower().strip()
+
+    if is_extreme_vol or (is_high_vol and tr in {"bearish", "crash", "strong_bearish"}):
+        regime = "BEAR_CRASH_HIGH_VOL" if tr in {"bearish", "crash", "strong_bearish"} else "VOLATILE_SHOCK"
+        vol = "extreme" if is_extreme_vol else "high"
+        strat = "Bearish Collar" if tr in {"bearish", "crash", "strong_bearish"} else "Long Straddle"
+    elif is_high_vol and tr in {"bullish", "strong_bullish"}:
+        regime = "BULL_TREND_HIGH_VOL"
+        vol = "high"
+        strat = "Bullish Collar"
+    elif not is_high_vol and tr in {"bullish", "strong_bullish"}:
+        regime = "BULL_TREND_LOW_VOL"
+        vol = "contracting"
+        strat = "Bull Call Spread"
+    elif not is_high_vol and tr in {"bearish", "strong_bearish"}:
+        regime = "BEAR_TREND_LOW_VOL"
+        vol = "contracting"
+        strat = "Bear Put Spread"
+    else:
+        regime = "SIDEWAYS_RANGEBOUND"
+        vol = "contracting"
+        strat = "Iron Condor" if is_high_vol else "Iron Butterfly"
+
+    return {
+        "regime": regime,
+        "volatility": vol,
+        "recommended_strategy": strat,
+    }
+
+
 def multi_leg_spread_catalog(symbol: str = "NIFTY", spot: float = 24500.0,
                              expiry_type: str = "weekly") -> List[Dict]:
     """Generates the primary defined-risk multi-leg spread setups for a given security."""
     norm = symbol.upper().replace("-EQ", "").replace("-FUT", "").strip()
     return [
+        build_derivative_plan(norm, spot, "bearish", "extreme", strategy="Bearish Collar", expiry_type=expiry_type),
+        build_derivative_plan(norm, spot, "bullish", "extreme", strategy="Bullish Collar", expiry_type=expiry_type),
         build_derivative_plan(norm, spot, "bullish", "expanding", strategy="Bull Call Spread", expiry_type=expiry_type),
         build_derivative_plan(norm, spot, "bullish", "neutral", strategy="Bull Put Spread", expiry_type=expiry_type),
         build_derivative_plan(norm, spot, "bearish", "expanding", strategy="Bear Put Spread", expiry_type=expiry_type),
@@ -457,20 +539,29 @@ def multi_leg_spread_catalog(symbol: str = "NIFTY", spot: float = 24500.0,
 
 
 def build_index_spread_ticket(symbol: str, spot: float, signal: int, regime: str = "sideways",
-                              allocation_capital: float = 50000.0) -> Optional[Dict]:
+                              allocation_capital: float = 50000.0, volatility: str = "neutral") -> Optional[Dict]:
     """High-level connector for LivePaperInference: converts ML signal into an index spread ticket.
 
+    Dynamically selects Bearish Collar / Bullish Collar when volatility regime is elevated.
     Returns None if signal is flat (0).
     """
     if signal == 0:
         return None
     norm = symbol.upper().replace("-EQ", "").replace("-FUT", "").strip()
     if norm not in INDEX_SPECS:
-        # Default to NIFTY for index routing
         norm = "NIFTY"
+
+    vol = volatility.lower().strip()
+    reg = regime.lower().strip()
+    is_volatile = vol in {"expanding", "high", "volatile", "extreme"} or any(
+        k in reg for k in ("volatile", "crash", "shock", "expanding", "defense", "breakdown")
+    )
+
     view = "bullish" if signal > 0 else "bearish"
-    strategy = "Bull Call Spread" if signal > 0 else "Bear Put Spread"
-    plan = build_derivative_plan(norm, spot, view, volatility="neutral", strategy=strategy, expiry_type="weekly")
+    effective_vol = "high" if is_volatile else vol
+    strategy = choose_derivative_strategy(view, volatility=effective_vol)
+
+    plan = build_derivative_plan(norm, spot, view, volatility=effective_vol, strategy=strategy, expiry_type="weekly")
     return {
         "ticket_type": "INDEX_DERIVATIVE_SPREAD",
         "symbol": norm,

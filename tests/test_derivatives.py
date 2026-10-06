@@ -52,7 +52,7 @@ class TestDerivativesMapping(unittest.TestCase):
 
     def test_multileg_catalog_nifty(self):
         catalog = multi_leg_spread_catalog("NIFTY", 24500.0, expiry_type="weekly")
-        self.assertEqual(len(catalog), 7)
+        self.assertEqual(len(catalog), 9)
         strategies = {s["strategy"] for s in catalog}
         self.assertIn("Bull Call Spread", strategies)
         self.assertIn("Bull Put Spread", strategies)
@@ -72,7 +72,7 @@ class TestDerivativesMapping(unittest.TestCase):
 
     def test_multileg_catalog_banknifty(self):
         catalog = multi_leg_spread_catalog("BANKNIFTY", 52150.0, expiry_type="weekly")
-        self.assertEqual(len(catalog), 7)
+        self.assertEqual(len(catalog), 9)
         for spread in catalog:
             self.assertEqual(spread["lot_size"], 30)
             self.assertEqual(spread["strike_step"], 100)
@@ -99,7 +99,7 @@ class TestDerivativesMapping(unittest.TestCase):
     def test_derivatives_spreads_service(self):
         res = derivatives_spreads("BANKNIFTY")
         self.assertEqual(res["symbol"], "BANKNIFTY")
-        self.assertEqual(res["spreads_count"], 7)
+        self.assertEqual(res["spreads_count"], 9)
         self.assertGreater(res["spot_price"], 30000.0)  # Correctly identifies BANKNIFTY not NIFTY
 
 

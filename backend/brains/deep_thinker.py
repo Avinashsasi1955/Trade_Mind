@@ -69,11 +69,11 @@ class DeepThinker:
         # 2. Multi-Timeframe Alignment
         mtf = candidate.get("multi_timeframe") or candidate.get("_multi_timeframe") or {}
         frames = mtf.get("frames", [])
-        aligned_frames = mtf.get("aligned_frames", 0)
-        total_ready = mtf.get("ready_frames", 0)
-        higher_tf_bias = "neutral"
+        aligned_frames = mtf.get("aligned_frames", len(frames))
+        total_ready = mtf.get("ready_frames", len(frames))
+        higher_tf_bias = mtf.get("higher_tf_bias") or "neutral"
         for f in frames:
-            if f.get("timeframe") in ("1H", "1D"):
+            if f.get("timeframe") in ("1H", "1D") and f.get("bias"):
                 higher_tf_bias = f.get("bias", "neutral")
 
         thought_chain.append(
@@ -81,34 +81,54 @@ class DeepThinker:
         )
 
         # 3. Mode Evaluation: INTRADAY vs SWING
-        target_mode = proposed_mode
+        mode_in = candidate.get("proposed_mode") or proposed_mode or "INTRADAY"
+        target_mode = mode_in
         gap_risk_warning = None
         verdict = "APPROVE"
 
         # Check if SWING mode is requested or justifiable
-        is_swing_candidate = proposed_mode == "SWING" or (
+        is_swing_candidate = mode_in == "SWING" or (
             quality_score >= 76.0 and aligned_frames >= 3 and higher_tf_bias in ("call", "put")
         )
 
         if is_swing_candidate:
             # Swing safety invariants
-            if instrument_type in ("CE", "PE") and not candidate.get("spread_basket_id"):
-                # Naked options CANNOT be held as swing overnight
+            dte = float(candidate.get("dte_days") or (candidate.get("greeks") or {}).get("dte_days") or 0.0)
+            is_opt = str(instrument_type or "").upper() in ("CE", "PE")
+            
+            # 1. Regulatory Guard: Cash equity shorts cannot be held overnight in Indian markets
+            inst_upper = str(instrument_type or "EQ").upper()
+            if inst_upper in ("EQ", "EQ_INTRADAY_SHORT") and side == "SELL":
                 target_mode = "INTRADAY"
                 thought_chain.append(
-                    "4. Swing Mode Guard: Naked option cannot be held overnight due to theta burn. Downgrading to INTRADAY."
+                    "4. Swing Mode Guard: Cash equity shorts are strictly intraday under exchange rules. Restricting to INTRADAY."
                 )
-                gap_risk_warning = "Naked options prohibited from overnight hold without hedging leg."
-            elif higher_tf_bias != "neutral" and ((side == "BUY" and higher_tf_bias == "put") or (side == "SELL" and higher_tf_bias == "call")):
+            # 2. Options Theta Decay Guard: Short-dated naked options (<10 DTE) cannot be held overnight
+            elif is_opt and not candidate.get("spread_basket_id") and dte < 10.0:
                 target_mode = "INTRADAY"
                 thought_chain.append(
-                    "4. Swing Mode Guard: Setup counters higher-timeframe 1D trend corridor. Restricting to INTRADAY scalp."
+                    f"4. Swing Mode Guard: Near-term naked option (DTE {dte:.1f}d < 10d) cannot be held overnight due to theta burn. Downgrading to INTRADAY."
                 )
+                gap_risk_warning = "Short-dated naked options prohibited from overnight hold without hedging leg."
             else:
-                target_mode = "SWING"
-                thought_chain.append(
-                    "4. Swing Conviction: Strong 1D/1H alignment with high quality score justifies multi-day position."
-                )
+                # 3. Trend Corridor Alignment
+                if is_opt:
+                    # BUY CE = +1, SELL CE = -1, BUY PE = -1, SELL PE = +1
+                    underlying_dir = 1 if (side == "BUY" and instrument_type == "CE") or (side == "SELL" and instrument_type == "PE") else -1
+                else:
+                    underlying_dir = 1 if side == "BUY" else -1
+                
+                tf_dir = 1 if higher_tf_bias == "call" else (-1 if higher_tf_bias == "put" else 0)
+                if tf_dir != 0 and underlying_dir != tf_dir:
+                    target_mode = "INTRADAY"
+                    thought_chain.append(
+                        "4. Swing Mode Guard: Setup counters higher-timeframe 1D trend corridor. Restricting to INTRADAY scalp."
+                    )
+                else:
+                    target_mode = "SWING"
+                    thought_chain.append(
+                        "4. Swing Conviction: Strong multi-timeframe alignment with high quality score justifies multi-day position."
+                    )
         else:
             target_mode = "INTRADAY"
             thought_chain.append(

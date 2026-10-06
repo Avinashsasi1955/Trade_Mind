@@ -10,10 +10,10 @@ from backend.intelligence_memory import publish_brain_event
 from backend.transaction_costs import estimate_zerodha_costs
 
 
-STOP_LOSS_PCT = Decimal(os.getenv("NIVESH_PAPER_STOP_LOSS_PCT", "0.006"))
-TAKE_PROFIT_PCT = Decimal(os.getenv("NIVESH_PAPER_TAKE_PROFIT_PCT", "0.012"))
-OPTION_STOP_LOSS_PCT = Decimal(os.getenv("NIVESH_PAPER_OPTION_STOP_LOSS_PCT", "0.06"))
-OPTION_TAKE_PROFIT_PCT = Decimal(os.getenv("NIVESH_PAPER_OPTION_TAKE_PROFIT_PCT", "0.14"))
+STOP_LOSS_PCT = Decimal(os.getenv("NIVESH_PAPER_STOP_LOSS_PCT", "0.008"))
+TAKE_PROFIT_PCT = Decimal(os.getenv("NIVESH_PAPER_TAKE_PROFIT_PCT", "0.018"))
+OPTION_STOP_LOSS_PCT = Decimal(os.getenv("NIVESH_PAPER_OPTION_STOP_LOSS_PCT", "0.25"))
+OPTION_TAKE_PROFIT_PCT = Decimal(os.getenv("NIVESH_PAPER_OPTION_TAKE_PROFIT_PCT", "0.50"))
 
 
 def classify_probability(probability: float, lower: float = .35, upper: float = .65) -> int:
@@ -56,7 +56,8 @@ def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:
         if strategy_note:
             try:
                 note=json.loads(strategy_note) if str(strategy_note).strip().startswith("{") else {}
-                trade_mode = str(note.get("trade_mode") or "INTRADAY").upper()
+                if note.get("trade_mode"):
+                    trade_mode = str(note.get("trade_mode")).upper()
                 if note.get("reasoning_chain"):
                     reasoning_chain_json = json.dumps(note.get("reasoning_chain"), default=str)
                 chart_sl=note.get("strategy_stop_loss")

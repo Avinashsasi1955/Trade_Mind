@@ -5,7 +5,10 @@ import subprocess
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-import boto3
+try:
+    import boto3
+except ImportError:
+    boto3 = None
 import psycopg2
 
 ROOT=Path(__file__).resolve().parent.parent

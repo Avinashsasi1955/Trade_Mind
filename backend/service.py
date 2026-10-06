@@ -262,6 +262,129 @@ def dashboard(db: sqlite3.Connection, user_id: int) -> Dict:
             "market_data_mode":live["data_mode"] if live else "simulated"}
 
 
+def calculate_institutional_metrics(closed_trades: List[Dict], capital: float = 1_000_000.0) -> Dict:
+    """Calculates authentic, institutional risk and performance statistics.
+    
+    Adheres strictly to quantitative portfolio standards:
+    - Zero mock/fantasy numbers.
+    - Chronological equity curve peak-to-trough drawdown.
+    - Annualized Daily Sharpe Ratio (sqrt(252)).
+    - Annualized Downside Semi-Variance Sortino Ratio.
+    - Gross Win / Gross Loss Profit Factor.
+    - Closed Win / Closed Trades Win Rate.
+    """
+    total_trades = len(closed_trades)
+    if total_trades == 0:
+        return {
+            "total_trades": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "win_rate_pct": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "profit_factor": 0.0,
+            "realised_pnl": 0.0,
+            "sharpe_ratio": 0.0,
+            "sortino_ratio": 0.0,
+            "max_drawdown_pct": 0.0,
+            "roi_pct": 0.0,
+        }
+
+    sorted_trades = sorted(
+        closed_trades,
+        key=lambda t: str(t.get("signal_at") or t.get("exit_at") or "")
+    )
+    
+    pnls = [
+        float(t.get("net_pnl") if t.get("net_pnl") is not None else (t.get("marked_pnl") or 0.0))
+        for t in sorted_trades
+    ]
+    
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    
+    win_rate = round((len(wins) / total_trades) * 100.0, 2)
+    gross_profit = round(sum(wins), 2)
+    gross_loss = round(abs(sum(losses)), 2)
+    
+    if gross_loss > 0:
+        profit_factor = round(gross_profit / gross_loss, 2)
+    elif gross_profit > 0:
+        profit_factor = 999.0
+    else:
+        profit_factor = 0.0
+
+    equity = float(capital)
+    peak = equity
+    max_dd_pct = 0.0
+    for p in pnls:
+        equity += p
+        if equity > peak:
+            peak = equity
+        if peak > 0:
+            dd = (peak - equity) / peak * 100.0
+            if dd > max_dd_pct:
+                max_dd_pct = dd
+    max_dd_pct = round(max_dd_pct, 2)
+
+    daily_pnl: Dict[str, float] = {}
+    for t in sorted_trades:
+        d_str = str(t.get("signal_at") or t.get("exit_at") or "")[:10]
+        val = float(t.get("net_pnl") if t.get("net_pnl") is not None else (t.get("marked_pnl") or 0.0))
+        daily_pnl[d_str] = daily_pnl.get(d_str, 0.0) + val
+
+    daily_returns = [p / max(1.0, capital) for p in daily_pnl.values()]
+    
+    if len(daily_returns) > 1:
+        mean_ret = sum(daily_returns) / len(daily_returns)
+        var_ret = sum((r - mean_ret) ** 2 for r in daily_returns) / (len(daily_returns) - 1)
+        std_ret = math.sqrt(var_ret) if var_ret > 0 else 0.0
+        
+        sharpe = round((mean_ret / std_ret) * math.sqrt(252), 2) if std_ret > 0 else 0.0
+        
+        downside_sq = [min(0.0, r) ** 2 for r in daily_returns]
+        downside_std = math.sqrt(sum(downside_sq) / len(daily_returns)) if daily_returns else 0.0
+        if downside_std > 0:
+            sortino = round((mean_ret / downside_std) * math.sqrt(252), 2)
+        elif mean_ret > 0:
+            sortino = 99.0
+        else:
+            sortino = 0.0
+    elif len(daily_returns) == 1:
+        if len(pnls) > 1:
+            trade_returns = [p / max(1.0, capital) for p in pnls]
+            mean_tr = sum(trade_returns) / len(trade_returns)
+            var_tr = sum((r - mean_tr) ** 2 for r in trade_returns) / (len(trade_returns) - 1)
+            std_tr = math.sqrt(var_tr) if var_tr > 0 else 0.0
+            sharpe = round((mean_tr / std_tr) * math.sqrt(252), 2) if std_tr > 0 else 0.0
+            downside_tr = math.sqrt(sum(min(0.0, r) ** 2 for r in trade_returns) / len(trade_returns))
+            sortino = round((mean_tr / downside_tr) * math.sqrt(252), 2) if downside_tr > 0 else (99.0 if mean_tr > 0 else 0.0)
+        else:
+            sharpe = 0.0
+            sortino = 0.0
+    else:
+        sharpe = 0.0
+        sortino = 0.0
+
+    realised_pnl = round(sum(pnls), 2)
+    roi_pct = round((realised_pnl / max(1.0, capital)) * 100.0, 3)
+
+    return {
+        "total_trades": total_trades,
+        "winning_trades": len(wins),
+        "losing_trades": len(losses),
+        "win_rate_pct": win_rate,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "profit_factor": profit_factor,
+        "realised_pnl": realised_pnl,
+        "sharpe_ratio": sharpe,
+        "sortino_ratio": sortino,
+        "max_drawdown_pct": max_dd_pct,
+        "roi_pct": roi_pct,
+    }
+
+
 def shadow_trade_book(limit: int = 200) -> Dict:
     """Open and closed ML shadow-paper trades.
 
@@ -271,6 +394,8 @@ def shadow_trade_book(limit: int = 200) -> Dict:
     """
     empty_summary = {"open_trades": 0, "closed_trades": 0, "realised_pnl": 0, "unrealised_pnl": 0,
                      "net_marked_pnl": 0, "win_rate_pct": 0, "profit_factor": 0, "estimated_fees": 0,
+                     "sharpe_ratio": 0.0, "sortino_ratio": 0.0, "max_drawdown_pct": 0.0,
+                     "gross_profit": 0.0, "gross_loss": 0.0, "roi_pct": 0.0,
                      "avg_quality_score": 0, "open_quality_score": 0, "closed_quality_score": 0,
                      "quality_feedback": quality_feedback([]), "exit_reasons": {}, "mistake_tags": {}}
     if not DATABASE_URL:
@@ -314,7 +439,7 @@ def shadow_trade_book(limit: int = 200) -> Dict:
                            ELSE 'BREAKDOWN_PUT_BUY'
                        END
                    ) AS strategy_tag,
-                   i.symbol,i.exchange,i.instrument_type
+                   i.symbol,i.exchange,i.instrument_type,i.underlying_symbol,i.strike,i.expiry
             FROM shadow_execution_audits a
             JOIN instrument_master i ON i.id=a.instrument_id
             LEFT JOIN adaptive_trade_rewards atr ON atr.audit_id=a.id
@@ -335,6 +460,27 @@ def shadow_trade_book(limit: int = 200) -> Dict:
                     ORDER BY instrument_id, bar_time DESC"""),
                     {"ids": instrument_ids}).fetchall()
                 latest_price_map = {int(r[0]): float(r[1]) for r in price_rows if r[1] is not None}
+                # Option contract mark-to-market fallback: derive price from underlying stock spot
+                missing_opt_rows = [r for r in rows if r["net_pnl"] is None and int(r["instrument_id"]) not in latest_price_map and r.get("instrument_type") in ("CE", "PE")]
+                if missing_opt_rows:
+                    from backend.greeks_engine import calculate_black_scholes_greeks
+                    today_date = datetime.now(IST).date()
+                    for r in missing_opt_rows:
+                        und_sym = str(r.get("underlying_symbol") or r.get("symbol") or "").split()[0]
+                        und_bar = connection.execute(text("""SELECT close_price FROM live_market_bars b
+                            JOIN instrument_master im ON b.instrument_id = im.id
+                            WHERE im.instrument_type IN ('EQ', 'INDEX')
+                              AND (im.symbol = :und OR REPLACE(im.symbol, ' ', '') = :und OR im.underlying_symbol = :und)
+                              AND b.interval IN ('1minute', '5minute', 'day')
+                            ORDER BY b.bar_time DESC LIMIT 1"""), {"und": und_sym}).scalar_one_or_none()
+                        if und_bar:
+                            opt_info = connection.execute(text("SELECT strike, expiry FROM instrument_master WHERE id = :id"), {"id": int(r["instrument_id"])}).mappings().one_or_none()
+                            if opt_info and opt_info.get("strike"):
+                                strike = float(opt_info["strike"])
+                                expiry_dt = opt_info.get("expiry")
+                                dte = max(0.5, float((expiry_dt - today_date).days)) if expiry_dt else 4.0
+                                g = calculate_black_scholes_greeks(float(und_bar), strike, dte, iv=0.145, option_type=r["instrument_type"])
+                                latest_price_map[int(r["instrument_id"])] = max(0.05, round(g["price"], 2))
             if r_client:
                 try:
                     live_pos_raw = r_client.get("nivesh:positions:live")
@@ -427,12 +573,9 @@ def shadow_trade_book(limit: int = 200) -> Dict:
     def summarise(selected: List[Dict]) -> Dict:
         open_items=[item for item in selected if item["is_open"]]
         closed_items=[item for item in selected if not item["is_open"]]
-        realised_pnl=sum(float(item["marked_pnl"]) for item in closed_items)
+        inst_metrics = calculate_institutional_metrics(closed_items)
+        realised_pnl=inst_metrics["realised_pnl"]
         unrealised_pnl=sum(float(item["marked_pnl"]) for item in open_items)
-        wins=sum(1 for item in closed_items if float(item["marked_pnl"])>0)
-        losses=sum(1 for item in closed_items if float(item["marked_pnl"])<=0)
-        gross_profit=sum(float(item["marked_pnl"]) for item in closed_items if float(item["marked_pnl"])>0)
-        gross_loss=abs(sum(float(item["marked_pnl"]) for item in closed_items if float(item["marked_pnl"])<=0))
         estimated_fees=sum(float(item.get("estimated_fees") or 0) for item in selected)
         quality_scores=[float(item.get("quality",{}).get("score") or 0) for item in selected if item.get("quality")]
         closed_quality=[float(item.get("quality",{}).get("score") or 0) for item in closed_items if item.get("quality")]
@@ -446,9 +589,15 @@ def shadow_trade_book(limit: int = 200) -> Dict:
         return {"open_trades":len(open_items),"closed_trades":len(closed_items),
                 "realised_pnl":round(realised_pnl,2),"unrealised_pnl":round(unrealised_pnl,2),
                 "net_marked_pnl":round(realised_pnl+unrealised_pnl,2),
-                "winning_trades":wins,"losing_trades":losses,
-                "win_rate_pct":round(wins/max(1,len(closed_items))*100,2),
-                "profit_factor":round(gross_profit/gross_loss,4) if gross_loss else (999.0 if gross_profit else 0.0),
+                "winning_trades":inst_metrics["winning_trades"],"losing_trades":inst_metrics["losing_trades"],
+                "win_rate_pct":inst_metrics["win_rate_pct"],
+                "profit_factor":inst_metrics["profit_factor"],
+                "sharpe_ratio":inst_metrics["sharpe_ratio"],
+                "sortino_ratio":inst_metrics["sortino_ratio"],
+                "max_drawdown_pct":inst_metrics["max_drawdown_pct"],
+                "gross_profit":inst_metrics["gross_profit"],
+                "gross_loss":inst_metrics["gross_loss"],
+                "roi_pct":inst_metrics["roi_pct"],
                 "estimated_fees":round(estimated_fees,2),
                 "avg_quality_score":round(sum(quality_scores)/len(quality_scores),2) if quality_scores else 0,
                 "open_quality_score":round(sum(open_quality)/len(open_quality),2) if open_quality else 0,
@@ -476,15 +625,34 @@ def shadow_trade_book(limit: int = 200) -> Dict:
 
 
 def _latest_shadow_price(connection, audit_id: int) -> Decimal:
-    row=connection.execute(text("""SELECT a.id,a.instrument_id,a.theoretical_fill_price,a.decision_price
-        FROM shadow_execution_audits a WHERE a.id=:id AND a.audit_status='RECONCILED' AND a.net_pnl IS NULL"""),{"id":audit_id}).mappings().one_or_none()
+    row=connection.execute(text("""SELECT a.id,a.instrument_id,a.theoretical_fill_price,a.decision_price,
+            i.symbol, i.underlying_symbol, i.strike, i.expiry, i.instrument_type
+        FROM shadow_execution_audits a 
+        JOIN instrument_master i ON i.id = a.instrument_id
+        WHERE a.id=:id AND a.audit_status='RECONCILED' AND a.net_pnl IS NULL"""),{"id":audit_id}).mappings().one_or_none()
     if not row:
         raise ValueError("Open shadow-paper trade not found")
     latest=connection.execute(text("""SELECT close_price FROM live_market_bars
         WHERE instrument_id=:instrument AND interval IN ('1second','1minute','5minute','day')
         ORDER BY bar_time DESC, CASE interval WHEN '1second' THEN 0 WHEN '1minute' THEN 1 WHEN '5minute' THEN 2 ELSE 3 END
         LIMIT 1"""),{"instrument":row["instrument_id"]}).scalar_one_or_none()
-    return Decimal(str(latest or row["theoretical_fill_price"] or row["decision_price"]))
+    if latest:
+        return Decimal(str(latest))
+    if row.get("instrument_type") in ("CE", "PE") and row.get("strike"):
+        und = row.get("underlying_symbol") or row["symbol"].split()[0]
+        und_bar = connection.execute(text("""SELECT close_price FROM live_market_bars b
+            JOIN instrument_master im ON b.instrument_id = im.id
+            WHERE im.instrument_type IN ('EQ', 'INDEX')
+              AND (im.symbol = :und OR REPLACE(im.symbol, ' ', '') = :und OR im.underlying_symbol = :und)
+              AND b.interval IN ('1minute', '5minute', 'day')
+            ORDER BY b.bar_time DESC LIMIT 1"""), {"und": und}).scalar_one_or_none()
+        if und_bar:
+            from backend.greeks_engine import calculate_black_scholes_greeks
+            today_date = datetime.now(IST).date()
+            dte = max(0.5, float((row["expiry"] - today_date).days)) if row.get("expiry") else 4.0
+            g = calculate_black_scholes_greeks(float(und_bar), float(row["strike"]), dte, iv=0.145, option_type=row["instrument_type"])
+            return Decimal(str(max(0.05, round(g["price"], 2))))
+    return Decimal(str(row["theoretical_fill_price"] or row["decision_price"]))
 
 
 def exit_shadow_trade(audit_id: int) -> Dict:
@@ -2424,35 +2592,19 @@ def rl_controller_status(symbol: str = "NIFTY") -> Dict:
 
 
 def daily_executive_journal(db: sqlite3.Connection, user_id: int) -> Dict:
-    trades_data = shadow_trade_book(150)
+    trades_data = shadow_trade_book(300)
     closed = trades_data.get("closed", [])
     open_trades = trades_data.get("open", [])
     
-    total_trades = len(closed)
-    wins = [t for t in closed if float(t.get("net_pnl") or 0) > 0]
-    losses = [t for t in closed if float(t.get("net_pnl") or 0) <= 0]
-    
-    win_rate = round((len(wins) / max(1, total_trades)) * 100, 2)
-    gross_profits = sum(float(t.get("net_pnl") or 0) for t in wins)
-    gross_losses = abs(sum(float(t.get("net_pnl") or 0) for t in losses))
-    profit_factor = round(gross_profits / max(1.0, gross_losses), 2) if gross_losses > 0 else (round(gross_profits, 2) if gross_profits > 0 else 1.0)
-    
-    pnls = [float(t.get("net_pnl") or 0) for t in closed]
-    mean_pnl = sum(pnls) / max(1, len(pnls))
-    std_pnl = (sum((x - mean_pnl)**2 for x in pnls) / max(1, len(pnls)))**0.5
-    downside_pnl = [min(0.0, x) for x in pnls]
-    downside_std = (sum((x**2) for x in downside_pnl) / max(1, len(downside_pnl)))**0.5
-    
-    sharpe = round(mean_pnl / max(1.0, std_pnl), 2) if std_pnl > 0 else 1.45
-    sortino = round(mean_pnl / max(1.0, downside_std), 2) if downside_std > 0 else 2.15
+    inst_metrics = calculate_institutional_metrics(closed, capital=1_000_000.0)
     
     strat_map = {}
     for t in closed:
         s = t.get("strategy_label") or "Breakout Call (CE)"
         strat_map.setdefault(s, {"count": 0, "pnl": 0.0, "wins": 0})
         strat_map[s]["count"] += 1
-        strat_map[s]["pnl"] += float(t.get("net_pnl") or 0)
-        if float(t.get("net_pnl") or 0) > 0:
+        strat_map[s]["pnl"] += float(t.get("net_pnl") if t.get("net_pnl") is not None else (t.get("marked_pnl") or 0))
+        if float(t.get("net_pnl") if t.get("net_pnl") is not None else (t.get("marked_pnl") or 0)) > 0:
             strat_map[s]["wins"] += 1
     
     strategies_summary = [
@@ -2464,23 +2616,24 @@ def daily_executive_journal(db: sqlite3.Connection, user_id: int) -> Dict:
         "session_date": datetime.now(IST).strftime("%Y-%m-%d"),
         "report_generated_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
         "metrics": {
-            "total_trades": total_trades,
+            "total_trades": inst_metrics["total_trades"],
             "open_positions": len(open_trades),
-            "winning_trades": len(wins),
-            "losing_trades": len(losses),
-            "win_rate_pct": win_rate,
-            "realised_pnl": round(sum(pnls), 2),
-            "gross_profits": round(gross_profits, 2),
-            "gross_losses": round(gross_losses, 2),
-            "profit_factor": profit_factor,
-            "sharpe_ratio": sharpe,
-            "sortino_ratio": sortino,
-            "max_drawdown_pct": 2.14,
+            "winning_trades": inst_metrics["winning_trades"],
+            "losing_trades": inst_metrics["losing_trades"],
+            "win_rate_pct": inst_metrics["win_rate_pct"],
+            "realised_pnl": inst_metrics["realised_pnl"],
+            "gross_profits": inst_metrics["gross_profit"],
+            "gross_losses": inst_metrics["gross_loss"],
+            "profit_factor": inst_metrics["profit_factor"],
+            "sharpe_ratio": inst_metrics["sharpe_ratio"],
+            "sortino_ratio": inst_metrics["sortino_ratio"],
+            "max_drawdown_pct": inst_metrics["max_drawdown_pct"],
             "capital_allocated": 1000000.0,
-            "roi_pct": round((sum(pnls) / 1000000.0) * 100, 3),
+            "roi_pct": inst_metrics["roi_pct"],
         },
+        "today_metrics": trades_data.get("today"),
         "strategies_breakdown": strategies_summary,
-        "top_trades": sorted(closed, key=lambda x: float(x.get("net_pnl") or 0), reverse=True)[:5],
+        "top_trades": sorted(closed, key=lambda x: float(x.get("net_pnl") if x.get("net_pnl") is not None else (x.get("marked_pnl") or 0)), reverse=True)[:5],
         "compliance_note": "Paper execution journal audited for Model Promotion evidence under SEBI simulation standards. Live orders hard locked."
     }
 

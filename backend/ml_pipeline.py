@@ -748,8 +748,12 @@ def _load_all_features(store: ResearchStore, feature_set: str = DEFAULT_FEATURE_
 
 
 def estimated_trade_cost_bps(price: float, quantity: int, average_daily_value: float,
-                             base_charges_bps: float = 12.0) -> Dict:
-    notional=max(0,price*quantity); participation=notional/max(1,average_daily_value)
+                             base_charges_bps: float = 12.0, is_index: bool = False) -> Dict:
+    if is_index:
+        effective_adv = max(average_daily_value or 0.0, 500_000_000.0)
+    else:
+        effective_adv = average_daily_value if average_daily_value and average_daily_value > 0 else 1.0
+    notional=max(0,price*quantity); participation=notional/max(1,effective_adv)
     slippage=4.0+min(60.0,math.sqrt(participation)*100)
     impact=min(80.0,participation*10000*.10)
     return {"charges_bps":base_charges_bps,"charge_components":["brokerage","STT/CTT","exchange transaction charge","SEBI fee","GST","stamp duty/DP where applicable"],"slippage_bps":round(slippage,2),"impact_bps":round(impact,2),"total_bps":round(base_charges_bps+slippage+impact,2),"participation_pct":round(participation*100,4),"note":"Configurable estimate; rates vary by segment/date and must be reconciled against actual broker contract notes."}

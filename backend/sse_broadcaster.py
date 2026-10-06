@@ -192,12 +192,43 @@ def start_metrics_ticker(engine=None, redis_client=None) -> None:
                             if isinstance(p, dict):
                                 thought_text = p.get("summary") or p.get("reason") or p.get("thought") or thought_text
 
+                    r_client = None
+                    try:
+                        from backend.service import _get_redis
+                        r_client = _get_redis()
+                    except Exception:
+                        pass
+
+                    cached_today = None
+                    if r_client:
+                        try:
+                            raw = r_client.get("nivesh:cache:shadow_trade_book:100") or r_client.get("nivesh:cache:shadow_trade_book:200")
+                            if raw:
+                                book = json.loads(raw)
+                                cached_today = book.get("today")
+                        except Exception:
+                            pass
+
+                    if cached_today and isinstance(cached_today, dict):
+                        realised_pnl = float(cached_today.get("realised_pnl") if cached_today.get("realised_pnl") is not None else (row["realised_pnl"] or 0.0))
+                        unrealised_pnl = float(cached_today.get("unrealised_pnl") or 0.0)
+                        net_marked_pnl = float(cached_today.get("net_marked_pnl") if cached_today.get("net_marked_pnl") is not None else (realised_pnl + unrealised_pnl))
+                        open_count = int(cached_today.get("open_trades") if cached_today.get("open_trades") is not None else (row["open_count"] or 0))
+                        closed_count = int(cached_today.get("closed_trades") if cached_today.get("closed_trades") is not None else (row["closed_count"] or 0))
+                    else:
+                        realised_pnl = float(row["realised_pnl"] or 0.0)
+                        unrealised_pnl = 0.0
+                        net_marked_pnl = realised_pnl
+                        open_count = int(row["open_count"] or 0)
+                        closed_count = int(row["closed_count"] or 0)
+
                     tick_data = {
-                        "open_trades": int(row["open_count"] or 0),
-                        "closed_trades": int(row["closed_count"] or 0),
-                        "realised_pnl": round(float(row["realised_pnl"] or 0.0), 2),
-                        "unrealised_pnl": 0.0,
-                        "total_pnl": round(float(row["realised_pnl"] or 0.0), 2),
+                        "open_trades": open_count,
+                        "closed_trades": closed_count,
+                        "realised_pnl": round(realised_pnl, 2),
+                        "unrealised_pnl": round(unrealised_pnl, 2),
+                        "net_marked_pnl": round(net_marked_pnl, 2),
+                        "total_pnl": round(net_marked_pnl, 2),
                         "latest_thought": str(thought_text)[:140],
                         "active_connections": get_connected_clients_count(),
                         "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),

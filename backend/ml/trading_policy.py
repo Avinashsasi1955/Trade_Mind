@@ -62,21 +62,32 @@ def _minimum_confidence(regime: str, signal: int) -> float:
 
 
 def score_candidate(row: Dict, probability: float, raw_probability: float,
-                    estimated_cost_bps: float, edge_buffer_bps: float = 1.0) -> RankedCandidate:
+                    estimated_cost_bps: float, edge_buffer_bps: float = 1.0,
+                    direction: int = 0) -> RankedCandidate:
     features = row["features"]
     regime = classify_regime(features)
     is_intraday = "vp_shape_code" in features or "poc_distance_bps" in features
     reason = ""
 
+    candidate_dir = direction
+    if candidate_dir == 0:
+        candidate_dir = 1 if probability >= 0.50 else -1
+
+    if is_intraday and candidate_dir < 0:
+        # Intraday label is long-TP only; no calibrated short-side probability exists.
+        p_effective = 0.0
+    else:
+        p_effective = probability if candidate_dir >= 0 else (1.0 - probability)
+
     if is_intraday:
         expected_move_bps = max(60.0, min(500.0, float(features.get("atr_14", 0)) * 20000.0))
         # Asymmetric triple-barrier payoff: +1.0% (+100 bps) TP vs ~ -0.25% (-25 bps) avg SL/timeout
-        expected_gross = max(0.0, probability * 100.0 - (1.0 - probability) * 25.0)
+        expected_gross = max(0.0, p_effective * 100.0 - (1.0 - p_effective) * 25.0)
         expected_net = expected_gross - float(estimated_cost_bps)
         # Calibrated probability >= 0.30 represents > 2x edge over 15% base rate
-        signal = 1 if probability >= 0.30 else 0
+        signal = candidate_dir if p_effective >= 0.30 else 0
         if signal == 0:
-            reason = f"probability {probability:.4f} below intraday long threshold (0.30)"
+            reason = f"effective probability {p_effective:.4f} below intraday directional threshold (0.30)"
         elif expected_net < edge_buffer_bps:
             reason = f"expected net edge {expected_net:.2f} bps below {edge_buffer_bps:.2f} bps buffer"
         else:
@@ -90,13 +101,13 @@ def score_candidate(row: Dict, probability: float, raw_probability: float,
     else:
         # Daily symmetric barrier (base rate ~50%)
         expected_move_bps = max(50.0, min(500.0, float(features.get("atr_14", 0)) * 15000.0))
-        signal = 1 if probability >= 0.55 else 0
-        confidence = probability if signal > 0 else 1.0 - probability
+        signal = candidate_dir if p_effective >= 0.55 else 0
+        confidence = p_effective
         expected_gross = max(0.0, (2 * confidence - 1) * expected_move_bps)
         expected_net = expected_gross - float(estimated_cost_bps)
         minimum = _minimum_confidence(regime, signal)
         if signal == 0:
-            reason = f"probability {probability:.4f} below daily long threshold (0.55)"
+            reason = f"effective probability {p_effective:.4f} below daily directional threshold (0.55)"
         elif confidence < minimum:
             reason = f"confidence {confidence:.4f} below {minimum:.4f} for {regime} regime"
         elif expected_net < edge_buffer_bps:

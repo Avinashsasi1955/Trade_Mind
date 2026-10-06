@@ -5,6 +5,7 @@ paper execution audits, but has no broker-order dependency or submission path.
 """
 import hashlib
 import json
+import logging
 import os
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
@@ -39,6 +40,7 @@ TRADE_BAR_SOURCES = tuple(
 )
 OPTION_UNDERLYING_ALIASES = {"NIFTY 50": "NIFTY", "NIFTY50": "NIFTY", "NIFTY BANK": "BANKNIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
 IST = ZoneInfo("Asia/Kolkata")
+logger = logging.getLogger("nivesh.live_inference")
 
 
 def _json(value):
@@ -292,10 +294,19 @@ def _instrument_local_direction(item: Dict) -> Dict:
     breakout_down = last < prior_low and volume_ratio >= 0.7
     pullback_up = trend_up and lows[-1] <= ema_fast <= last and last >= previous
     pullback_down = trend_down and highs[-1] >= ema_fast >= last and last <= previous
-    direction = 1 if (breakout_up or pullback_up or (trend_up and recent_move > 0.0006)) else -1 if (breakout_down or pullback_down or (trend_down and recent_move < -0.0006)) else 0
+    range_mid = (prior_high + prior_low) / 2.0
+    range_bounce_up = (last <= range_mid) and (last <= prior_low * 1.004 or (lows[-1] <= prior_low and last >= lows[-1])) and last >= previous
+    range_reject_down = (last >= range_mid) and (last >= prior_high * 0.996 or (highs[-1] >= prior_high and last <= highs[-1])) and last <= previous
+    direction = 1 if (breakout_up or pullback_up or (trend_up and recent_move > 0.0006) or range_bounce_up) else -1 if (breakout_down or pullback_down or (trend_down and recent_move < -0.0006) or range_reject_down) else 0
     confidence = 0
     reasons = []
-    if direction:
+    if range_bounce_up and direction > 0:
+        confidence = 50
+        reasons.append("local range support bounce")
+    elif range_reject_down and direction < 0:
+        confidence = 50
+        reasons.append("local range resistance reject")
+    elif direction:
         confidence = 44
         confidence += 14 if abs(recent_move) >= 0.001 else 7
         confidence += 12 if volume_ratio >= 0.9 else 5
@@ -313,44 +324,35 @@ def _instrument_local_direction(item: Dict) -> Dict:
 def _chart_strategy_gate(item: Dict, signal: int) -> Dict:
     """Deterministic paper-trading chart gate.
 
-    The ML model supplies direction/edge.  This gate asks whether the live chart
+    The ML model supplies direction/edge. This gate asks whether the live chart
     is actually tradeable: trend, breakout/reversion context, volume, and a
-    minimum risk/reward profile.  It is intentionally strict because this is
-    promotion evidence, not a demo trade generator.
+    minimum risk/reward profile. Adapts strategy to market regime (Trend, Range/Chop,
+    and Institutional Trap Reversals) instead of blocking when conditions oscillate.
     """
-    bars=item.get("intraday") or []
-    if len(bars)<12:
-        return {"accepted":False,"reason":"less than 12 completed 5m live candles","strategy":"NO_TRADE"}
+    bars = item.get("intraday") or []
+    if len(bars) < 12:
+        return {"accepted": False, "reason": "less than 12 completed 5m live candles", "strategy": "NO_TRADE"}
     local_direction = _instrument_local_direction(item)
     if not signal:
         signal = int(local_direction.get("direction") or 0)
     if not signal:
-        return {"accepted":False,"reason":"no instrument-local CALL/PUT direction","strategy":"NO_TRADE",
-                "local_direction":local_direction}
-    closes=[float(bar["close"]) for bar in bars]
-    highs=[float(bar["high"]) for bar in bars]
-    lows=[float(bar["low"]) for bar in bars]
-    volumes=[max(0,int(bar.get("volume") or 0)) for bar in bars]
-    ema_fast=_ema(closes,8)
-    ema_slow=_ema(closes,21 if len(closes)>=21 else max(9,len(closes)//2))
-    last=closes[-1]
-    previous=closes[-2]
-    prior_high=max(highs[-10:-1])
-    prior_low=min(lows[-10:-1])
-    avg_volume=sum(volumes[-10:-1])/max(1,len(volumes[-10:-1]))
-    volume_ok=volumes[-1]>=avg_volume*.75 if avg_volume else True
-    atr=sum((high-low) for high,low in zip(highs[-10:],lows[-10:]))/10
-    if atr<=0:
-        return {"accepted":False,"reason":"zero intraday range","strategy":"NO_TRADE"}
-    structure=_structure_analysis(bars)
-    if structure.get("accepted") and signal and structure.get("direction") and structure["direction"]!=signal:
-        return {"accepted":False,"reason":"ML direction conflicts with BOS/CHoCH structure",
-                "strategy":"NO_TRADE","structure":structure}
-
-    # Regime & Market Structure Analytics: Intraday VWAP & ADX Trend Strength
-    total_pv = sum(((float(b["high"]) + float(b["low"]) + float(b["close"])) / 3.0) * max(1, int(b.get("volume") or 1)) for b in bars)
-    total_vol = sum(max(1, int(b.get("volume") or 1)) for b in bars)
-    vwap = total_pv / total_vol if total_vol > 0 else last
+        return {"accepted": False, "reason": "no instrument-local CALL/PUT direction", "strategy": "NO_TRADE",
+                "local_direction": local_direction}
+    closes = [float(bar["close"]) for bar in bars]
+    highs = [float(bar["high"]) for bar in bars]
+    lows = [float(bar["low"]) for bar in bars]
+    volumes = [max(0, int(bar.get("volume") or 0)) for bar in bars]
+    ema_fast = _ema(closes, 8)
+    ema_slow = _ema(closes, 21 if len(closes) >= 21 else max(9, len(closes)//2))
+    last = closes[-1]
+    previous = closes[-2]
+    prior_high = max(highs[-10:-1])
+    prior_low = min(lows[-10:-1])
+    avg_volume = sum(volumes[-10:-1]) / max(1, len(volumes[-10:-1]))
+    volume_ok = volumes[-1] >= avg_volume * .75 if avg_volume else True
+    atr = sum((high - low) for high, low in zip(highs[-10:], lows[-10:])) / 10
+    if atr <= 0:
+        return {"accepted": False, "reason": "zero intraday range", "strategy": "NO_TRADE"}
 
     # True Range & Directional Movement (ADX proxy)
     dx_vals = []
@@ -366,17 +368,33 @@ def _chart_strategy_gate(item: Dict, signal: int) -> Dict:
     adx = (sum(dx_vals[-7:]) / len(dx_vals[-7:])) if dx_vals else 20.0
     is_choppy = adx < 18.0
 
+    structure = _structure_analysis(bars)
+    has_structure_break = bool(structure.get("recent_event"))
+    if not is_choppy and has_structure_break and structure.get("accepted") and signal and structure.get("direction") and structure["direction"] != signal:
+        return {"accepted": False, "reason": "ML direction conflicts with BOS/CHoCH structure",
+                "strategy": "NO_TRADE", "structure": structure}
+
+    # Regime & Market Structure Analytics: Intraday VWAP & ADX Trend Strength
+    total_pv = sum(((float(b["high"]) + float(b["low"]) + float(b["close"])) / 3.0) * max(1, int(b.get("volume") or 1)) for b in bars)
+    total_vol = sum(max(1, int(b.get("volume") or 1)) for b in bars)
+    vwap = total_pv / total_vol if total_vol > 0 else last
+
     # Wyckoff Intra-Bar Volume Authenticity Indicator (True vs Fake Candles)
     rvol = volumes[-1] / max(1, avg_volume) if avg_volume else 1.0
     candle_spread = highs[-1] - lows[-1]
     is_wide_spread = candle_spread >= atr * 1.5
-    if is_wide_spread and rvol < 0.90:
-        return {"accepted": False, "reason": f"Wyckoff Effort-vs-Result divergence: wide spread with low volume (RVOL {rvol:.2f}x < 0.90x), fake candle exhaustion trap",
-                "strategy": "NO_TRADE", "local_direction": local_direction}
+    if is_wide_spread and rvol < 0.85:
+        if closes[-1] > (highs[-1] + lows[-1]) / 2 and signal > 0:
+            return {"accepted": False, "reason": f"Wyckoff Effort-vs-Result divergence: wide bullish spread with low volume (RVOL {rvol:.2f}x < 0.85x), fake candle exhaustion trap",
+                    "strategy": "NO_TRADE", "local_direction": local_direction}
+        elif closes[-1] < (highs[-1] + lows[-1]) / 2 and signal < 0:
+            return {"accepted": False, "reason": f"Wyckoff Effort-vs-Result divergence: wide bearish spread with low volume (RVOL {rvol:.2f}x < 0.85x), fake breakdown exhaustion trap",
+                    "strategy": "NO_TRADE", "local_direction": local_direction}
 
     # Anti-Chasing Overextension Guard: Volatility-adaptive threshold
     vwap_distance_pct = (last - vwap) / vwap
-    max_vwap_dist = max(0.012, min(0.025, (atr / max(1e-9, last)) * 1.5))
+    multiplier = 2.0 if (not is_choppy and rvol >= 1.2) else 1.5
+    max_vwap_dist = max(0.008, min(0.035, (atr / max(1e-9, last)) * multiplier))
     if signal > 0 and vwap_distance_pct > max_vwap_dist:
         return {"accepted": False, "reason": f"overextended above VWAP (+{vwap_distance_pct*100:.2f}% > +{max_vwap_dist*100:.2f}%), high probability pullback trap",
                 "strategy": "NO_TRADE", "local_direction": local_direction}
@@ -384,55 +402,22 @@ def _chart_strategy_gate(item: Dict, signal: int) -> Dict:
         return {"accepted": False, "reason": f"overextended below VWAP ({vwap_distance_pct*100:.2f}% < -{max_vwap_dist*100:.2f}%), oversold bounce trap",
                 "strategy": "NO_TRADE", "local_direction": local_direction}
 
-    trend_up=ema_fast[-1]>ema_slow[-1] and last>=ema_fast[-1]
-    trend_down=ema_fast[-1]<ema_slow[-1] and last<=ema_fast[-1]
-    breakout_volume_ok = rvol >= 1.20 and volume_ok
-    breakout_up=last>prior_high and breakout_volume_ok
-    breakout_down=last<prior_low and breakout_volume_ok
-    pullback_buy=trend_up and (lows[-1]<=ema_fast[-1]*1.002 or last>=ema_fast[-1]>=lows[-2]) and last>=previous and not is_choppy
-    pullback_sell=trend_down and (highs[-1]>=ema_fast[-1]*0.998 or last<=ema_fast[-1]<=highs[-2]) and last<=previous and not is_choppy
-    momentum_up=trend_up and last>previous and ema_fast[-1]>ema_fast[-2] and not is_choppy
-    momentum_down=trend_down and last<previous and ema_fast[-1]<ema_fast[-2] and not is_choppy
-    range_support_bounce=last<=prior_low*1.005 and last>=previous and signal>0 and not is_choppy
-    range_resist_reject=last>=prior_high*0.995 and last<=previous and signal<0 and not is_choppy
-    
-    if signal>0 and breakout_up:
-        strategy="BREAKOUT_CALL_BUY"
-        route=("CE","BUY")
-    elif signal>0 and pullback_buy:
-        strategy="TREND_PULLBACK_PUT_SELL"
-        route=("PE","SELL")
-    elif signal>0 and range_support_bounce:
-        strategy="RANGE_REVERSION_PUT_SELL"
-        route=("PE","SELL")
-    elif signal>0 and momentum_up:
-        strategy="MOMENTUM_CALL_BUY"
-        route=("CE","BUY")
-    elif signal<0 and breakout_down:
-        strategy="BREAKDOWN_PUT_BUY"
-        route=("PE","BUY")
-    elif signal<0 and pullback_sell:
-        strategy="TREND_PULLBACK_CALL_SELL"
-        route=("CE","SELL")
-    elif signal<0 and range_resist_reject:
-        strategy="RANGE_REVERSION_CALL_SELL"
-        route=("CE","SELL")
-    elif signal<0 and momentum_down:
-        strategy="MOMENTUM_PUT_BUY"
-        route=("PE","BUY")
-    else:
-        rej_reason = "breakout blocked during choppy consolidation (ADX < 18)" if (is_choppy and (last>prior_high or last<prior_low)) else "trade direction not confirmed by this stock's breakout/pullback/momentum chart structure"
-        return {"accepted":False,"reason":rej_reason,"strategy":"NO_TRADE","local_direction":local_direction}
-    if signal > 0:
-        risk = max(atr * 1.5, last * .006)
-    else:
-        risk = max(atr * 1.2, last * .005)
-    reward = max(atr * 3.0, last * .012)
-    rr = reward / risk if risk else 0
-    # 1. Welles Wilder's ASI False Breakout / Trap Filter
+    # Pattern Recognition for Trend, Pullbacks, Ranges, and Mean Reversions
+    trend_up = ema_fast[-1] > ema_slow[-1] and last >= ema_fast[-1]
+    trend_down = ema_fast[-1] < ema_slow[-1] and last <= ema_fast[-1]
+    breakout_volume_ok = rvol >= 1.20 and volume_ok and not is_choppy
+    breakout_up = last > prior_high and breakout_volume_ok
+    breakout_down = last < prior_low and breakout_volume_ok
+    pullback_buy = trend_up and (lows[-1] <= ema_fast[-1] * 1.002 or last >= ema_fast[-1] >= lows[-2]) and last >= previous and not is_choppy
+    pullback_sell = trend_down and (highs[-1] >= ema_fast[-1] * 0.998 or last <= ema_fast[-1] <= highs[-2]) and last <= previous and not is_choppy
+    momentum_up = trend_up and last > previous and ema_fast[-1] > ema_fast[-2] and not is_choppy
+    momentum_down = trend_down and last < previous and ema_fast[-1] < ema_fast[-2] and not is_choppy
+
+
+    # ASI Trap Analysis
     asi_trap = detect_nse_trap(bars)
+    trap_type = asi_trap.get("trap_type") if asi_trap.get("is_trap") else None
     if asi_trap.get("is_trap"):
-        trap_type = asi_trap.get("trap_type")
         if signal > 0 and trap_type == "BULL_TRAP":
             return {"accepted": False, "reason": f"trade blocked by ASI Bull Trap detection ({asi_trap.get('reason')})",
                     "strategy": "NO_TRADE", "trap_details": asi_trap}
@@ -440,7 +425,77 @@ def _chart_strategy_gate(item: Dict, signal: int) -> Dict:
             return {"accepted": False, "reason": f"trade blocked by ASI Bear Trap detection ({asi_trap.get('reason')})",
                     "strategy": "NO_TRADE", "trap_details": asi_trap}
 
-    # 2. Adverse Institutional Option Wall (PCR Filter)
+    failed_breakout_buy = signal > 0 and trap_type == "BEAR_TRAP"
+    failed_breakout_sell = signal < 0 and trap_type == "BULL_TRAP"
+
+    # Range and Mean-Reversion Patterns (Active in Choppy / Consolidation Regimes)
+    range_mid = (prior_high + prior_low) / 2.0
+    is_bounce = last >= previous or last > float(bars[-1].get("open", last))
+    is_reject = last <= previous or last < float(bars[-1].get("open", last))
+    range_support_bounce = (last <= range_mid) and (last <= prior_low + (atr * 0.4) or (lows[-1] <= prior_low and last >= lows[-1])) and is_bounce and signal > 0
+    range_resist_reject = (last >= range_mid) and (last >= prior_high - (atr * 0.4) or (highs[-1] >= prior_high and last <= highs[-1])) and is_reject and signal < 0
+    vwap_reversion_buy = signal > 0 and vwap_distance_pct <= -max(0.005, max_vwap_dist * 0.6) and is_bounce
+    vwap_reversion_sell = signal < 0 and vwap_distance_pct >= max(0.005, max_vwap_dist * 0.6) and is_reject
+
+    # Strategy Selection Matrix (Senior Trader: Defined-Risk Option Buying / Spreads)
+    if signal > 0 and failed_breakout_buy:
+        strategy = "FAILED_BREAKOUT_REVERSAL_CALL_BUY"
+        route = ("CE", "BUY")
+    elif signal > 0 and breakout_up:
+        strategy = "BREAKOUT_CALL_BUY"
+        route = ("CE", "BUY")
+    elif signal > 0 and pullback_buy:
+        strategy = "TREND_PULLBACK_CALL_BUY"
+        route = ("CE", "BUY")
+    elif signal > 0 and vwap_reversion_buy:
+        strategy = "VWAP_MEAN_REVERSION_CALL_BUY"
+        route = ("CE", "BUY")
+    elif signal > 0 and range_support_bounce:
+        strategy = "RANGE_SUPPORT_CALL_BUY"
+        route = ("CE", "BUY")
+    elif signal > 0 and momentum_up:
+        strategy = "MOMENTUM_CALL_BUY"
+        route = ("CE", "BUY")
+    elif signal < 0 and failed_breakout_sell:
+        strategy = "FAILED_BREAKOUT_REVERSAL_PUT_BUY"
+        route = ("PE", "BUY")
+    elif signal < 0 and breakout_down:
+        strategy = "BREAKDOWN_PUT_BUY"
+        route = ("PE", "BUY")
+    elif signal < 0 and pullback_sell:
+        strategy = "TREND_PULLBACK_PUT_BUY"
+        route = ("PE", "BUY")
+    elif signal < 0 and vwap_reversion_sell:
+        strategy = "VWAP_MEAN_REVERSION_PUT_BUY"
+        route = ("PE", "BUY")
+    elif signal < 0 and range_resist_reject:
+        strategy = "RANGE_RESISTANCE_PUT_BUY"
+        route = ("PE", "BUY")
+    elif signal < 0 and momentum_down:
+        strategy = "MOMENTUM_PUT_BUY"
+        route = ("PE", "BUY")
+    else:
+        rej_reason = "breakout blocked during choppy consolidation (ADX < 18)" if (is_choppy and (last > prior_high or last < prior_low)) else "trade direction not confirmed by this stock's breakout/pullback/momentum chart structure"
+        return {"accepted": False, "reason": rej_reason, "strategy": "NO_TRADE", "local_direction": local_direction}
+
+    # Calibrate Risk and Reward by Strategy Type
+    if strategy.startswith("RANGE_") or "VWAP_MEAN_REVERSION" in strategy:
+        risk = max(atr * 1.0, last * 0.0035)
+        dist_vwap = abs(last - vwap)
+        reward = max(atr * 2.0, dist_vwap if dist_vwap > atr else last * 0.007)
+    elif "FAILED_BREAKOUT" in strategy:
+        risk = max(atr * 0.8, last * 0.0030)
+        range_span = abs(prior_high - prior_low)
+        reward = max(atr * 2.5, range_span * 0.70 if range_span > 0 else last * 0.010)
+    elif signal > 0:
+        risk = max(atr * 1.5, last * .006)
+        reward = max(atr * 3.0, last * .012)
+    else:
+        risk = max(atr * 1.2, last * .005)
+        reward = max(atr * 3.0, last * .012)
+    rr = reward / risk if risk else 0
+
+    # Adverse Institutional Option Wall (PCR Filter)
     atm_pcr = float(item.get("atm_pcr", 1.0) or 1.0)
     if signal > 0 and atm_pcr < 0.50:
         return {"accepted": False, "reason": f"Long trade blocked by adverse extreme Call writing wall (ATM PCR {atm_pcr:.2f} < 0.50)",
@@ -449,16 +504,19 @@ def _chart_strategy_gate(item: Dict, signal: int) -> Dict:
         return {"accepted": False, "reason": f"Short trade blocked by adverse extreme Put writing wall (ATM PCR {atm_pcr:.2f} > 1.50)",
                 "strategy": "NO_TRADE"}
 
-    # 3. Volume Profile Value Area Exhaustion Filter
+    # Volume Profile Value Area Exhaustion Filter
     vp_data = calculate_volume_profile(bars)
     vp_eval = evaluate_volume_profile_verdict(last, signal, vp_data)
     item["_volume_profile"] = vp_eval
-    if vp_eval.get("verdict") == "CAUTION_VAH_EXTENSION" and rvol < 1.5:
-        return {"accepted": False, "reason": f"Long trade blocked by Volume Profile VAH exhaustion without expansion volume (POC: {vp_data.get('poc')}, VAH: {vp_data.get('vah')})",
-                "strategy": "NO_TRADE", "volume_profile": vp_eval}
-    if vp_eval.get("verdict") == "CAUTION_VAL_EXTENSION" and rvol < 1.5:
-        return {"accepted": False, "reason": f"Short trade blocked by Volume Profile VAL exhaustion without expansion volume (POC: {vp_data.get('poc')}, VAL: {vp_data.get('val')})",
-                "strategy": "NO_TRADE", "volume_profile": vp_eval}
+    is_strong_trend = (not is_choppy) and (adx >= 22.0)
+    is_reversal = "FAILED_BREAKOUT" in strategy or strategy.startswith("RANGE_") or "VWAP_MEAN_REVERSION" in strategy
+    if not is_strong_trend and not is_reversal:
+        if vp_eval.get("verdict") == "CAUTION_VAH_EXTENSION" and rvol < 1.3:
+            return {"accepted": False, "reason": f"Long trade blocked by Volume Profile VAH exhaustion without expansion volume (POC: {vp_data.get('poc')}, VAH: {vp_data.get('vah')})",
+                    "strategy": "NO_TRADE", "volume_profile": vp_eval}
+        if vp_eval.get("verdict") == "CAUTION_VAL_EXTENSION" and rvol < 1.3:
+            return {"accepted": False, "reason": f"Short trade blocked by Volume Profile VAL exhaustion without expansion volume (POC: {vp_data.get('poc')}, VAL: {vp_data.get('val')})",
+                    "strategy": "NO_TRADE", "volume_profile": vp_eval}
 
     return {"accepted": True, "reason": "fresh live feed, chart structure, BOS/CHoCH, volume and risk/reward passed",
             "strategy": strategy, "option_type": route[0], "side": route[1], "rr": round(rr, 2),
@@ -603,8 +661,8 @@ class LivePaperInference:
         self.max_new_trades_per_cycle=max(1,int(os.getenv("NIVESH_SHADOW_MAX_NEW_TRADES_PER_CYCLE","3")))
         self.option_paper_enabled=os.getenv("NIVESH_SHADOW_OPTION_PAPER_ENABLED","1")=="1"
         self.intraday_short_fallback=True  # Bidirectional Long & Short coverage in paper mode
-        self.learning_mode_enabled=os.getenv("NIVESH_SHADOW_LEARNING_MODE_ENABLED","0")=="1"
-        self.max_index_learning_trades=max(0,int(os.getenv("NIVESH_SHADOW_MAX_INDEX_LEARNING_TRADES","0")))
+        self.learning_mode_enabled=os.getenv("NIVESH_SHADOW_LEARNING_MODE_ENABLED","1")=="1"
+        self.max_index_learning_trades=max(0,int(os.getenv("NIVESH_SHADOW_MAX_INDEX_LEARNING_TRADES","3")))
         self.max_trades_per_underlying=max(1,int(os.getenv("NIVESH_SHADOW_MAX_TRADES_PER_UNDERLYING","1")))
         self.trailing_enabled=os.getenv("NIVESH_SHADOW_TRAILING_STOP_ENABLED","1")=="1"
         self.trailing_trigger_pct=Decimal(os.getenv("NIVESH_SHADOW_TRAILING_TRIGGER_PCT","0.012"))
@@ -624,9 +682,9 @@ class LivePaperInference:
         self.reentry_cooldown_minutes=max(0,int(os.getenv("NIVESH_SHADOW_REENTRY_COOLDOWN_MINUTES","30")))
         self.min_option_price=Decimal(os.getenv("NIVESH_SHADOW_MIN_OPTION_PRICE","20"))
         self.max_option_price=Decimal(os.getenv("NIVESH_SHADOW_MAX_OPTION_PRICE","450"))
-        self.option_stop_loss_pct=Decimal(os.getenv("NIVESH_PAPER_OPTION_STOP_LOSS_PCT","0.06"))
-        self.option_take_profit_pct=Decimal(os.getenv("NIVESH_PAPER_OPTION_TAKE_PROFIT_PCT","0.14"))
-        self.max_option_loss_rupees=Decimal(os.getenv("NIVESH_SHADOW_MAX_OPTION_LOSS_RUPEES","375"))
+        self.option_stop_loss_pct=Decimal(os.getenv("NIVESH_PAPER_OPTION_STOP_LOSS_PCT","0.25"))
+        self.option_take_profit_pct=Decimal(os.getenv("NIVESH_PAPER_OPTION_TAKE_PROFIT_PCT","0.50"))
+        self.max_option_loss_rupees=Decimal(os.getenv("NIVESH_SHADOW_MAX_OPTION_LOSS_RUPEES","2500"))
         self.option_stop_to_capture_max_ratio=Decimal(os.getenv("NIVESH_SHADOW_OPTION_STOP_TO_CAPTURE_MAX_RATIO","1.50"))
         self.active_trade_manager_enabled=os.getenv("NIVESH_SHADOW_ACTIVE_TRADE_MANAGER_ENABLED","0")=="1"
         self.inference_close_due_enabled=os.getenv("NIVESH_INFERENCE_CLOSE_DUE_ENABLED","0")=="1"
@@ -650,12 +708,17 @@ class LivePaperInference:
         self.profit_capture_pct=Decimal(os.getenv("NIVESH_SHADOW_PROFIT_CAPTURE_PCT","0.004"))
         self.option_profit_capture_pct=Decimal(os.getenv("NIVESH_SHADOW_OPTION_PROFIT_CAPTURE_PCT","0.018"))
         self.top_selector_enabled=os.getenv("NIVESH_SHADOW_TOP10_SELECTOR_ENABLED","1")=="1"
-        self.min_entry_quality=float(os.getenv("NIVESH_SHADOW_MIN_ENTRY_QUALITY","78"))
+        self.min_entry_quality=float(os.getenv("NIVESH_SHADOW_MIN_ENTRY_QUALITY","68"))
         self.min_option_entry_quality=float(os.getenv("NIVESH_SHADOW_MIN_OPTION_ENTRY_QUALITY","68"))
         self.min_option_grade=os.getenv("NIVESH_SHADOW_MIN_OPTION_GRADE","B").upper().strip() or "B"
         self.option_grade_a_score=float(os.getenv("NIVESH_SHADOW_OPTION_GRADE_A_SCORE","78"))
         self.option_grade_b_score=float(os.getenv("NIVESH_SHADOW_OPTION_GRADE_B_SCORE",str(self.min_option_entry_quality)))
-        self.min_professional_rr=float(os.getenv("NIVESH_SHADOW_MIN_PROFESSIONAL_RR","1.50"))
+        self.min_professional_rr=float(os.getenv("NIVESH_SHADOW_MIN_PROFESSIONAL_RR","1.90"))
+        self.breakeven_trigger_r=Decimal(os.getenv("NIVESH_SHADOW_BREAKEVEN_TRIGGER_R","1.10"))
+        self.profit_lock_trigger_r=Decimal(os.getenv("NIVESH_SHADOW_PROFIT_LOCK_TRIGGER_R","1.60"))
+        self.profit_lock_guaranteed_r=Decimal(os.getenv("NIVESH_SHADOW_PROFIT_LOCK_GUARANTEED_R","1.00"))
+        self.trailing_trigger_r=Decimal(os.getenv("NIVESH_SHADOW_TRAILING_TRIGGER_R","1.50"))
+        self.trailing_giveback_r=Decimal(os.getenv("NIVESH_SHADOW_TRAILING_GIVEBACK_R","0.40"))
         self.min_expected_net_edge_bps=float(os.getenv("NIVESH_SHADOW_MIN_EXPECTED_NET_EDGE_BPS","40"))
         self.session_case_enabled=os.getenv("NIVESH_SHADOW_SESSION_CASE_ENABLED","1")=="1"
         self.learning_best_min_rr=float(os.getenv("NIVESH_SHADOW_LEARNING_BEST_MIN_RR","1.80"))
@@ -667,7 +730,7 @@ class LivePaperInference:
         self.learning_best_min_edge_bps=float(os.getenv("NIVESH_SHADOW_LEARNING_BEST_MIN_EDGE_BPS","-25"))
         self.learning_neutral_min_edge_bps=float(os.getenv("NIVESH_SHADOW_LEARNING_NEUTRAL_MIN_EDGE_BPS","-10"))
         self.learning_worst_min_edge_bps=float(os.getenv("NIVESH_SHADOW_LEARNING_WORST_MIN_EDGE_BPS",str(self.min_expected_net_edge_bps)))
-        self.require_depth_for_entries=os.getenv("NIVESH_SHADOW_REQUIRE_DEPTH_FOR_ENTRIES","1")=="1"
+        self.require_depth_for_entries=os.getenv("NIVESH_SHADOW_REQUIRE_DEPTH_FOR_ENTRIES","0")=="1"
         self.max_same_side_open=max(1,int(os.getenv("NIVESH_SHADOW_MAX_SAME_SIDE_OPEN","5")))
         self.max_new_same_side=max(1,int(os.getenv("NIVESH_SHADOW_MAX_NEW_SAME_SIDE","3")))
         self.max_consecutive_losses=max(1,int(os.getenv("NIVESH_SHADOW_MAX_CONSECUTIVE_LOSSES","2")))
@@ -849,7 +912,7 @@ class LivePaperInference:
         with self.engine.connect() as connection:
             row=connection.execute(text("""
                 SELECT i.id instrument_id,COALESCE(i.instrument_token,k.provider_token) instrument_token,
-                    i.lot_size,i.instrument_type,b.close_price
+                    i.lot_size,i.instrument_type,i.expiry,i.strike,b.close_price
                 FROM instrument_master i JOIN LATERAL(
                     SELECT close_price FROM live_market_bars WHERE instrument_id=i.id AND interval='5minute'
                       AND bar_time<=:watermark AND bar_time>:watermark-INTERVAL '10 minutes'
@@ -861,17 +924,20 @@ class LivePaperInference:
                 ORDER BY i.expiry,ABS(i.strike-:spot) LIMIT 1
             """),{"watermark":watermark,"symbol":OPTION_UNDERLYING_ALIASES.get(str(item["symbol"]).upper(),str(item["symbol"]).upper()),"spot":item["session"]["close"],
                   "option_type":option_type,"trade_sources":list(TRADE_BAR_SOURCES)}).mappings().one_or_none()
+            wm_dt = (watermark.astimezone(IST) if getattr(watermark, "tzinfo", None) else watermark).date() if hasattr(watermark, "date") else watermark
             if row:
                 price=Decimal(str(row["close_price"]))
                 if self.min_option_price<=price<=self.max_option_price:
+                    dte_days = max(1.0, float((row["expiry"] - wm_dt).days)) if row.get("expiry") else 4.0
                     return {"instrument_token":row["instrument_token"],"instrument_id":row["instrument_id"],"side":item.get("option_side","BUY"),
-                            "price":price,"lot_size":int(row["lot_size"] or 100),"kind":row["instrument_type"]}
+                            "price":price,"lot_size":int(row["lot_size"] or 100),"kind":row["instrument_type"],
+                            "expiry":str(row["expiry"]) if row.get("expiry") else None,"dte_days":dte_days}
             # Real option instrument lookup without live completed bars requirement
             opt_sym = OPTION_UNDERLYING_ALIASES.get(str(item["symbol"]).upper(), str(item["symbol"]).upper())
             spot_val = float(item["session"]["close"])
             opt_row = connection.execute(text("""
                 SELECT i.id instrument_id, COALESCE(k.provider_token, i.instrument_token) instrument_token,
-                    i.lot_size, i.instrument_type, i.strike
+                    i.lot_size, i.instrument_type, i.strike, i.expiry
                 FROM instrument_master i
                 LEFT JOIN instrument_provider_keys k ON k.instrument_id=i.id AND k.is_active
                 WHERE i.underlying_symbol=:symbol AND i.exchange IN ('NFO','BFO') AND i.instrument_type=:option_type
@@ -882,7 +948,9 @@ class LivePaperInference:
                 try:
                     from backend.greeks_engine import get_live_or_analytical_greeks
                     strike_val = float(opt_row["strike"])
-                    greeks = get_live_or_analytical_greeks(self.engine, opt_row["instrument_id"], spot_val, strike_val, dte_days=4.0, option_type=option_type)
+                    dte_days = max(1.0, float((opt_row["expiry"] - wm_dt).days)) if opt_row.get("expiry") else 4.0
+                    greeks = get_live_or_analytical_greeks(self.engine, opt_row["instrument_id"], spot_val, strike_val, dte_days=dte_days, option_type=option_type)
+                    greeks["dte_days"] = dte_days
                     price = max(Decimal("1.50"), Decimal(str(greeks["price"])))
                     item["_greeks"] = greeks
                     return {
@@ -893,6 +961,8 @@ class LivePaperInference:
                         "lot_size": int(opt_row["lot_size"] or 100),
                         "kind": opt_row["instrument_type"],
                         "option_strike": strike_val,
+                        "expiry": str(opt_row["expiry"]) if opt_row.get("expiry") else None,
+                        "dte_days": dte_days,
                         "greeks": greeks
                     }
                 except Exception:
@@ -1032,7 +1102,7 @@ class LivePaperInference:
         if not observed:
             return {"accepted":False,"reason":"missing signal timestamp"}
         age=(watermark-observed).total_seconds()/60
-        max_age = 3.5 if is_option else self.max_signal_age_minutes
+        max_age = 5.0 if is_option else self.max_signal_age_minutes
         if age>max_age:
             return {"accepted":False,
                     "reason":f"stale signal age {age:.1f}m exceeds {max_age:.1f}m for {'option' if is_option else 'cash'}",
@@ -1040,7 +1110,7 @@ class LivePaperInference:
         latest_1m=item.get("latest_1m_bar")
         if latest_1m:
             one_minute_lag=(watermark-latest_1m).total_seconds()/60
-            max_lag = 1.5 if is_option else 2.0
+            max_lag = float(os.getenv("NIVESH_SHADOW_MAX_1M_LAG_MINUTES", "5.0"))
             if one_minute_lag>max_lag:
                 return {"accepted":False,
                         "reason":f"latest 1m feed lag {one_minute_lag:.1f}m exceeds {max_lag:.1f}m",
@@ -1122,6 +1192,8 @@ class LivePaperInference:
         aligned=0
         conflicts=[]
         ready=0
+        strategy_name = str((item.get("chart_gate") or {}).get("strategy") or item.get("_quant_strategy") or "")
+        is_reversion = any(k in strategy_name for k in ("REVERSION", "FAILED_BREAKOUT", "ABSORPTION", "PAIR_REVERSION")) or strategy_name.startswith("RANGE_")
         for name,role,bars,min_bars in frames:
             view=_timeframe_direction(bars,min_bars)
             direction=int(view.get("direction") or 0)
@@ -1131,9 +1203,15 @@ class LivePaperInference:
                 ready+=1
             if strategy_direction and direction==strategy_direction and confidence>=45:
                 aligned+=1
-            conflict_thresh = max(75.0, self.mtf_strong_conflict_threshold + 15.0) if name == "1m" else self.mtf_strong_conflict_threshold
+            if name == "1m":
+                conflict_thresh = max(75.0, self.mtf_strong_conflict_threshold + 15.0)
+            elif name == "1H" and len(bars) < 6:
+                conflict_thresh = 82.0
+            else:
+                conflict_thresh = self.mtf_strong_conflict_threshold
+
             if strategy_direction and direction and direction!=strategy_direction and confidence>=conflict_thresh:
-                conflicts.append(name)
+                conflicts.append((name, confidence))
             analysed.append({
                 "timeframe":name,
                 "role":role,
@@ -1145,10 +1223,21 @@ class LivePaperInference:
                 "reason":view.get("reason"),
                 "recent_event":view.get("recent_event"),
             })
-        accepted=not conflicts and (aligned>=self.mtf_min_required_frames or not self.require_multi_timeframe_for_entries)
+
+        conflict_names = [c[0] for c in conflicts]
+        if is_reversion and len(conflicts) <= 1:
+            has_fatal_conflict = any(c[1] >= 90.0 for c in conflicts)
+            conflict_accepted = not has_fatal_conflict
+        elif aligned >= 3 and len(conflicts) <= 1:
+            has_fatal_conflict = any(c[1] >= 85.0 for c in conflicts)
+            conflict_accepted = not has_fatal_conflict
+        else:
+            conflict_accepted = not conflicts
+
+        accepted = conflict_accepted and (aligned>=self.mtf_min_required_frames or not self.require_multi_timeframe_for_entries)
         reason=(
-            f"multi-timeframe conflict on {', '.join(conflicts)}"
-            if conflicts else
+            f"multi-timeframe conflict on {', '.join(conflict_names)}"
+            if not conflict_accepted and conflicts else
             f"{aligned} timeframe(s) aligned; {ready} ready"
         )
         return {"accepted":accepted,"enabled":True,"reason":reason,
@@ -1159,35 +1248,63 @@ class LivePaperInference:
                 "execution_rule":"1s confirms final timing/exit; 1m/5m/15m/1H define permission and setup"}
 
     def _risk_levels_for_target(self,item: Dict,target: Dict) -> Dict:
-        """Return SL/TP in the same price space as the traded instrument."""
+        """Return SL/TP in the same price space as the traded instrument (Senior Trader Delta-Anchored)."""
         side=str(target.get("side") or "BUY").upper()
         kind=str(target.get("kind") or "").upper()
         price=Decimal(str(target.get("price") or 0))
         chart=item.get("chart_gate") or {}
         if kind in {"CE","PE"}:
+            chart_sl = chart.get("stop_loss")
+            spot = float(item.get("session", {}).get("close") or 0)
+            greeks = target.get("greeks") or item.get("_greeks") or {}
+            delta = abs(float(greeks.get("delta") or 0.50))
+            if chart_sl is not None and spot > 0:
+                dist = abs(spot - float(chart_sl))
+                opt_risk = Decimal(str(round(dist * delta, 4)))
+                min_risk = price * Decimal("0.20")
+                max_risk = price * Decimal("0.35")
+                actual_risk = max(min_risk, min(max_risk, opt_risk))
+                actual_reward = actual_risk * Decimal("2.0")  # Enforce 1:2 R:R
+                stop_loss = (price - actual_risk) if side == "BUY" else (price + actual_risk)
+                take_profit = (price + actual_reward) if side == "BUY" else (price - actual_reward)
+                return {"stop_loss": round(stop_loss, 4), "take_profit": round(take_profit, 4), "basis": "instrument",
+                        "source": "underlying_delta_anchored"}
             sl_pct=self.option_stop_loss_pct
             tp_pct=self.option_take_profit_pct
             stop_loss=(price*(Decimal("1")-sl_pct)) if side=="BUY" else (price*(Decimal("1")+sl_pct))
             take_profit=(price*(Decimal("1")+tp_pct)) if side=="BUY" else (price*(Decimal("1")-tp_pct))
-            return {"stop_loss":stop_loss,"take_profit":take_profit,"basis":"instrument",
-                    "source":"option_premium_default"}
+            return {"stop_loss": round(stop_loss, 4), "take_profit": round(take_profit, 4), "basis": "instrument",
+                    "source": "option_volatility_buffer"}
         stop_loss=chart.get("stop_loss")
         take_profit=chart.get("take_profit")
         stop_loss=Decimal(str(stop_loss)) if stop_loss not in (None,"") else None
         take_profit=Decimal(str(take_profit)) if take_profit not in (None,"") else None
-        return {"stop_loss":stop_loss,"take_profit":take_profit,"basis":"instrument",
-                "source":"underlying_chart_levels"}
+        return {"stop_loss": stop_loss, "take_profit": take_profit, "basis": "instrument",
+                "source": "underlying_chart_levels"}
 
     def _execution_target(self,item: Dict,watermark: datetime) -> Optional[Dict]:
         requested_option=item.get("option_type") if item.get("option_type") in {"CE","PE"} else None
         option_direction=self._option_route_direction(requested_option,item.get("option_side"))
-        if self.option_paper_enabled and item.get("option_type") in {"CE","PE"}:
+        is_index = item.get("instrument_type") == "INDEX" or str(item.get("symbol")).upper() in {"NIFTY 50", "BANKNIFTY", "SENSEX"}
+
+        # 1. Index instruments execute via Index Options
+        if is_index and self.option_paper_enabled and item.get("option_type") in {"CE","PE"}:
+            option_target=self._nearest_option_target(item,watermark,item["option_type"])
+            if option_target:
+                return option_target
+            return None
+
+        # 2. Equity stocks: route to Options or Intraday Cash Equity
+        prefer_cash = item.get("prefer_cash") or item.get("trade_mode") == "INTRADAY"
+        if self.option_paper_enabled and item.get("option_type") in {"CE","PE"} and not prefer_cash:
             option_target=self._nearest_option_target(item,watermark,item["option_type"])
             if option_target:
                 return option_target
             if item.get("instrument_type")!="EQ":
                 return None
-        if item.get("instrument_type") == "EQ" and Decimal(str(item["session"]["close"])) < Decimal("300"):
+
+        # Allow liquid large-cap cash equities >= ₹100 (covers TATASTEEL, BEL, ITC)
+        if item.get("instrument_type") == "EQ" and Decimal(str(item["session"]["close"])) < Decimal("100"):
             return None
         direction=option_direction if option_direction is not None else item["signal"]
         if direction>0:
@@ -1263,21 +1380,21 @@ class LivePaperInference:
                     # Stage 3: +2.5R Spike Exit
                     if favorable_r >= Decimal("2.5"):
                         exit_price=entry + Decimal("2.5") * r_points; exit_reason="PROFIT_CAPTURE"; exit_at=bar["bar_time"]; break
-                    # Stage 2: +1.2R Lock guaranteed +0.6R profit
-                    if favorable_r >= Decimal("1.2"):
+                    # Stage 2: Calibrated Profit Lock (Guarantees +1.0R at +1.60R)
+                    if favorable_r >= self.profit_lock_trigger_r:
                         profit_locked=True
-                        profit_lock_price=max(profit_lock_price, entry + Decimal("0.6") * r_points)
-                    # Stage 1: +0.7R Arm Fee-Padded Breakeven
-                    if favorable_r >= Decimal("0.7") or best_favourable>=entry*(Decimal("1")+self.breakeven_trigger_pct):
+                        profit_lock_price=max(profit_lock_price, entry + self.profit_lock_guaranteed_r * r_points)
+                    # Stage 1: Calibrated Breakeven (+1.10R Arm)
+                    if favorable_r >= self.breakeven_trigger_r:
                         breakeven_armed=True
                         breakeven_price=entry + fee_buffer_per_share
 
                     if self.profit_capture_enabled and high>=entry+capture_points:
                         exit_price=entry+capture_points; exit_reason="PROFIT_CAPTURE"; exit_at=bar["bar_time"]; break
-                    if self.trailing_enabled and best_favourable>=entry*(Decimal("1")+self.trailing_trigger_pct):
-                        trailing_stop=best_favourable*(Decimal("1")-self.trailing_giveback_pct)
+                    if favorable_r >= self.trailing_trigger_r:
+                        trailing_stop=best_favourable - self.trailing_giveback_r * r_points
                         if low<=trailing_stop:
-                            exit_price=max(trailing_stop,entry if breakeven_armed else trailing_stop)
+                            exit_price=max(trailing_stop,profit_lock_price if profit_locked else (breakeven_price if breakeven_armed else trailing_stop))
                             exit_reason="TRAILING_STOP"; exit_at=bar["bar_time"]; break
                     if profit_locked and low<=profit_lock_price:
                         exit_price=profit_lock_price; exit_reason="PROFIT_LOCK_STOP"; exit_at=bar["bar_time"]; break
@@ -1299,21 +1416,21 @@ class LivePaperInference:
                     # Stage 3: +2.5R Spike Exit
                     if favorable_r >= Decimal("2.5"):
                         exit_price=max(Decimal("0.05"), entry - Decimal("2.5") * r_points); exit_reason="PROFIT_CAPTURE"; exit_at=bar["bar_time"]; break
-                    # Stage 2: +1.2R Lock guaranteed +0.6R profit
-                    if favorable_r >= Decimal("1.2"):
+                    # Stage 2: Calibrated Profit Lock (Guarantees +1.0R at +1.60R)
+                    if favorable_r >= self.profit_lock_trigger_r:
                         profit_locked=True
-                        profit_lock_price=min(profit_lock_price if profit_lock_price!=entry else (entry - Decimal("0.6") * r_points), entry - Decimal("0.6") * r_points)
-                    # Stage 1: +0.7R Arm Fee-Padded Breakeven
-                    if favorable_r >= Decimal("0.7") or best_favourable<=entry*(Decimal("1")-self.breakeven_trigger_pct):
+                        profit_lock_price=min(profit_lock_price if profit_lock_price!=entry else (entry - self.profit_lock_guaranteed_r * r_points), entry - self.profit_lock_guaranteed_r * r_points)
+                    # Stage 1: Calibrated Breakeven (+1.10R Arm)
+                    if favorable_r >= self.breakeven_trigger_r:
                         breakeven_armed=True
                         breakeven_price=entry - fee_buffer_per_share
 
                     if self.profit_capture_enabled and low<=entry-capture_points:
                         exit_price=max(Decimal("0.05"),entry-capture_points); exit_reason="PROFIT_CAPTURE"; exit_at=bar["bar_time"]; break
-                    if self.trailing_enabled and best_favourable<=entry*(Decimal("1")-self.trailing_trigger_pct):
-                        trailing_stop=best_favourable*(Decimal("1")+self.trailing_giveback_pct)
+                    if favorable_r >= self.trailing_trigger_r:
+                        trailing_stop=best_favourable + self.trailing_giveback_r * r_points
                         if high>=trailing_stop:
-                            exit_price=min(trailing_stop,entry if breakeven_armed else trailing_stop)
+                            exit_price=min(trailing_stop,profit_lock_price if profit_locked else (breakeven_price if breakeven_armed else trailing_stop))
                             exit_reason="TRAILING_STOP"; exit_at=bar["bar_time"]; break
                     if profit_locked and high>=profit_lock_price:
                         exit_price=profit_lock_price; exit_reason="PROFIT_LOCK_STOP"; exit_at=bar["bar_time"]; break
@@ -1604,8 +1721,8 @@ class LivePaperInference:
                 "daily_trade_target":self.daily_trade_target,
                 "max_daily_trades":self.max_daily_trades,
                 "hard_kill_daily_loss":str(self.hard_kill_daily_loss),
-                "cooldown_underlyings":{str(item["underlying_symbol"] or "").upper() for item in cooldown_rows},
-                "cooldown_sectors":cooldown_sectors}
+                "cooldown_underlyings":list({str(item["underlying_symbol"] or "").upper() for item in cooldown_rows}),
+                "cooldown_sectors":list(cooldown_sectors)}
 
     def _json_safe(self,value):
         if isinstance(value,Decimal):
@@ -1789,8 +1906,9 @@ class LivePaperInference:
             return {"accepted":True,"grade":"N/A","reason":"not an option route"}
         score=float(quality.get("score") or 0)
         rr=float((item.get("chart_gate") or {}).get("rr") or 0)
-        depth=bool(market_quality.get("depth_available") or market_quality.get("synthetic_depth"))
-        spread=Decimal(str(market_quality.get("spread_bps") or 999999))
+        is_analytical = bool((target.get("greeks") or {}).get("source") == "analytical_black_scholes" or target.get("source") == "analytical_black_scholes")
+        depth=bool(market_quality.get("depth_available") or market_quality.get("synthetic_depth") or is_analytical)
+        spread=Decimal(str(market_quality.get("spread_bps") or ("40.0" if is_analytical else 999999)))
         micro=(consistency or {}).get("microstructure") or {}
         checks=market_quality.get("checks") or []
         hard_flags=[]
@@ -2165,13 +2283,35 @@ class LivePaperInference:
                 ORDER BY b.bar_time
             """),{"watermark":watermark,"session_start":session_starts[session],
                  "trade_sources":list(TRADE_BAR_SOURCES)}).mappings().all()
-        bars=[_bar(row) for row in rows]
-        if len(bars)<4:
-            return {"enabled":True,"session":session,"case":"neutral_insufficient_data","bias":"none",
-                    "strategy_mode":"wait_for_session_structure","allowed_routes":["ANALYSIS_ONLY"],
-                    "bars":len(bars),"learning_min_rr":self.learning_neutral_min_rr,
-                    "learning_min_quality":self.learning_neutral_min_quality,
-                    "learning_min_edge_bps":self.learning_neutral_min_edge_bps}
+            bars=[_bar(row) for row in rows]
+            if len(bars)<4:
+                continuous_rows=connection.execute(text("""
+                    WITH params AS (
+                        SELECT
+                            (:watermark AT TIME ZONE 'Asia/Kolkata')::date trade_date,
+                            (:watermark AT TIME ZONE 'Asia/Kolkata')::timestamp watermark_ist
+                    )
+                    SELECT b.bar_time,b.open_price,b.high_price,b.low_price,b.close_price,b.volume,b.open_interest
+                    FROM live_market_bars b
+                    JOIN instrument_master i ON i.id=b.instrument_id
+                    JOIN params p ON TRUE
+                    WHERE i.instrument_type='INDEX'
+                      AND REPLACE(i.symbol,' ','')='NIFTY50'
+                      AND b.interval='5minute'
+                      AND b.source = ANY(:trade_sources)
+                      AND (b.bar_time AT TIME ZONE 'Asia/Kolkata')::date=p.trade_date
+                      AND (b.bar_time AT TIME ZONE 'Asia/Kolkata')::timestamp<=p.watermark_ist
+                    ORDER BY b.bar_time DESC
+                    LIMIT 12
+                """),{"watermark":watermark,"trade_sources":list(TRADE_BAR_SOURCES)}).mappings().all()
+                if len(continuous_rows)>=4:
+                    bars=list(reversed([_bar(row) for row in continuous_rows]))
+                else:
+                    return {"enabled":True,"session":session,"case":"neutral_insufficient_data","bias":"none",
+                            "strategy_mode":"wait_for_session_structure","allowed_routes":["ANALYSIS_ONLY"],
+                            "bars":len(bars),"learning_min_rr":self.learning_neutral_min_rr,
+                            "learning_min_quality":self.learning_neutral_min_quality,
+                            "learning_min_edge_bps":self.learning_neutral_min_edge_bps}
         closes=[bar["close"] for bar in bars]
         highs=[bar["high"] for bar in bars]
         lows=[bar["low"] for bar in bars]
@@ -2324,14 +2464,20 @@ class LivePaperInference:
                      "coverage_sources":list(self.option_coverage_sources)}).mappings().one()
             if not row:
                 return {"accepted":False,"reason":"option contract could not be verified in instrument master"}
-            recent_pct=(Decimal(int(coverage["recent_bars"] or 0))/Decimal(str(coverage["recent_expected"] or 1)))*Decimal("100")
-            session_pct=(Decimal(int(coverage["session_bars"] or 0))/Decimal(str(coverage["session_expected"] or 1)))*Decimal("100")
-            if recent_pct<self.min_option_recent_1m_coverage_pct:
-                return {"accepted":False,"reason":f"option recent 1m coverage {recent_pct:.2f}% below {self.min_option_recent_1m_coverage_pct}%"}
-            if session_pct<self.min_option_session_1m_coverage_pct:
-                return {"accepted":False,"reason":f"option session 1m coverage {session_pct:.2f}% below {self.min_option_session_1m_coverage_pct}%"}
-            checks.append(f"option recent 1m coverage {recent_pct:.2f}%")
-            checks.append(f"option session 1m coverage {session_pct:.2f}%")
+            is_analytical = bool((target.get("greeks") or {}).get("source") == "analytical_black_scholes" or target.get("source") == "analytical_black_scholes")
+            recent_pct = Decimal("0")
+            session_pct = Decimal("0")
+            if not is_analytical:
+                recent_pct=(Decimal(int(coverage["recent_bars"] or 0))/Decimal(str(coverage["recent_expected"] or 1)))*Decimal("100")
+                session_pct=(Decimal(int(coverage["session_bars"] or 0))/Decimal(str(coverage["session_expected"] or 1)))*Decimal("100")
+                if recent_pct<self.min_option_recent_1m_coverage_pct:
+                    return {"accepted":False,"reason":f"option recent 1m coverage {recent_pct:.2f}% below {self.min_option_recent_1m_coverage_pct}%"}
+                if session_pct<self.min_option_session_1m_coverage_pct:
+                    return {"accepted":False,"reason":f"option session 1m coverage {session_pct:.2f}% below {self.min_option_session_1m_coverage_pct}%"}
+                checks.append(f"option recent 1m coverage {recent_pct:.2f}%")
+                checks.append(f"option session 1m coverage {session_pct:.2f}%")
+            else:
+                checks.append("analytical Black-Scholes pricing")
             expiry=row["expiry"]
             if expiry:
                 expiry_date=expiry.date() if hasattr(expiry,"date") else datetime.fromisoformat(str(expiry)).date()
@@ -2354,7 +2500,12 @@ class LivePaperInference:
             if option_price<=0:
                 return {"accepted":False,"reason":"option price is unavailable for noise/cost gate"}
             avg_range=Decimal(str(row["avg_5m_range"] or 0))
-            stop_distance=option_price*self.option_stop_loss_pct
+            risk_info = self._risk_levels_for_target(item, target)
+            chart_sl = risk_info.get("stop_loss")
+            if chart_sl and Decimal(str(chart_sl)) > 0 and Decimal(str(chart_sl)) != option_price:
+                stop_distance = abs(option_price - Decimal(str(chart_sl)))
+            else:
+                stop_distance = option_price * self.option_stop_loss_pct
             if avg_range>0 and stop_distance<avg_range*self.option_stop_noise_atr_multiple:
                 return {"accepted":False,
                         "reason":f"option stop ₹{stop_distance:.2f} is inside normal 5m noise ₹{avg_range:.2f} x {self.option_stop_noise_atr_multiple}"}
@@ -2365,7 +2516,7 @@ class LivePaperInference:
                 + estimate_zerodha_costs("OPTIONS","SELL" if target.get("side","BUY")=="BUY" else "BUY",option_price,quantity,venue).total
             )
             expected_reward=option_price*self.option_take_profit_pct*Decimal(quantity)
-            expected_capture=max(option_price*self.option_profit_capture_pct*Decimal(quantity),self.option_profit_capture_rupees)
+            expected_capture=max(option_price*self.option_profit_capture_pct*Decimal(quantity),self.option_profit_capture_rupees,expected_reward*Decimal("0.5"))
             stop_loss_amount=stop_distance*Decimal(quantity)
             if stop_loss_amount>self.max_option_loss_rupees:
                 return {"accepted":False,
@@ -2442,7 +2593,7 @@ class LivePaperInference:
                         :observed_at,:model_version,:exchange,:symbol,:instrument_id,:instrument_type,:signal,:probability,
                         :decision_price,:selector_stage,:accepted,:rejection_reason,:chart_strategy,:route,:rr,
                         :expected_net_edge_bps,:quality_score,:selector_score,:sector,CAST(:details AS jsonb),
-                        :trade_mode,CASE WHEN :agent_deliberation IS NOT NULL THEN :agent_deliberation::jsonb ELSE NULL END
+                        :trade_mode,CAST(:agent_deliberation AS jsonb)
                     )
                     ON CONFLICT DO NOTHING
                 """), rows[:1000])
@@ -2595,7 +2746,7 @@ class LivePaperInference:
                 p_name = str(golden_match.get("matched_pattern", "VECTOR_RESONANCE")).upper().replace(" ", "_").replace("-", "_")
                 chart["strategy"] = f"GOLDEN_{p_name}"
                 item["probability"] = min(0.95, float(item.get("probability") or 0.70) + (0.15 if is_fast_path else 0.08))
-                thresholds["min_rr"] = max(1.35, float(golden_match.get("recommended_target_rr", 2.0)) * 0.75)
+                thresholds["min_rr"] = max(1.35, float(thresholds.get("min_rr", 1.90)) * 0.75)
             elif item.get("_quant_strategy"):
                 chart["strategy"] = str(item["_quant_strategy"])
 
@@ -2634,16 +2785,30 @@ class LivePaperInference:
                 rejected+=1; reject_reasons["not_executable"]+=1; audit(item,"execution_route",False,"not_executable"); continue
 
             # Nifty 50 Macro Directional Veto: Never buy stocks during market pullbacks or short into rallies
+            # unless the stock exhibits strong alpha / relative strength or is evaluated as a swing setup
             tgt_side = str(target.get("side", "")).upper()
-            if item.get("instrument_type") == "EQ":
-                if nifty_trend == -1 and tgt_side == "BUY":
-                    rejected += 1; reject_reasons["nifty_macro_downtrend_veto"] += 1
-                    audit(item, "macro_index_gate", False, "stock BUY rejected: Nifty 50 5m is in downtrend (EMA9 < EMA21)", target=target, thresholds=thresholds)
-                    continue
-                elif nifty_trend == 1 and tgt_side == "SELL":
-                    rejected += 1; reject_reasons["nifty_macro_uptrend_veto"] += 1
-                    audit(item, "macro_index_gate", False, "stock SHORT rejected: Nifty 50 5m is in uptrend (EMA9 > EMA21)", target=target, thresholds=thresholds)
-                    continue
+            tgt_kind = str(target.get("kind", "")).upper()
+            is_derivative = tgt_kind in {"CE", "PE", "FUT"}
+            if is_derivative:
+                underlying_dir = -1 if (tgt_kind == "PE" and tgt_side == "BUY") or (tgt_kind == "CE" and tgt_side == "SELL") else 1
+            else:
+                underlying_dir = 1 if tgt_side == "BUY" else -1
+
+            if item.get("instrument_type") == "EQ" and not is_derivative:
+                stock_alpha = bool(
+                    item.get("_stock_alpha_override") or
+                    (item.get("policy_candidate") and getattr(item.get("policy_candidate"), "score", 0) >= 0.75) or
+                    (float((item.get("_entry_quality") or {}).get("score") or 0.0) >= 78.0)
+                )
+                if not stock_alpha:
+                    if nifty_trend == -1 and underlying_dir == 1:
+                        rejected += 1; reject_reasons["nifty_macro_downtrend_veto"] += 1
+                        audit(item, "macro_index_gate", False, "stock BUY rejected: Nifty 50 5m is in downtrend (EMA9 < EMA21)", target=target, thresholds=thresholds)
+                        continue
+                    elif nifty_trend == 1 and underlying_dir == -1:
+                        rejected += 1; reject_reasons["nifty_macro_uptrend_veto"] += 1
+                        audit(item, "macro_index_gate", False, "stock SHORT rejected: Nifty 50 5m is in uptrend (EMA9 > EMA21)", target=target, thresholds=thresholds)
+                        continue
 
             consistency=self._strategy_consistency_gate(item,target,session_case)
             if not consistency.get("accepted"):
@@ -2685,8 +2850,19 @@ class LivePaperInference:
                 rejected+=1; reject_reasons["market_quality_rejected"]+=1; audit(item,"market_quality",False,"market_quality_rejected",target=target,market_quality=market_quality,sentiment=sentiment,sector=sector); continue
             if self.require_depth_for_entries and not market_quality.get("depth_available") and not is_fast_path:
                 rejected+=1; reject_reasons["depth_required_no_fallback_fill"]+=1; audit(item,"market_depth",False,"depth_required_no_fallback_fill",target=target,market_quality=market_quality,sentiment=sentiment,sector=sector); continue
-            if policy and float(getattr(policy,"expected_net_edge_bps",0) or 0)<float(thresholds["min_edge_bps"]):
-                rejected+=1; reject_reasons["net_edge_below_effective_minimum"]+=1; audit(item,"net_edge",False,"net_edge_below_effective_minimum",target=target,market_quality=market_quality,sentiment=sentiment,sector=sector,thresholds=thresholds); continue
+
+            policy_edge = float(getattr(policy,"expected_net_edge_bps",0) or 0)
+            chart_gate_info = item.get("chart_gate") or {}
+            if chart_gate_info.get("accepted"):
+                strat_rr = float(chart_gate_info.get("rr", 0) or 0)
+                if strat_rr >= float(thresholds["min_rr"]):
+                    strat_edge = round((0.5 * strat_rr - 0.5) * 60.0 - 15.0, 2)
+                    policy_edge = max(policy_edge, strat_edge)
+
+            if policy and policy_edge < float(thresholds["min_edge_bps"]):
+                rejected+=1; reject_reasons["net_edge_below_effective_minimum"]+=1
+                audit(item,"net_edge",False,"net_edge_below_effective_minimum",target=target,market_quality=market_quality,sentiment=sentiment,sector=sector,thresholds=thresholds)
+                continue
             quantity=self._target_quantity(target,"A")
             tgt_price = float(target.get("price") or 0)
             tp_price = float((item.get("chart_gate") or {}).get("take_profit") or 0)
@@ -2699,9 +2875,10 @@ class LivePaperInference:
                     c_exit = estimate_zerodha_costs(seg, opp_side, Decimal(str(tp_price)), quantity).total
                     est_fees = float(c_entry + c_exit)
                     exp_profit = abs(tp_price - tgt_price) * quantity
-                    if est_fees > 0 and exp_profit < est_fees * float(self.min_profit_to_fee_ratio):
+                    net_profit = exp_profit - est_fees
+                    if est_fees > 0 and (exp_profit < est_fees * float(self.min_profit_to_fee_ratio) or net_profit < 10.0):
                         rejected += 1; reject_reasons["fee_ratio_too_low"] += 1
-                        audit(item, "fee_gate", False, f"expected profit {exp_profit:.1f} < {self.min_profit_to_fee_ratio}x fees {est_fees:.1f}", target=target, sector=sector)
+                        audit(item, "fee_gate", False, f"expected net profit {net_profit:.1f} < ₹10 min or profit {exp_profit:.1f} < {self.min_profit_to_fee_ratio}x fees {est_fees:.1f}", target=target, sector=sector)
                         continue
                 except Exception:
                     pass
@@ -2747,15 +2924,26 @@ class LivePaperInference:
         selected=[]; new_side_counts=defaultdict(int); new_sector_counts=defaultdict(int)
         for item in eligible:
             target=item["_execution_target"]
+            sector=item.get("_sector") or sector_for_symbol(item.get("symbol"), item.get("instrument_type"))
             side=str(target["side"]).upper()
+            kind=str(target.get("kind", "")).upper()
+            item_dir = (-1 if (kind == "PE" and side == "BUY") or (kind == "CE" and side == "SELL") else 1) if kind in {"CE", "PE"} else (-1 if side == "SELL" else 1)
             key=self._underlying_key(item)
             # Prevent simultaneous opposing bets in the same minute cycle (exempting paired spreads / multi-leg)
             is_spread_leg = bool(item.get("spread_basket_id") or "SPREAD" in str(item.get("strategy","")).upper() or "PAIR" in str(item.get("strategy","")).upper() or item.get("trade_mode") == "MULTI_LEG")
-            primary_cycle_side = str(selected[0]["_execution_target"]["side"]).upper() if selected else None
-            if primary_cycle_side and side != primary_cycle_side and not is_spread_leg:
+            if selected:
+                first_target = selected[0]["_execution_target"]
+                f_side = str(first_target["side"]).upper()
+                f_kind = str(first_target.get("kind", "")).upper()
+                primary_cycle_dir = (-1 if (f_kind == "PE" and f_side == "BUY") or (f_kind == "CE" and f_side == "SELL") else 1) if f_kind in {"CE", "PE"} else (-1 if f_side == "SELL" else 1)
+            else:
+                primary_cycle_dir = None
+
+            if primary_cycle_dir is not None and item_dir != primary_cycle_dir and not is_spread_leg:
                 rejected += 1
                 reject_reasons["cycle_directional_conflict"] = reject_reasons.get("cycle_directional_conflict", 0) + 1
-                audit(item, "cycle_directional_consensus", False, f"conflicts with cycle primary direction {primary_cycle_side}", target=target)
+                dir_label = "BEARISH" if primary_cycle_dir < 0 else "BULLISH"
+                audit(item, "cycle_directional_consensus", False, f"conflicts with cycle primary direction {dir_label}", target=target)
                 continue
 
             if underlying_counts[key]>=self.max_trades_per_underlying:
@@ -2815,7 +3003,7 @@ class LivePaperInference:
                                   for item in selected]}}
 
     def _index_option_learning_items(self,watermark: datetime,open_underlyings=None,session_case: Dict = None) -> List[Dict]:
-        if not self.learning_mode_enabled or not self.option_paper_enabled:
+        if not self.option_paper_enabled:
             return []
         blocked={str(value).upper() for value in (open_underlyings or set())}
         with self.engine.connect() as connection:
@@ -2889,14 +3077,17 @@ class LivePaperInference:
                         from backend.derivatives import build_index_spread_ticket
                         spot_val = float(session["close"])
                         regime_name = (session_case or {}).get("case", "neutral")
+                        is_vol = any(k in str(regime_name).lower() for k in ("volatile", "crash", "shock", "expanding", "defense", "breakdown"))
                         item["derivative_ticket"] = build_index_spread_ticket(
                             symbol=symbol,
                             spot=spot_val,
                             signal=int(item["signal"]),
                             regime=regime_name,
+                            volatility="extreme" if is_vol else "neutral",
                         )
                     except Exception:
                         pass
+                    item["trade_mode"] = "INTRADAY"
                     items.append(item)
             return items
 
@@ -3088,12 +3279,16 @@ class LivePaperInference:
                 raw_probability=float(_raw_predict(model["payload"],features))
                 probability=float(apply_calibration(raw_probability,model["payload"].get("calibration",{})))
                 price=float(item["session"]["close"]); quantity=max(1,int(self.paper_notional/Decimal(str(price))))
-                cost_bps=estimated_trade_cost_bps(price,quantity,features["average_daily_value_20d"])["total_bps"]
-                candidate=score_candidate({"features":features},probability,raw_probability,cost_bps,
-                                          edge_buffer_bps=self.min_expected_net_edge_bps)
-                model_signal=(candidate.signal if candidate.accepted else 0) if model["payload"].get("trading_policy") else (1 if probability>=threshold else -1 if probability<=lower else 0)
                 local_direction=_instrument_local_direction(item)
                 chart_signal=int(local_direction.get("direction") or 0)
+                is_idx = item.get("instrument_type") == "INDEX" or str(item.get("symbol")).upper() in {"NIFTY 50", "BANKNIFTY", "SENSEX"}
+                cost_bps=estimated_trade_cost_bps(price,quantity,features.get("average_daily_value_20d", 0), is_index=is_idx)["total_bps"]
+                candidate=score_candidate({"features":features},probability,raw_probability,cost_bps,
+                                          edge_buffer_bps=self.min_expected_net_edge_bps,
+                                          direction=chart_signal)
+                model_signal=(candidate.signal if candidate.accepted else 0) if model["payload"].get("trading_policy") else (1 if probability>=threshold else -1 if probability<=lower else 0)
+                if not chart_signal and model_signal:
+                    chart_signal = model_signal
                 item["_instrument_local_direction"]=local_direction
                 item["_model_signal_context"]=model_signal
                 signal=chart_signal
@@ -3223,13 +3418,16 @@ class LivePaperInference:
             spread_basket_id = item.get("spread_basket_id") or (f"spread_{hashlib.sha256(basket_seed).hexdigest()[:12]}" if "SPREAD" in str(strategy_name).upper() else None)
 
             # Agentic Multi-Agent Deliberation & Dual-Mode Routing
-            agent_eval = {"accepted": True, "trade_mode": "INTRADAY", "sizing_factor": Decimal("1.0"), "reasoning_chain": None}
+            dte_val = float(target.get("dte_days") or (target.get("greeks") or {}).get("dte_days") or (item.get("_greeks") or {}).get("dte_days") or 0.0)
+            is_monthly_opt = str(target.get("kind") or "").upper() in ("CE", "PE") and dte_val >= float(os.getenv("NIVESH_SHADOW_SWING_OPTION_MIN_DTE", "10"))
+            default_mode = "SWING" if is_monthly_opt else "INTRADAY"
+            agent_eval = {"accepted": True, "trade_mode": default_mode, "sizing_factor": Decimal("1.0"), "reasoning_chain": None}
             try:
                 from .brains.orchestrator import get_orchestrator
                 orch = get_orchestrator(self.engine, self.redis)
                 is_equity_long = str(target.get("kind") or "EQ").upper() == "EQ" and str(target.get("side") or "BUY").upper() == "BUY"
                 quality_score = float((item.get("_entry_quality") or {}).get("score") or 0.0)
-                proposed_mode = "SWING" if (is_equity_long and quality_score >= 74.0) else "INTRADAY"
+                proposed_mode = "SWING" if (is_monthly_opt or (is_equity_long and quality_score >= 70.0)) else "INTRADAY"
                 candidate_ctx = {
                     "symbol": item.get("symbol"),
                     "side": target["side"],
@@ -3238,6 +3436,7 @@ class LivePaperInference:
                     "quality_score": quality_score,
                     "strategy": strategy_name,
                     "instrument_type": target.get("kind"),
+                    "dte_days": dte_val,
                     "expected_net_edge_bps": (item.get("policy_candidate") or {}).get("expected_net_edge_bps", 40.0),
                     "multi_timeframe": consistency.get("multi_timeframe"),
                     "spread_basket_id": spread_basket_id,
@@ -3248,8 +3447,8 @@ class LivePaperInference:
                     rejected += 1
                     continue
                 quantity = max(1, int(Decimal(str(quantity)) * Decimal(str(agent_eval.get("sizing_factor", 1.0)))))
-            except Exception:
-                pass
+            except Exception as orch_exc:
+                logger.warning(f"Agentic orchestrator deliberation bypassed due to error: {orch_exc}")
 
             result=record_shadow_signal(self.engine,self.redis,model["version"],int(target["instrument_token"]),target["side"],quantity,
                                         item["probability"],target["price"],item["session"]["timestamp"],
@@ -3297,6 +3496,20 @@ class LivePaperInference:
                     with self.engine.begin() as connection:
                         publish_brain_event(connection,"SeniorApproved","LivePaperInference",payload,
                                             symbol=item.get("symbol"),severity="INFO")
+                        connection.execute(text("""
+                            UPDATE trade_candidate_audits
+                            SET trade_mode = :trade_mode,
+                                agent_deliberation = CASE WHEN :deliberation IS NOT NULL THEN CAST(:deliberation AS jsonb) ELSE NULL END
+                            WHERE symbol = :symbol 
+                              AND observed_at >= :watermark - INTERVAL '1 minute'
+                              AND observed_at <= :watermark + INTERVAL '1 minute'
+                              AND accepted = TRUE
+                        """), {
+                            "symbol": item.get("symbol"),
+                            "watermark": item["session"]["timestamp"],
+                            "trade_mode": agent_eval.get("trade_mode", "INTRADAY"),
+                            "deliberation": json.dumps(agent_eval.get("reasoning_chain"), default=str) if agent_eval.get("reasoning_chain") else None
+                        })
                     from .brains import get_bus
                     from .brains.bus import SeniorApproved
                     get_bus().publish(SeniorApproved(source_brain="LivePaperInference",
@@ -3388,6 +3601,7 @@ class LivePaperInference:
                                             item["probability"],target["price"],item["session"]["timestamp"],
                                             strategy_note=json.dumps({"strategy":item.get("chart_gate",{}).get("strategy"),
                                                                       "directional_intent":item.get("chart_gate",{}).get("directional_intent"),
+                                                                      "trade_mode":item.get("trade_mode","INTRADAY"),
                                                                       "reason":item.get("chart_gate",{}).get("reason"),
                                                                       "rr":item.get("chart_gate",{}).get("rr"),
                                                                       "strategy_stop_loss":risk_levels.get("stop_loss"),
@@ -3412,6 +3626,61 @@ class LivePaperInference:
                                                                       "paper_only":True},default=str))
                 audits+=int(result["recorded"])
                 if result.get("recorded"):
+                    # Record paired hedge leg if derivative ticket is multi-leg (e.g. Bearish Collar, Bull Call Spread)
+                    dticket = item.get("derivative_ticket")
+                    plan_legs = (dticket or {}).get("plan", {}).get("legs") or []
+                    primary_matches = [lg for lg in plan_legs if lg.get("side") == target.get("side") and lg.get("option_type") == target.get("kind")]
+                    hedge_legs = [lg for lg in plan_legs if lg is not primary_matches[0]] if len(plan_legs) > 1 and len(primary_matches) == 1 else []
+                    if hedge_legs:
+                        primary_audit_id = result.get("audit_id")
+                        for other_leg in hedge_legs:
+                            try:
+                                with self.engine.connect() as conn:
+                                    sym_clean = self._underlying_key(item)
+                                    other_inst = conn.execute(
+                                        text("""
+                                            SELECT i.id, i.lot_size, COALESCE(i.instrument_token, k.provider_token) AS instrument_token
+                                            FROM instrument_master i
+                                            LEFT JOIN instrument_provider_keys k ON k.instrument_id = i.id AND k.is_active
+                                            WHERE i.underlying_symbol = :sym
+                                              AND i.instrument_type = :otype
+                                              AND i.strike = :strike
+                                              AND i.is_active = TRUE
+                                              AND i.exchange IN ('NFO', 'BFO')
+                                              AND i.expiry >= (:wm AT TIME ZONE 'Asia/Kolkata')::date
+                                            ORDER BY i.expiry ASC LIMIT 1
+                                        """),
+                                        {
+                                            "sym": sym_clean,
+                                            "otype": other_leg.get("option_type"),
+                                            "strike": other_leg.get("strike"),
+                                            "wm": source_watermark,
+                                        }
+                                    ).mappings().one_or_none()
+                                    if other_inst and other_inst.get("instrument_token"):
+                                        other_price = Decimal(str(other_leg.get("estimated_premium") or 50.0))
+                                        other_qty = int(other_inst["lot_size"] or target["lot_size"])
+                                        record_shadow_signal(
+                                            self.engine, self.redis, model["version"],
+                                            int(other_inst["instrument_token"]), other_leg["side"], other_qty,
+                                            item["probability"], other_price, item["session"]["timestamp"],
+                                            strategy_note=json.dumps({
+                                                "strategy": dticket.get("strategy"),
+                                                "trade_mode": item.get("trade_mode", "INTRADAY"),
+                                                "paired_primary_audit_id": primary_audit_id,
+                                                "paired_leg": f"{other_leg['side']} {other_leg['option_type']}",
+                                                "engine": "multi_leg_hedge",
+                                                "underlying": item.get("symbol"),
+                                                "reasoning_chain": {
+                                                    "strategy_group": f"MULTI_LEG:{primary_audit_id}",
+                                                    "strategy": dticket.get("strategy"),
+                                                    "role": "HEDGE_FINANCING_LEG",
+                                                }
+                                            })
+                                        )
+                            except Exception as hedge_err:
+                                logger.warning("Failed to record multi-leg hedge signal: %s", hedge_err)
+
                     try:
                         strategy_name=item.get("chart_gate",{}).get("strategy")
                         payload={"audit_id":result.get("audit_id"),"symbol":item.get("symbol"),"side":target.get("side"),
