@@ -232,20 +232,20 @@ timeline
 - [ ] Ingest today's complete 1-min & 5-min bars via `backend/market_ingestion_v3.py`.
 - [ ] Run daily trade book audit: verify zero invariant violations, zero unhedged options, and strict atomic sibling exits.
 
-#### Phase 4.2: Frontend Native ES Module Decomposition (`frontend/app.js` ~4,563 lines)
-- [ ] **`frontend/modules/utils.js`**: Extract shared helpers (`signedMoney`, `money`, `escapeHtml`, `formatPnlEl`, `icon`, `strategyPill`).
-- [ ] **`frontend/modules/metrics.js`**: Extract metrics ticker updates, marked P&L formatting, risk window counters, and brain status indicators.
-- [ ] **`frontend/modules/sse.js`**: Extract Server-Sent Events listener (`/api/stream`), exponential reconnect backoff, and fallback polling logic.
-- [ ] **`frontend/modules/trade_book.js`**: Extract paper trades table rendering, audit modal inspection, filters, and export handlers.
-- [ ] Update `frontend/index.html` to load `<script type="module" src="app.js"></script>`.
-- [ ] Refactor `frontend/app.js` into the slim top-level orchestrator importing and wiring all modules.
-- [ ] Validate with `node --check frontend/app.js frontend/modules/*.js` and verify live browser telemetry.
+#### Phase 4.2: Frontend Native ES Module Decomposition (`frontend/app.js` ~4,563 lines) ✅ COMPLETE
+- [x] **`frontend/modules/utils.js`**: Extract shared helpers (`signedMoney`, `money`, `escapeHtml`, `formatPnlEl`, `icon`, `strategyPill`).
+- [x] **`frontend/modules/metrics.js`**: Extract metrics ticker updates, marked P&L formatting, risk window counters, and brain status indicators.
+- [x] **`frontend/modules/sse.js`**: Extract Server-Sent Events listener (`/api/stream`), exponential reconnect backoff, and fallback polling logic.
+- [x] **`frontend/modules/trade_book.js`**: Extract paper trades table rendering, audit modal inspection, filters, and export handlers.
+- [x] Update `frontend/index.html` to load `<script type="module" src="app.js?v=20261007t1715"></script>`.
+- [x] Refactor `frontend/app.js` into the slim top-level orchestrator importing and wiring all modules.
+- [x] Validate with `node --check frontend/app.js frontend/modules/*.js` and verify live browser telemetry.
 
-#### Phase 4.3: Backend Phase C & Advanced Intelligence Wiring
-- [ ] **Regime Router Active Gating**: Wire `backend/regime_router.py` into `live_inference.py` (veto breakouts in `RANGE_MEAN_REVERSION`, veto fades in `TREND_CONTINUATION`).
-- [ ] **GEX Engine & Flip Point Calculator**: Build 3-minute scheduled Gamma Exposure routine across Nifty, BankNifty, and Top 5 heavyweights; enforce stop widening ($1.5\times$) and size halving below the Zero-Gamma Flip Strike.
-- [ ] **Spider Bot Delta Balancing Loop**: Wire `backend/spider_bot.py` rebalancing loop into background worker (`backend/tasks/worker.py`) to auto-evaluate and roll short wings when $|\Delta| > 0.20$.
-- [ ] **Dual-Tier Memo Trap Penalties**: Enforce intraday trap counts from `backend/intelligence_memory.py` to bump required entry conviction for repeatedly failed setups.
-- [ ] **Phase C Integration Test**: Create and pass `tests/test_phase_c_integration.py` covering end-to-end regime, GEX, Spider, and memory execution.
+#### Phase 4.3: Backend Phase C & Advanced Intelligence Wiring ✅ COMPLETE
+- [x] **Regime Router Active Gating**: Wire `backend/regime_router.py` into `live_inference.py` (veto breakouts in `RANGE_MEAN_REVERSION`, veto fades in `TREND_CONTINUATION`).
+- [x] **GEX Engine & Flip Point Calculator**: Build 3-minute scheduled Gamma Exposure routine across Nifty, BankNifty, and Top 5 heavyweights; enforce stop widening ($1.5\times$) and size halving below the Zero-Gamma Flip Strike.
+- [x] **Spider Bot Delta Balancing Loop**: Wire `backend/spider_bot.py` rebalancing loop into background worker (`backend/tasks/worker.py`) to auto-evaluate and roll short wings when $|\Delta| > 0.20$.
+- [x] **Dual-Tier Memo Trap Penalties**: Enforce intraday trap counts from `backend/intelligence_memory.py` to bump required entry conviction for repeatedly failed setups.
+- [x] **Phase C Integration Test**: Create and pass `tests/test_phase_c_integration.py` covering end-to-end regime, GEX, Spider, and memory execution (184 total tests passing in project test suite).
 
 
