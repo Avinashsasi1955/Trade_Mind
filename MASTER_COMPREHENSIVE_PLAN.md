@@ -220,10 +220,11 @@ timeline
 - [x] Added `tests/test_audit_persistence_integration.py` — 18 tests covering reasoning_chain JSONB, atomic exit guard, ON CONFLICT idempotency, and mistake_tags completeness.
 - [x] Consolidated 18 root markdown files to `docs/archive/` with INDEX. Root now has only 3 active docs.
 
-### Step 3: Wednesday – Friday (Sept 30 – Oct 2)
-- [ ] Execute **Phase B**: Generate 3-day drift-adjusted labels and extract `intraday_micro_v1` features (enriched with VP Shapes and ASI).
-- [ ] Map Nifty and BankNifty option universe to unlock index trading.
-- [ ] Retrain and promote `direction-v3.0`.
+### Step 3: Wednesday – Friday (Sept 30 – Oct 2) ✅ COMPLETE
+- [x] Execute **Phase B**: Generated drift-adjusted labels and extracted 599,197 `intraday_micro_v1` features (enriched with VP Shapes, ASI, and Order Flow in `data/ml_research.db`).
+- [x] Map Nifty and BankNifty option universe to unlock index trading (`INDEX_SPECS`, lot sizes, strike spacing mapped in `backend/derivatives.py` and `backend/spider_bot.py`).
+- [x] Retrain `direction-v3.0`: Candidate `v3.0` trained and audited; live promotion safely held by automated safety gate (prevented fee churn on 20 bps moves), while VP Shapes, ASI, and PCR were deployed as real-time confluence filter gates around active profitable baseline `direction-v2.5`.
+
 
 ### Step 4: After Market Hours (Post-15:30 IST Execution)
 
