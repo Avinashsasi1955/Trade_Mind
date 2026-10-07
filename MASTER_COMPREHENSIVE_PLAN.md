@@ -226,16 +226,25 @@ timeline
 - [ ] Retrain and promote `direction-v3.0`.
 
 ### Step 4: After Market Hours (Post-15:30 IST Execution)
-- [ ] **Phase C Deployment**:
-  - [ ] Deploy and wire `backend/regime_router.py` into live signal gating (suppress breakouts in range, suppress fades in trend).
-  - [ ] Implement Real-Time GEX Engine for Nifty, BankNifty, and Top 5 heavyweights with Zero-Gamma Flip Point detector.
-  - [ ] Connect `backend/spider_bot.py` autonomous delta rebalancing loop (|Delta| > 0.20 threshold) into background worker.
-  - [ ] Activate Dual-Tier Memo memory layer (`backend/intelligence_memory.py`) intraday trap penalties in live scoring.
-- [ ] **Frontend Native ES Module Decomposition (`frontend/app.js` ~4,563 lines)**:
-  - [ ] Create `frontend/modules/metrics.js`: Extract metrics ticker updates, marked P&L formatting (`formatPnlEl`), risk window counters, and brain status indicators.
-  - [ ] Create `frontend/modules/sse.js`: Extract Server-Sent Events listener (`/api/stream`), exponential reconnect backoff, and fallback polling logic.
-  - [ ] Create `frontend/modules/trade_book.js`: Extract paper trades table rendering, audit modal inspection, filters, and export handlers.
-  - [ ] Update `frontend/index.html` to load `<script type="module" src="app.js"></script>`.
-  - [ ] Keep `frontend/app.js` as the clean top-level orchestrator importing and wiring the modules together.
-  - [ ] Validate with `node --check` across all modules and verify SSE streaming in browser.
+
+#### Phase 4.1: Post-Market Ingestion & Session Reconciliation (15:35 IST)
+- [ ] Ingest today's complete 1-min & 5-min bars via `backend/market_ingestion_v3.py`.
+- [ ] Run daily trade book audit: verify zero invariant violations, zero unhedged options, and strict atomic sibling exits.
+
+#### Phase 4.2: Frontend Native ES Module Decomposition (`frontend/app.js` ~4,563 lines)
+- [ ] **`frontend/modules/utils.js`**: Extract shared helpers (`signedMoney`, `money`, `escapeHtml`, `formatPnlEl`, `icon`, `strategyPill`).
+- [ ] **`frontend/modules/metrics.js`**: Extract metrics ticker updates, marked P&L formatting, risk window counters, and brain status indicators.
+- [ ] **`frontend/modules/sse.js`**: Extract Server-Sent Events listener (`/api/stream`), exponential reconnect backoff, and fallback polling logic.
+- [ ] **`frontend/modules/trade_book.js`**: Extract paper trades table rendering, audit modal inspection, filters, and export handlers.
+- [ ] Update `frontend/index.html` to load `<script type="module" src="app.js"></script>`.
+- [ ] Refactor `frontend/app.js` into the slim top-level orchestrator importing and wiring all modules.
+- [ ] Validate with `node --check frontend/app.js frontend/modules/*.js` and verify live browser telemetry.
+
+#### Phase 4.3: Backend Phase C & Advanced Intelligence Wiring
+- [ ] **Regime Router Active Gating**: Wire `backend/regime_router.py` into `live_inference.py` (veto breakouts in `RANGE_MEAN_REVERSION`, veto fades in `TREND_CONTINUATION`).
+- [ ] **GEX Engine & Flip Point Calculator**: Build 3-minute scheduled Gamma Exposure routine across Nifty, BankNifty, and Top 5 heavyweights; enforce stop widening ($1.5\times$) and size halving below the Zero-Gamma Flip Strike.
+- [ ] **Spider Bot Delta Balancing Loop**: Wire `backend/spider_bot.py` rebalancing loop into background worker (`backend/tasks/worker.py`) to auto-evaluate and roll short wings when $|\Delta| > 0.20$.
+- [ ] **Dual-Tier Memo Trap Penalties**: Enforce intraday trap counts from `backend/intelligence_memory.py` to bump required entry conviction for repeatedly failed setups.
+- [ ] **Phase C Integration Test**: Create and pass `tests/test_phase_c_integration.py` covering end-to-end regime, GEX, Spider, and memory execution.
+
 
