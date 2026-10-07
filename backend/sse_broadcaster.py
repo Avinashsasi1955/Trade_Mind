@@ -157,6 +157,7 @@ def start_metrics_ticker(engine=None, redis_client=None) -> None:
 
         def _ticker_loop():
             from sqlalchemy import text
+            last_known_today = None
             while True:
                 time.sleep(4.0)
                 if get_connected_clients_count() == 0:
@@ -192,35 +193,44 @@ def start_metrics_ticker(engine=None, redis_client=None) -> None:
                             if isinstance(p, dict):
                                 thought_text = p.get("summary") or p.get("reason") or p.get("thought") or thought_text
 
-                    r_client = None
-                    try:
-                        from backend.service import _get_redis
-                        r_client = _get_redis()
-                    except Exception:
-                        pass
-
-                    cached_today = None
-                    if r_client:
+                    r_client = redis_client
+                    if not r_client:
                         try:
-                            raw = r_client.get("nivesh:cache:shadow_trade_book:100") or r_client.get("nivesh:cache:shadow_trade_book:200")
-                            if raw:
-                                book = json.loads(raw)
-                                cached_today = book.get("today")
+                            from backend.service import _get_redis
+                            r_client = _get_redis()
                         except Exception:
                             pass
 
+                    cached_today = None
+                    today_str = datetime.now(IST).date().isoformat()
+                    if r_client:
+                        try:
+                            raw = (
+                                r_client.get("nivesh:cache:shadow_trade_book:100")
+                                or r_client.get("nivesh:cache:shadow_trade_book:200")
+                            )
+                            if raw:
+                                book = json.loads(raw)
+                                if book.get("market_date") == today_str:
+                                    cached_today = book.get("today")
+                        except Exception:
+                            pass
+
+                    now_mono = time.monotonic()
                     if cached_today and isinstance(cached_today, dict):
-                        realised_pnl = float(cached_today.get("realised_pnl") if cached_today.get("realised_pnl") is not None else (row["realised_pnl"] or 0.0))
-                        unrealised_pnl = float(cached_today.get("unrealised_pnl") or 0.0)
-                        net_marked_pnl = float(cached_today.get("net_marked_pnl") if cached_today.get("net_marked_pnl") is not None else (realised_pnl + unrealised_pnl))
-                        open_count = int(cached_today.get("open_trades") if cached_today.get("open_trades") is not None else (row["open_count"] or 0))
-                        closed_count = int(cached_today.get("closed_trades") if cached_today.get("closed_trades") is not None else (row["closed_count"] or 0))
-                    else:
-                        realised_pnl = float(row["realised_pnl"] or 0.0)
-                        unrealised_pnl = 0.0
-                        net_marked_pnl = realised_pnl
-                        open_count = int(row["open_count"] or 0)
-                        closed_count = int(row["closed_count"] or 0)
+                        last_known_today = (today_str, cached_today, now_mono)
+                    elif last_known_today and last_known_today[0] == today_str:
+                        # Expire cache fallback if older than 60s TTL
+                        if (now_mono - last_known_today[2]) <= 60.0:
+                            cached_today = last_known_today[1]
+                        else:
+                            last_known_today = None
+
+                    open_count = int(row["open_count"] or 0)
+                    closed_count = int(row["closed_count"] or 0)
+                    realised_pnl = float(row["realised_pnl"] or 0.0)
+                    unrealised_pnl = float(cached_today.get("unrealised_pnl") or 0.0) if (open_count > 0 and cached_today and isinstance(cached_today, dict)) else 0.0
+                    net_marked_pnl = realised_pnl + unrealised_pnl
 
                     tick_data = {
                         "open_trades": open_count,

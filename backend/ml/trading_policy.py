@@ -71,7 +71,7 @@ def score_candidate(row: Dict, probability: float, raw_probability: float,
 
     candidate_dir = direction
     if candidate_dir == 0:
-        candidate_dir = 1 if probability >= 0.50 else -1
+        candidate_dir = 1 if (is_intraday or probability >= 0.50) else -1
 
     if is_intraday and candidate_dir < 0:
         # Intraday label is long-TP only; no calibrated short-side probability exists.

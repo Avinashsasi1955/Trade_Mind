@@ -53,6 +53,7 @@ def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:
         chart_sl = None
         chart_tp = None
         allow_strategy_risk = False
+        is_synthetic_entry = False
         if strategy_note:
             try:
                 note=json.loads(strategy_note) if str(strategy_note).strip().startswith("{") else {}
@@ -60,6 +61,7 @@ def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:
                     trade_mode = str(note.get("trade_mode")).upper()
                 if note.get("reasoning_chain"):
                     reasoning_chain_json = json.dumps(note.get("reasoning_chain"), default=str)
+                is_synthetic_entry = bool(note.get("synthetic_entry"))
                 chart_sl=note.get("strategy_stop_loss")
                 chart_tp=note.get("strategy_take_profit")
                 risk_price_basis=str(note.get("risk_price_basis") or "").lower()
@@ -71,6 +73,8 @@ def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:
         signal_date=signal_at.date()
         verified=(instrument["instrument_type"] in {"FUT","CE","PE"} and instrument["is_active"]
             and instrument["expiry"] is not None and instrument["expiry"]>=signal_date and int(quantity)%int(instrument["lot_size"])==0)
+        if is_synthetic_entry:
+            verified = False
         sl_pct=OPTION_STOP_LOSS_PCT if instrument["instrument_type"] in {"CE","PE"} else STOP_LOSS_PCT
         tp_pct=OPTION_TAKE_PROFIT_PCT if instrument["instrument_type"] in {"CE","PE"} else TAKE_PROFIT_PCT
         stop_loss=(fill*(Decimal("1")-sl_pct)) if side=="BUY" else (fill*(Decimal("1")+sl_pct))
@@ -84,13 +88,14 @@ def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:
             if (side=="BUY" and candidate_tp>fill) or (side=="SELL" and candidate_tp<fill):
                 take_profit=candidate_tp
         fill_source="DEPTH_SNAPSHOT" if depth else "DECISION_PRICE_FALLBACK"
+        initial_tags = ["synthetic_option_model"] if is_synthetic_entry else []
         inserted=connection.execute(text("""INSERT INTO shadow_execution_audits(model_version,instrument_id,signal_at,side,quantity,signal_probability,decision_price,
             best_bid,best_ask,bid_quantity,ask_quantity,theoretical_fill_price,one_tick_penalty,estimated_fees,cost_reconciled,
             instrument_execution_verified,audit_status,rejection_reason,stop_loss_price,take_profit_price,fill_source,improvement_note,
-            trade_mode,reasoning_chain)
+            trade_mode,reasoning_chain,mistake_tags)
             VALUES(:model,:instrument,:signal_at,:side,:quantity,:probability,:price,:bid,:ask,:bid_qty,:ask_qty,:fill,:penalty,:fees,TRUE,
             :verified,'RECONCILED',:reason,:stop_loss,:take_profit,:fill_source,:strategy_note,
-            :trade_mode,CASE WHEN :reasoning_chain IS NOT NULL THEN CAST(:reasoning_chain AS jsonb) ELSE NULL END)
+            :trade_mode,CASE WHEN :reasoning_chain IS NOT NULL THEN CAST(:reasoning_chain AS jsonb) ELSE NULL END,CAST(:mistake_tags AS jsonb))
             ON CONFLICT(model_version,instrument_id,signal_at,side) DO NOTHING RETURNING id"""),
             {"model":model_version,"instrument":instrument["id"],"signal_at":signal_at,"side":side,"quantity":quantity,"probability":probability,"price":decision_price,
              "bid":best_bid,"ask":best_ask,"bid_qty":depth.get("bid_quantity"),"ask_qty":depth.get("ask_quantity"),
@@ -98,7 +103,8 @@ def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:
              "reason":None if depth else "Paper fallback: no contemporaneous depth snapshot",
              "stop_loss":stop_loss,"take_profit":take_profit,"fill_source":fill_source,
              "strategy_note":strategy_note[:2000] if strategy_note else None,
-             "trade_mode":trade_mode,"reasoning_chain":reasoning_chain_json}).scalar_one_or_none()
+             "trade_mode":trade_mode,"reasoning_chain":reasoning_chain_json,
+             "mistake_tags":json.dumps(initial_tags)}).scalar_one_or_none()
         if inserted:
             payload={"audit_id":int(inserted),"instrument_id":int(instrument["id"]),"symbol":instrument["symbol"],
                      "instrument_type":instrument["instrument_type"],"side":side,"quantity":quantity,
@@ -153,29 +159,53 @@ def reconcile_shadow_costs(engine) -> Dict:
 
 
 def _mistake_tags(row, net: Decimal, exit_reason: str) -> Dict:
-    tags=[]; note="Paper trade behaved as planned; keep collecting evidence."
-    if exit_reason=="STOP_LOSS":
-        tags.append("stop_loss_hit"); note="Review entry timing, trend filter and stop distance; signal moved against the model before target."
-    elif exit_reason=="TIME_EXIT" and net<0:
-        tags.append("stale_signal_loss"); note="Signal did not work within the paper holding window; consider stricter no-trade zone or faster invalidation."
-    elif exit_reason=="TIME_EXIT" and net>=0:
-        tags.append("slow_winner"); note="Trade made money but did not reach target; evaluate partial-profit or trailing exit rules."
-    elif exit_reason=="TAKE_PROFIT":
-        tags.append("target_hit"); note="Target was reached; compare whether earlier exits leave profit on the table."
-    elif exit_reason=="PROFIT_CAPTURE":
-        tags.append("profit_captured"); note="Trade reached the configured paper profit capture threshold and was closed before the move faded."
-    elif exit_reason=="TRAILING_STOP":
-        tags.append("trailing_profit_protection"); note="Trade moved favourably and the trailing stop protected part of the move."
-    elif exit_reason=="BREAKEVEN_STOP":
-        tags.append("capital_protection"); note="Trade moved enough to arm break-even protection, then faded back without a material loss."
-    if row["fill_source"]!="DEPTH_SNAPSHOT":
+    raw_tags = row.get("mistake_tags") if hasattr(row, "get") else getattr(row, "mistake_tags", None)
+    if isinstance(raw_tags, str):
+        try:
+            raw_tags = json.loads(raw_tags)
+        except Exception:
+            raw_tags = []
+    tags = list(raw_tags) if isinstance(raw_tags, (list, tuple)) else []
+    note = "Paper trade behaved as planned; keep collecting evidence."
+    if exit_reason == "STOP_LOSS":
+        if "stop_loss_hit" not in tags:
+            tags.append("stop_loss_hit")
+        note = "Review entry timing, trend filter and stop distance; signal moved against the model before target."
+    elif exit_reason == "TIME_EXIT" and net < 0:
+        if "stale_signal_loss" not in tags:
+            tags.append("stale_signal_loss")
+        note = "Signal did not work within the paper holding window; consider stricter no-trade zone or faster invalidation."
+    elif exit_reason == "TIME_EXIT" and net >= 0:
+        if "slow_winner" not in tags:
+            tags.append("slow_winner")
+        note = "Trade made money but did not reach target; evaluate partial-profit or trailing exit rules."
+    elif exit_reason == "TAKE_PROFIT":
+        if "target_hit" not in tags:
+            tags.append("target_hit")
+        note = "Target was reached; compare whether earlier exits leave profit on the table."
+    elif exit_reason == "PROFIT_CAPTURE":
+        if "profit_captured" not in tags:
+            tags.append("profit_captured")
+        note = "Trade reached the configured paper profit capture threshold and was closed before the move faded."
+    elif exit_reason == "TRAILING_STOP":
+        if "trailing_profit_protection" not in tags:
+            tags.append("trailing_profit_protection")
+        note = "Trade moved favourably and the trailing stop protected part of the move."
+    elif exit_reason == "BREAKEVEN_STOP":
+        if "capital_protection" not in tags:
+            tags.append("capital_protection")
+        note = "Trade moved enough to arm break-even protection, then faded back without a material loss."
+    fill_src = row.get("fill_source") if hasattr(row, "get") else getattr(row, "fill_source", None)
+    if fill_src != "DEPTH_SNAPSHOT" and "fallback_fill" not in tags:
         tags.append("fallback_fill")
-    if Decimal(row["estimated_fees"] or 0)>abs(net) and net<0:
+    est_fees = Decimal(str((row.get("estimated_fees") if hasattr(row, "get") else getattr(row, "estimated_fees", 0)) or 0))
+    if est_fees > abs(net) and net < 0 and "cost_drag" not in tags:
         tags.append("cost_drag")
-    return {"tags":tags,"note":note}
+    return {"tags": tags, "note": note}
 
 
-def record_shadow_exit(engine,audit_id:int,exit_price:Decimal,exit_reason: str = "TIME_EXIT",exit_at=None) -> Dict:
+def record_shadow_exit(engine,audit_id:int,exit_price:Decimal,exit_reason: str = "TIME_EXIT",exit_at=None,
+                        is_synthetic: bool = False) -> Dict:
     if exit_price<=0: raise ValueError("Positive exit price required")
     with engine.begin() as connection:
         row=connection.execute(text("""SELECT a.*,i.exchange,i.instrument_type,i.symbol FROM shadow_execution_audits a
@@ -192,15 +222,21 @@ def record_shadow_exit(engine,audit_id:int,exit_price:Decimal,exit_reason: str =
         gross=(exit_price-entry)*quantity if side=="BUY" else (entry-exit_price)*quantity
         net=gross-Decimal(row["estimated_fees"])-exit_costs.total
         mistake=_mistake_tags(row,net,exit_reason)
+        is_synthetic = bool(is_synthetic or ("synthetic_option_model" in mistake["tags"]))
+        if is_synthetic:
+            if "synthetic_option_model" not in mistake["tags"]:
+                mistake["tags"].append("synthetic_option_model")
+            mistake["note"] = f"{mistake.get('note', '')} [SYNTHETIC_MODEL_EXIT]".strip()
         connection.execute(text("""UPDATE shadow_execution_audits SET realised_exit_price=:exit,net_pnl=:net,
             exit_at=COALESCE(:exit_at,CURRENT_TIMESTAMP),exit_reason=:reason,mistake_tags=CAST(:tags AS jsonb),improvement_note=:note
             WHERE id=:id AND net_pnl IS NULL"""),{"exit":exit_price,"net":net,"id":audit_id,"exit_at":exit_at,"reason":exit_reason,
                               "tags":json.dumps(mistake["tags"]),"note":mistake["note"]})
         publish_brain_event(connection,"ShadowTradeClosed","record_shadow_exit",
                             {"audit_id":audit_id,"instrument_id":int(row["instrument_id"]),"side":side,
-                             "net_pnl":str(net),"exit_reason":exit_reason,"mistake_tags":mistake["tags"]},
+                             "net_pnl":str(net),"exit_reason":exit_reason,"mistake_tags":mistake["tags"],
+                             "is_synthetic":is_synthetic},
                             severity="INFO" if net>=0 else "WARNING")
-        if float(net) >= 100.0 or (row["stop_loss_price"] and float(abs(exit_price - entry) / max(Decimal("0.05"), abs(entry - Decimal(row["stop_loss_price"])))) >= 1.8):
+        if not is_synthetic and (float(net) >= 100.0 or (row["stop_loss_price"] and float(abs(exit_price - entry) / max(Decimal("0.05"), abs(entry - Decimal(row["stop_loss_price"])))) >= 1.8)):
             try:
                 from backend.trade_memory import auto_ingest_winning_trade
                 auto_ingest_winning_trade({
@@ -223,7 +259,7 @@ def record_shadow_exit(engine,audit_id:int,exit_price:Decimal,exit_reason: str =
             from backend.brains.bus import ShadowTradeClosed
             get_bus().publish(ShadowTradeClosed(source_brain="record_shadow_exit", audit_id=int(audit_id),
                                                 net_pnl=float(net), exit_reason=exit_reason,
-                                                payload={"mistake_tags":mistake["tags"]}))
+                                                payload={"mistake_tags":mistake["tags"],"is_synthetic":is_synthetic}))
         except Exception:
             pass
         try:
@@ -272,14 +308,20 @@ def evaluate_promotion(engine,starting_capital:Decimal=Decimal("1000000")) -> Di
         model=connection.execute(text("SELECT metrics FROM model_versions WHERE status='active' ORDER BY id DESC LIMIT 1")).scalar_one_or_none() or {}
         if isinstance(model,str): model=json.loads(model)
         log_loss=float(model.get("holdout",{}).get("log_loss",999))
-        pnl=[float(row[0]) for row in connection.execute(text("SELECT net_pnl FROM shadow_execution_audits WHERE net_pnl IS NOT NULL ORDER BY signal_at"))]
+        pnl=[float(row[0]) for row in connection.execute(text("""SELECT net_pnl FROM shadow_execution_audits
+            WHERE net_pnl IS NOT NULL
+              AND NOT COALESCE(mistake_tags @> '["synthetic_option_model"]'::jsonb, FALSE)
+            ORDER BY signal_at"""))]
         gains=sum(x for x in pnl if x>0); losses=abs(sum(x for x in pnl if x<=0)); profit_factor=gains/losses if losses else (999 if gains else 0)
         equity=peak=float(starting_capital); max_dd=0.0
         for value in pnl: equity+=value; peak=max(peak,equity); max_dd=min(max_dd,(equity/peak-1)*100)
         cost_sessions=int(connection.execute(text("""SELECT COUNT(DISTINCT (created_at AT TIME ZONE 'Asia/Kolkata')::date)
             FROM order_execution_ledger WHERE contract_note_reconciled_at IS NOT NULL
               AND actual_contract_note_fees IS NOT NULL AND status='FILLED'""")).scalar_one())
-        verified=int(connection.execute(text("SELECT COUNT(*) FROM shadow_execution_audits WHERE instrument_execution_verified AND audit_status='RECONCILED'")).scalar_one())
+        verified=int(connection.execute(text("""SELECT COUNT(*) FROM shadow_execution_audits
+            WHERE instrument_execution_verified
+              AND audit_status='RECONCILED'
+              AND NOT COALESCE(mistake_tags @> '["synthetic_option_model"]'::jsonb, FALSE)""")).scalar_one())
         gates={"sessions_gate":completed>=90,"performance_gate":profit_factor>=1.20 and max_dd>=-7.32 and bool(pnl),
                "log_loss_gate":log_loss<.693,"costs_gate":cost_sessions>=20,"instrument_gate":verified>=20}
         eligible=all(gates.values()); reasons=[name for name,passed in gates.items() if not passed]

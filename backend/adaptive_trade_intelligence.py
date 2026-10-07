@@ -109,6 +109,8 @@ def reward_points(net_pnl: Decimal, quality_score: float, exit_reason: str, mist
     quality = (Decimal(str(quality_score)) - Decimal("60")) / Decimal("10")
     penalty = Decimal("0")
     tags = set(str(item) for item in (mistake_tags or []))
+    if "synthetic_option_model" in tags:
+        return Decimal("0.0")
     if exit_reason == "STOP_LOSS":
         penalty += Decimal("4")
     if "cost_drag" in tags:

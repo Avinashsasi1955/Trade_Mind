@@ -321,14 +321,20 @@ function initSSETransport(){
           const ticker=document.getElementById('reasoningTickerText');
           if(ticker) ticker.textContent=tick.latest_thought;
         }
-        const pnlEl=document.querySelector('[data-live-marked-pnl]');
-        if(pnlEl){
-          const pnl=Number(tick.total_pnl||0);
-          pnlEl.textContent=(pnl>=0?'+':'')+'₹'+pnl.toLocaleString('en-IN',{minimumFractionDigits:2});
-          pnlEl.className=`metric-value ${pnl>=0?'up':'down'}`;
-        }
+        const formatPnlEl = (selector, val, isMetric) => {
+          const el = document.querySelector(selector);
+          if (!el) return;
+          const num = Number(val || 0);
+          el.textContent = signedMoney(num);
+          el.className = isMetric ? `metric-value ${num >= 0 ? 'up' : 'down'}` : (num >= 0 ? 'up' : 'down');
+        };
+        formatPnlEl('[data-live-marked-pnl]', tick.net_marked_pnl ?? tick.total_pnl, true);
+        formatPnlEl('[data-live-realised-pnl]', tick.realised_pnl, false);
+        formatPnlEl('[data-live-unrealised-pnl]', tick.unrealised_pnl, false);
         const openCntEl=document.querySelector('[data-live-open-trades]');
         if(openCntEl) openCntEl.textContent=tick.open_trades;
+        const closedCntEl=document.querySelector('[data-live-closed-trades]');
+        if(closedCntEl) closedCntEl.textContent=tick.closed_trades;
       }catch(_){}
     });
     sseConnection.onerror=()=>{
@@ -482,6 +488,8 @@ function dashboard() {
   const today=sh.today || {};
   const pnl=today.paper_pnl || today.metrics?.paper_pnl || {};
   const netPnl=Number(tradeSummary.net_marked_pnl ?? pnl.net_marked_pnl ?? 0);
+  const realisedPnl=Number(tradeSummary.realised_pnl ?? pnl.realised_pnl ?? 0);
+  const unrealisedPnl=Number(tradeSummary.unrealised_pnl ?? pnl.unrealised_pnl ?? 0);
   const capital=Number(s.starting_capital||1000000);
   const paperValue=capital+netPnl;
   const completed=Number(sh.effective_completed_sessions||0);
@@ -490,6 +498,16 @@ function dashboard() {
   const closedTrades=Number(tradeSummary.closed_trades ?? pnl.closed_trades ?? 0);
   const openTrades=Number(tradeSummary.open_trades ?? pnl.open_trades ?? 0);
   const sessionLabel=escapeHtml((today.status||'WAITING').replaceAll('_',' '));
+
+  const allTimeSummary=shadowTrades.summary || sh.summary || {};
+  const closedAll=Number(allTimeSummary.closed_trades || 0);
+  const winRateVal=allTimeSummary.win_rate_pct != null ? Number(allTimeSummary.win_rate_pct) : (tradeSummary.win_rate_pct != null ? Number(tradeSummary.win_rate_pct) : null);
+  const pfVal=allTimeSummary.profit_factor != null ? Number(allTimeSummary.profit_factor) : (tradeSummary.profit_factor != null ? Number(tradeSummary.profit_factor) : null);
+  const sharpeVal=allTimeSummary.sharpe_ratio != null ? Number(allTimeSummary.sharpe_ratio) : 0.0;
+  const sortinoVal=allTimeSummary.sortino_ratio != null ? Number(allTimeSummary.sortino_ratio) : 0.0;
+  const maxDdVal=allTimeSummary.max_drawdown_pct != null ? Number(allTimeSummary.max_drawdown_pct) : 0.0;
+  const grossWinVal=Number(allTimeSummary.gross_profit || 0);
+  const grossLossVal=Number(allTimeSummary.gross_loss || 0);
 
   return `<div class="page-intro">
     <div>
@@ -507,7 +525,7 @@ function dashboard() {
   <!-- Primary 4-Metric Strip -->
   <section class="metric-grid" style="grid-template-columns: repeat(4, 1fr); margin-bottom: 20px;">
     ${metric('Shadow Capital',money(capital),'Clean ML starting allocation','landmark','primary')}
-    ${metric('Paper Realized P&L',signedMoney(netPnl),`<b class="${netPnl>=0?'up':'down'}">${signedPct((netPnl/capital)*100)}</b> net marked`,'chart-spline','','data-live-marked-pnl')}
+    ${metric('Total Paper P&L (Marked)',signedMoney(netPnl),`<b class="${netPnl>=0?'up':'down'}">${signedPct((netPnl/capital)*100)}</b> · Booked <span data-live-realised-pnl class="${realisedPnl>=0?'up':'down'}">${signedMoney(realisedPnl)}</span> · Floating <span data-live-unrealised-pnl class="${unrealisedPnl>=0?'up':'down'}">${signedMoney(unrealisedPnl)}</span>`,'chart-spline','','data-live-marked-pnl')}
     ${metric('Total Account Value',money(paperValue),`<span data-live-closed-trades>${closedTrades.toLocaleString('en-IN')}</span> closed · <span data-live-open-trades>${openTrades.toLocaleString('en-IN')}</span> open`,'wallet-cards')}
     ${metric('Validation Stage',`${completed}/${target}`,`${remaining.toLocaleString('en-IN')} sessions remaining`,'shield-check')}
   </section>
@@ -521,34 +539,44 @@ function dashboard() {
       <div>
         <span class="status-badge" style="border-color:var(--positive); color:var(--positive);"><span></span>Audited Post-Market Performance Journal</span>
         <h3 style="font-size:16px; margin:6px 0 2px;">Institutional Performance &amp; Risk Metrics</h3>
-        <p style="font-size:11px; color:var(--muted); margin:0;">Daily statistical risk metrics computed across closed shadow paper trades</p>
+        <p style="font-size:11px; color:var(--muted); margin:0;">Risk statistics across the most recent closed paper trades (${closedAll} evaluated)</p>
       </div>
       <button class="primary-btn" id="exportDailyJournalBtn">${icon('file-text')} Export Audit Journal</button>
     </div>
     <div class="journal-metrics-grid">
       <div class="journal-metric-box">
         <span>Win Rate</span>
-        <strong style="color:var(--positive);">${tradeSummary.win_rate || '68.5%'}</strong>
-        <small style="color:var(--muted); font-size:9px;">${closedTrades} trades evaluated</small>
+        <strong style="color:${winRateVal != null && winRateVal >= 50 ? 'var(--positive)' : (winRateVal != null && winRateVal > 0 ? '#f59e0b' : 'var(--negative)')};">
+          ${winRateVal != null ? winRateVal.toFixed(1) + '%' : '—'}
+        </strong>
+        <small style="color:var(--muted); font-size:9px;">${closedAll || closedTrades} trades evaluated</small>
       </div>
       <div class="journal-metric-box">
         <span>Profit Factor</span>
-        <strong style="color:var(--positive);">${Number(tradeSummary.profit_factor || 2.42).toFixed(2)}</strong>
-        <small style="color:var(--muted); font-size:9px;">Gross Win / Loss</small>
+        <strong style="color:${pfVal != null && pfVal >= 1.0 ? 'var(--positive)' : (pfVal != null && pfVal > 0 ? '#f59e0b' : 'var(--negative)')};">
+          ${pfVal != null ? (pfVal >= 900 ? '∞' : pfVal.toFixed(2)) : '—'}
+        </strong>
+        <small style="color:var(--muted); font-size:9px;">${grossWinVal || grossLossVal ? `₹${grossWinVal.toLocaleString('en-IN')}W / ₹${grossLossVal.toLocaleString('en-IN')}L` : 'Gross Win / Loss'}</small>
       </div>
       <div class="journal-metric-box">
         <span>Sharpe Ratio</span>
-        <strong style="color:#22d3ee;">1.84</strong>
-        <small style="color:var(--muted); font-size:9px;">Risk-Adjusted Return</small>
+        <strong style="color:${sharpeVal > 0 ? '#22d3ee' : (sharpeVal === 0 ? 'var(--muted)' : 'var(--negative)')};">
+          ${sharpeVal.toFixed(2)}
+        </strong>
+        <small style="color:var(--muted); font-size:9px;">Annualized (K=252)</small>
       </div>
       <div class="journal-metric-box">
         <span>Sortino Ratio</span>
-        <strong style="color:#a855f7;">2.65</strong>
+        <strong style="color:${sortinoVal > 0 ? '#a855f7' : (sortinoVal === 0 ? 'var(--muted)' : 'var(--negative)')};">
+          ${sortinoVal.toFixed(2)}
+        </strong>
         <small style="color:var(--muted); font-size:9px;">Downside Semi-Variance</small>
       </div>
       <div class="journal-metric-box">
         <span>Max Drawdown</span>
-        <strong style="color:var(--negative);">-2.14%</strong>
+        <strong style="color:${maxDdVal > 0 ? 'var(--negative)' : 'var(--muted)'};">
+          -${maxDdVal.toFixed(2)}%
+        </strong>
         <small style="color:var(--muted); font-size:9px;">Peak-to-Trough Lock</small>
       </div>
     </div>
@@ -749,7 +777,11 @@ function shadowActionLabel(t){
 function shadowStrategyNote(t){
   const raw=t.improvement_note||'';
   if(!raw)return '';
-  try{const parsed=JSON.parse(raw);return [parsed.strategy,parsed.route,parsed.reason,parsed.rr?`R:R ${parsed.rr}`:''].filter(Boolean).join(' · ')}
+  try{
+    const parsed=JSON.parse(raw);
+    const hedge = parsed.paired_leg ? `🛡️ [HEDGE: ${parsed.paired_leg}]` : '';
+    return [hedge, parsed.strategy, parsed.route, parsed.reason, parsed.rr?`R:R ${parsed.rr}`:''].filter(Boolean).join(' · ');
+  }
   catch(_){return raw}
 }
 function shadowRiskManagerNote(t){
@@ -3696,11 +3728,31 @@ function wirePage(view) {
         const m = journal.metrics || {};
         // Update live metric boxes
         const boxes = document.querySelectorAll('.journal-metric-box strong');
-        if(boxes[0]) boxes[0].textContent = m.win_rate_pct ? m.win_rate_pct + '%' : boxes[0].textContent;
-        if(boxes[1]) boxes[1].textContent = m.profit_factor ? Number(m.profit_factor).toFixed(2) : boxes[1].textContent;
-        if(boxes[2]) boxes[2].textContent = m.sharpe_ratio ? Number(m.sharpe_ratio).toFixed(2) : boxes[2].textContent;
-        if(boxes[3]) boxes[3].textContent = m.sortino_ratio ? Number(m.sortino_ratio).toFixed(2) : boxes[3].textContent;
-        if(boxes[4]) boxes[4].textContent = m.max_drawdown_pct ? '-' + m.max_drawdown_pct + '%' : boxes[4].textContent;
+        if(boxes[0] && m.win_rate_pct != null) {
+          const wr = Number(m.win_rate_pct);
+          boxes[0].textContent = wr.toFixed(1) + '%';
+          boxes[0].style.color = wr >= 50 ? 'var(--positive)' : (wr > 0 ? '#f59e0b' : 'var(--negative)');
+        }
+        if(boxes[1] && m.profit_factor != null) {
+          const pf = Number(m.profit_factor);
+          boxes[1].textContent = pf >= 900 ? '∞' : pf.toFixed(2);
+          boxes[1].style.color = pf >= 1.0 ? 'var(--positive)' : (pf > 0 ? '#f59e0b' : 'var(--negative)');
+        }
+        if(boxes[2] && m.sharpe_ratio != null) {
+          const sh = Number(m.sharpe_ratio);
+          boxes[2].textContent = sh.toFixed(2);
+          boxes[2].style.color = sh > 0 ? '#22d3ee' : (sh === 0 ? 'var(--muted)' : 'var(--negative)');
+        }
+        if(boxes[3] && m.sortino_ratio != null) {
+          const so = Number(m.sortino_ratio);
+          boxes[3].textContent = so.toFixed(2);
+          boxes[3].style.color = so > 0 ? '#a855f7' : (so === 0 ? 'var(--muted)' : 'var(--negative)');
+        }
+        if(boxes[4] && m.max_drawdown_pct != null) {
+          const dd = Math.abs(Number(m.max_drawdown_pct));
+          boxes[4].textContent = '-' + dd.toFixed(2) + '%';
+          boxes[4].style.color = dd > 0 ? 'var(--negative)' : 'var(--muted)';
+        }
         // Download as JSON
         const blob = new Blob([JSON.stringify(journal, null, 2)], {type:'application/json'});
         const url = URL.createObjectURL(blob);

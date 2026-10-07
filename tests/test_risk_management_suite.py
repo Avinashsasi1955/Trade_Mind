@@ -15,6 +15,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
+from sqlalchemy import text
 
 from backend.live_inference import _chart_strategy_gate, LivePaperInference
 from backend.position_manager import PositionManager
@@ -281,6 +282,108 @@ class RiskManagementTestSuite(unittest.TestCase):
         net_rupees = gross - roundtrip_costs - slippage_penalty
         self.assertGreater(net_rupees, Decimal("0.0"), "Breakeven stop must close with net positive rupees")
 
+    def test_11_hedge_leg_skips_independent_sl_tp_and_adverse_cut(self):
+        """Verify that hedge leg in spread basket skips independent SL/TP and adverse cut exits."""
+        import json
+        pm = PositionManager("sqlite:///:memory:")
+        pm.get_latest_price = MagicMock(return_value=Decimal("80.00"))
+        pm.get_exit_bars = MagicMock(return_value=[{"high_price": "100.0", "low_price": "75.0"}])
+
+        entry = Decimal("100.00")
+        sl = Decimal("90.00")
+        mid_day = datetime(2026, 9, 21, 5, 0, 0, tzinfo=timezone.utc)
+        pos_hedge = {
+            "id": 201,
+            "instrument_id": 10,
+            "symbol": "NIFTY26OCT25000PE",
+            "side": "BUY",
+            "trade_mode": "INTRADAY",
+            "theoretical_fill_price": entry,
+            "stop_loss_price": sl,
+            "take_profit_price": Decimal("150.00"),
+            "quantity": 50,
+            "estimated_fees": 20,
+            "signal_at": mid_day - timedelta(seconds=45),
+            "improvement_note": json.dumps({
+                "engine": "multi_leg_hedge",
+                "spread_basket_id": "basket_xyz_123",
+                "paired_primary_audit_id": 200,
+            }),
+        }
+
+        with patch("backend.position_manager.record_shadow_exit") as mock_exit:
+            res = pm.evaluate_position(pos_hedge, mid_day)
+            self.assertIsNotNone(res)
+            self.assertEqual(res["status"], "OPEN")
+            self.assertIsNone(res["exit_reason"], "Hedge leg must not trigger independent SL/TP exit")
+            mock_exit.assert_not_called()
+
+    def test_12_atomic_spread_basket_exit_closes_paired_legs(self):
+        """Verify that when a primary leg exits, sibling legs sharing the basket close atomically."""
+        import json
+        from sqlalchemy import create_engine
+        engine = create_engine("sqlite:///:memory:")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE shadow_execution_audits (
+                    id INTEGER PRIMARY KEY,
+                    instrument_id INTEGER,
+                    theoretical_fill_price NUMERIC,
+                    side TEXT,
+                    quantity INTEGER,
+                    audit_status TEXT,
+                    net_pnl NUMERIC,
+                    exit_reason TEXT,
+                    exit_at TIMESTAMP,
+                    signal_at TIMESTAMP,
+                    improvement_note TEXT,
+                    reasoning_chain TEXT
+                )
+            """))
+            # Insert hedge sibling
+            conn.execute(text("""
+                INSERT INTO shadow_execution_audits (
+                    id, instrument_id, theoretical_fill_price, side, quantity, audit_status, net_pnl, signal_at, improvement_note
+                ) VALUES (
+                    302, 11, 40.0, 'SELL', 50, 'RECONCILED', NULL, CURRENT_TIMESTAMP, :note
+                )
+            """), {"note": json.dumps({"spread_basket_id": "basket_alpha_456", "paired_primary_audit_id": 301})})
+
+        pm = PositionManager("sqlite:///:memory:")
+        pm.engine = engine
+        pm.get_latest_price = MagicMock(return_value=Decimal("45.00"))
+        pm.get_exit_bars = MagicMock(return_value=[])
+
+        mid_day = datetime(2026, 9, 21, 5, 0, 0, tzinfo=timezone.utc)
+        pos_primary = {
+            "id": 301,
+            "instrument_id": 10,
+            "symbol": "NIFTY26OCT25000CE",
+            "side": "BUY",
+            "trade_mode": "INTRADAY",
+            "theoretical_fill_price": Decimal("100.00"),
+            "stop_loss_price": Decimal("90.00"),
+            "take_profit_price": Decimal("120.00"),
+            "quantity": 50,
+            "estimated_fees": 20,
+            "signal_at": mid_day - timedelta(seconds=45),
+            "improvement_note": json.dumps({"spread_basket_id": "basket_alpha_456"}),
+        }
+
+        # Price dropped to 85, triggering early adverse cut / SL
+        pm.get_latest_price = MagicMock(side_effect=lambda inst_id, wm, **kwargs: (Decimal("85.00"), "market") if kwargs.get("return_source") else Decimal("85.00"))
+
+        with patch("backend.position_manager.record_shadow_exit") as mock_exit:
+            res = pm.evaluate_position(pos_primary, mid_day)
+            self.assertIsNotNone(res)
+            self.assertTrue(res["closed"])
+            self.assertIn(302, res.get("sibling_closed_ids", []))
+            # Verify record_shadow_exit was called for both primary (301) and sibling (302)
+            called_ids = [call.args[1] for call in mock_exit.call_args_list]
+            self.assertIn(301, called_ids)
+            self.assertIn(302, called_ids)
+
 
 if __name__ == "__main__":
     unittest.main()
+

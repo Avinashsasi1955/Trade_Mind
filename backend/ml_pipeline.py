@@ -747,12 +747,14 @@ def _load_all_features(store: ResearchStore, feature_set: str = DEFAULT_FEATURE_
     return [{**dict(x),"features":_decode_json(x["features"])} for x in rows]
 
 
-def estimated_trade_cost_bps(price: float, quantity: int, average_daily_value: float,
+def estimated_trade_cost_bps(price: float, quantity: int, average_daily_value: Optional[float] = None,
                              base_charges_bps: float = 12.0, is_index: bool = False) -> Dict:
-    if is_index:
-        effective_adv = max(average_daily_value or 0.0, 500_000_000.0)
+    if average_daily_value is not None and average_daily_value > 0:
+        effective_adv = float(average_daily_value)
+    elif is_index:
+        effective_adv = 500_000_000.0
     else:
-        effective_adv = average_daily_value if average_daily_value and average_daily_value > 0 else 1.0
+        effective_adv = 1.0
     notional=max(0,price*quantity); participation=notional/max(1,effective_adv)
     slippage=4.0+min(60.0,math.sqrt(participation)*100)
     impact=min(80.0,participation*10000*.10)

@@ -102,6 +102,19 @@ class TestDerivativesMapping(unittest.TestCase):
         self.assertEqual(res["spreads_count"], 9)
         self.assertGreater(res["spot_price"], 30000.0)  # Correctly identifies BANKNIFTY not NIFTY
 
+    def test_protective_collar_payoff_separation(self):
+        plan = build_derivative_plan("NIFTY", 24500.0, "bullish", strategy="Protective Collar")
+        self.assertEqual(plan["strategy"], "Protective Collar")
+        # Net cashflow should reflect only option premiums (not the futures notional)
+        self.assertLess(abs(plan["net_cashflow"]), 500.0)
+        self.assertGreater(plan["risk"]["max_loss"], 0.0)
+        self.assertLess(plan["risk"]["max_loss"], 10000.0)
+        self.assertGreater(plan["risk"]["max_profit"], 0.0)
+        self.assertLess(plan["risk"]["max_profit"], 10000.0)
+        self.assertGreater(plan["risk"]["breakeven"], 24000.0)
+        self.assertLess(plan["risk"]["breakeven"], 25000.0)
+
+
 
 if __name__ == "__main__":
     unittest.main()

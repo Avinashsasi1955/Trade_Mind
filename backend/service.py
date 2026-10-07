@@ -6,7 +6,7 @@ import hashlib
 import secrets
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 from sqlalchemy import create_engine, text
 
@@ -350,18 +350,6 @@ def calculate_institutional_metrics(closed_trades: List[Dict], capital: float = 
             sortino = 99.0
         else:
             sortino = 0.0
-    elif len(daily_returns) == 1:
-        if len(pnls) > 1:
-            trade_returns = [p / max(1.0, capital) for p in pnls]
-            mean_tr = sum(trade_returns) / len(trade_returns)
-            var_tr = sum((r - mean_tr) ** 2 for r in trade_returns) / (len(trade_returns) - 1)
-            std_tr = math.sqrt(var_tr) if var_tr > 0 else 0.0
-            sharpe = round((mean_tr / std_tr) * math.sqrt(252), 2) if std_tr > 0 else 0.0
-            downside_tr = math.sqrt(sum(min(0.0, r) ** 2 for r in trade_returns) / len(trade_returns))
-            sortino = round((mean_tr / downside_tr) * math.sqrt(252), 2) if downside_tr > 0 else (99.0 if mean_tr > 0 else 0.0)
-        else:
-            sharpe = 0.0
-            sortino = 0.0
     else:
         sharpe = 0.0
         sortino = 0.0
@@ -451,6 +439,7 @@ def shadow_trade_book(limit: int = 200) -> Dict:
             # DISTINCT ON is O(instruments_seen) not O(limit) — eliminates the N+1 pattern
             instrument_ids = list({int(r["instrument_id"]) for r in rows if r["net_pnl"] is None})
             latest_price_map: dict = {}
+            synthetic_price_by_audit: dict = {}
             if instrument_ids:
                 price_rows = connection.execute(text("""SELECT DISTINCT ON (instrument_id)
                         instrument_id, close_price
@@ -471,7 +460,8 @@ def shadow_trade_book(limit: int = 200) -> Dict:
                             JOIN instrument_master im ON b.instrument_id = im.id
                             WHERE im.instrument_type IN ('EQ', 'INDEX')
                               AND (im.symbol = :und OR REPLACE(im.symbol, ' ', '') = :und OR im.underlying_symbol = :und)
-                              AND b.interval IN ('1minute', '5minute', 'day')
+                              AND b.interval IN ('1minute', '5minute')
+                              AND b.bar_time >= CURRENT_TIMESTAMP - INTERVAL '60 minutes'
                             ORDER BY b.bar_time DESC LIMIT 1"""), {"und": und_sym}).scalar_one_or_none()
                         if und_bar:
                             opt_info = connection.execute(text("SELECT strike, expiry FROM instrument_master WHERE id = :id"), {"id": int(r["instrument_id"])}).mappings().one_or_none()
@@ -480,13 +470,33 @@ def shadow_trade_book(limit: int = 200) -> Dict:
                                 expiry_dt = opt_info.get("expiry")
                                 dte = max(0.5, float((expiry_dt - today_date).days)) if expiry_dt else 4.0
                                 g = calculate_black_scholes_greeks(float(und_bar), strike, dte, iv=0.145, option_type=r["instrument_type"])
-                                latest_price_map[int(r["instrument_id"])] = max(0.05, round(g["price"], 2))
+                                scale_ratio = 1.0
+                                entry_p = r.get("theoretical_fill_price") or r.get("decision_price")
+                                if entry_p and float(entry_p) > 0 and g["price"] > 0.05:
+                                    entry_und = connection.execute(text("""SELECT close_price FROM live_market_bars b
+                                        JOIN instrument_master im ON b.instrument_id = im.id
+                                        WHERE im.instrument_type IN ('EQ', 'INDEX')
+                                          AND (im.symbol = :und OR REPLACE(im.symbol, ' ', '') = :und OR im.underlying_symbol = :und)
+                                          AND b.interval IN ('1minute', '5minute')
+                                          AND b.bar_time <= :sig_at
+                                        ORDER BY b.bar_time DESC LIMIT 1"""), {"und": und_sym, "sig_at": r["signal_at"]}).scalar_one_or_none()
+                                    if entry_und:
+                                        f_dte = max(0.5, float((expiry_dt - r["signal_at"].date()).days)) if (expiry_dt and hasattr(r["signal_at"], "date")) else dte
+                                        entry_bs = calculate_black_scholes_greeks(float(entry_und), strike, f_dte, iv=0.145, option_type=r["instrument_type"])["price"]
+                                        if entry_bs > 0.05:
+                                            scale_ratio = max(0.2, min(5.0, float(entry_p) / entry_bs))
+                                synth_p = max(0.05, round(g["price"] * scale_ratio, 2))
+                                synthetic_price_by_audit[int(r["id"])] = synth_p
+                                if int(r["instrument_id"]) not in latest_price_map:
+                                    latest_price_map[int(r["instrument_id"])] = synth_p
             if r_client:
                 try:
                     live_pos_raw = r_client.get("nivesh:positions:live")
                     if live_pos_raw:
                         pos_data = json.loads(live_pos_raw)
                         for p in pos_data.get("positions", []):
+                            if p.get("latest_price"):
+                                synthetic_price_by_audit[int(p["id"])] = float(p["latest_price"])
                             for r in rows:
                                 if r.get("id") == p.get("id") and p.get("latest_price"):
                                     latest_price_map[int(r["instrument_id"])] = float(p["latest_price"])
@@ -521,8 +531,8 @@ def shadow_trade_book(limit: int = 200) -> Dict:
     items=[]
     for row in rows:
         entry=_float(row["theoretical_fill_price"] or row["decision_price"])
-        # Use batch-fetched latest_price_map; fall back to entry for closed trades (they use net_pnl directly)
-        live_price=latest_price_map.get(int(row["instrument_id"]), None)
+        # Use synthetic price for this audit id if calibrated; otherwise batch-fetched latest_price_map
+        live_price=synthetic_price_by_audit.get(int(row["id"])) or latest_price_map.get(int(row["instrument_id"]), None)
         latest=_float(row["realised_exit_price"] or live_price or entry)
         qty=int(row["quantity"] or 0)
         side=str(row["side"])
@@ -624,8 +634,9 @@ def shadow_trade_book(limit: int = 200) -> Dict:
     return result
 
 
-def _latest_shadow_price(connection, audit_id: int) -> Decimal:
+def _latest_shadow_price(connection, audit_id: int) -> Tuple[Decimal, bool]:
     row=connection.execute(text("""SELECT a.id,a.instrument_id,a.theoretical_fill_price,a.decision_price,
+            a.signal_at,
             i.symbol, i.underlying_symbol, i.strike, i.expiry, i.instrument_type
         FROM shadow_execution_audits a 
         JOIN instrument_master i ON i.id = a.instrument_id
@@ -637,22 +648,39 @@ def _latest_shadow_price(connection, audit_id: int) -> Decimal:
         ORDER BY bar_time DESC, CASE interval WHEN '1second' THEN 0 WHEN '1minute' THEN 1 WHEN '5minute' THEN 2 ELSE 3 END
         LIMIT 1"""),{"instrument":row["instrument_id"]}).scalar_one_or_none()
     if latest:
-        return Decimal(str(latest))
+        return Decimal(str(latest)), False
     if row.get("instrument_type") in ("CE", "PE") and row.get("strike"):
         und = row.get("underlying_symbol") or row["symbol"].split()[0]
         und_bar = connection.execute(text("""SELECT close_price FROM live_market_bars b
             JOIN instrument_master im ON b.instrument_id = im.id
             WHERE im.instrument_type IN ('EQ', 'INDEX')
               AND (im.symbol = :und OR REPLACE(im.symbol, ' ', '') = :und OR im.underlying_symbol = :und)
-              AND b.interval IN ('1minute', '5minute', 'day')
+              AND b.interval IN ('1minute', '5minute')
+              AND b.bar_time >= CURRENT_TIMESTAMP - INTERVAL '60 minutes'
             ORDER BY b.bar_time DESC LIMIT 1"""), {"und": und}).scalar_one_or_none()
         if und_bar:
             from backend.greeks_engine import calculate_black_scholes_greeks
             today_date = datetime.now(IST).date()
             dte = max(0.5, float((row["expiry"] - today_date).days)) if row.get("expiry") else 4.0
             g = calculate_black_scholes_greeks(float(und_bar), float(row["strike"]), dte, iv=0.145, option_type=row["instrument_type"])
-            return Decimal(str(max(0.05, round(g["price"], 2))))
-    return Decimal(str(row["theoretical_fill_price"] or row["decision_price"]))
+            scale_ratio = 1.0
+            entry_px = row["theoretical_fill_price"] or row["decision_price"]
+            if entry_px and float(entry_px) > 0 and g["price"] > 0.05:
+                entry_und = connection.execute(text("""SELECT close_price FROM live_market_bars b
+                    JOIN instrument_master im ON b.instrument_id = im.id
+                    WHERE im.instrument_type IN ('EQ', 'INDEX')
+                      AND (im.symbol = :und OR REPLACE(im.symbol, ' ', '') = :und OR im.underlying_symbol = :und)
+                      AND b.interval IN ('1minute', '5minute')
+                      AND b.bar_time <= :sig_at
+                    ORDER BY b.bar_time DESC LIMIT 1"""), {"und": und, "sig_at": row["signal_at"]}).scalar_one_or_none()
+                if entry_und:
+                    f_dte = max(0.5, float((row["expiry"] - row["signal_at"].date()).days)) if (row.get("expiry") and hasattr(row["signal_at"], "date")) else dte
+                    entry_bs = calculate_black_scholes_greeks(float(entry_und), float(row["strike"]), f_dte, iv=0.145, option_type=row["instrument_type"])["price"]
+                    if entry_bs > 0.05:
+                        scale_ratio = max(0.2, min(5.0, float(entry_px) / entry_bs))
+            synth_px = Decimal(str(max(0.05, round(g["price"] * scale_ratio, 2))))
+            return synth_px, True
+    return Decimal(str(row["theoretical_fill_price"] or row["decision_price"])), False
 
 
 def exit_shadow_trade(audit_id: int) -> Dict:
@@ -661,8 +689,8 @@ def exit_shadow_trade(audit_id: int) -> Dict:
         raise ValueError("PostgreSQL shadow ledger is not configured")
     engine=create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
     with engine.connect() as connection:
-        exit_price=_latest_shadow_price(connection,int(audit_id))
-    result=record_shadow_exit(engine,int(audit_id),exit_price,"MANUAL_EXIT")
+        exit_price, is_synth = _latest_shadow_price(connection,int(audit_id))
+    result=record_shadow_exit(engine,int(audit_id),exit_price,"MANUAL_EXIT",is_synthetic=is_synth)
     with engine.begin() as connection:
         connection.execute(text("""INSERT INTO monitoring_events(component,level,message,payload,created_at)
             VALUES('shadow_manual_override','INFO','manual paper trade exit',CAST(:payload AS jsonb),CURRENT_TIMESTAMP)"""),

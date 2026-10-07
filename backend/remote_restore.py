@@ -16,13 +16,17 @@ POST_RESTORE_MIGRATIONS=("v3_5_security.sql","v3_6_live_paper_pipeline.sql","v3_
 
 
 def _sha256(path: Path) -> str:
-    digest=hashlib.sha256()
     with path.open("rb") as handle:
+        if hasattr(hashlib, "file_digest"):
+            return hashlib.file_digest(handle, "sha256").hexdigest()
+        digest=hashlib.sha256()
         for chunk in iter(lambda:handle.read(1024*1024),b""): digest.update(chunk)
-    return digest.hexdigest()
+        return digest.hexdigest()
 
 
 def restore() -> dict:
+    if boto3 is None:
+        raise RuntimeError("boto3 is required for remote restore")
     if os.getenv("ALLOW_REMOTE_RESTORE")!="YES": raise RuntimeError("ALLOW_REMOTE_RESTORE=YES is required for the one-shot migration task")
     bucket=os.environ["BACKUP_BUCKET"]; key=os.environ["BACKUP_OBJECT_KEY"]; expected_sha=os.environ["BACKUP_SHA256"].lower()
     expected_bars=int(os.getenv("EXPECTED_MARKET_BARS","6435334")); expected_features=int(os.getenv("EXPECTED_FEATURE_ROWS","3488676"))
