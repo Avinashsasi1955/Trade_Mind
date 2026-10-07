@@ -80,9 +80,46 @@ const titles = {
   dashboard:['Shadow paper desk','Live-feed validation'], positions:['Live exposure','Open positions'], history:['Execution ledger','Trade history'], analysis:['Minute intelligence','AI market analysis'], charts:['Technical workspace','Advanced charts'], universe:['Exchange master','NSE + BSE universe'], backtest:['Research laboratory','Historical backtesting'], mlresearch:['Model laboratory','ML research pipeline'], sentiment:['Market pulse','Sentiment intelligence'], strategies:['Agent intelligence','Strategy library'], tradebot:['Persistent intelligence','AI trade bot'], pattern_memory:['Vector RAG Engine','Pattern Memory & Replay'], sector_flow:['Relative Strength','Sector Flow & Risk Treemap'], execution:['Safety and control','Execution control'], operations:['System reliability','Production monitoring'], settings:['Workspace controls','Settings']
 };
 
+import {
+  icon,
+  logo,
+  money,
+  signedMoney,
+  signedPct,
+  escapeHtml,
+  formatPnlEl,
+  strategyPill,
+  fmtTime,
+  normaliseTags,
+  shadowActionLabel,
+  shadowStrategyNote,
+  shadowRiskManagerNote,
+  shadowRiskCell,
+  shadowQualityCell,
+  shadowSeniorAgentCell,
+  shadowTradeActions,
+  swingLifecycleCell,
+} from './modules/utils.js';
+import {
+  systemNotifications,
+  addSystemNotification,
+  renderNotificationList,
+  handleMetricsTick,
+  applyMarketUpdate,
+} from './modules/metrics.js';
+import {
+  initSSETransport,
+  closeSSETransport,
+  pollAlerts,
+  getSSEStatus,
+} from './modules/sse.js';
+import {
+  shadowTradeRows,
+  showTradeThoughtModal,
+  bindThoughtButtons,
+} from './modules/trade_book.js';
+
 const content = document.getElementById('content');
-const icon = (name) => `<i data-lucide="${name}"></i>`;
-const logo = (s) => `<span class="stock-logo">${s.slice(0,2)}</span>`;
 let authToken = '';
 let sessionAuthenticated = false;
 localStorage.removeItem('nivesh_token');
@@ -95,33 +132,6 @@ let currentUser = null;
 let activeRisk = 'balanced';
 let activeView = 'dashboard';
 
-const money = value => `₹${Math.abs(Number(value || 0)).toLocaleString('en-IN',{minimumFractionDigits:0,maximumFractionDigits:0})}`;
-const signedMoney = value => `${Number(value)>=0?'+':'−'}${money(value)}`;
-const signedPct = value => `${Number(value)>=0?'+':'−'}${Math.abs(Number(value || 0)).toFixed(2)}%`;
-function strategyPill(strategy) {
-  let s = String(strategy || 'BREAKOUT_CALL_BUY').trim().toUpperCase();
-  if(!s || s === 'UNKNOWN' || s === 'UNKNOWN_STRATEGY' || s === 'UNKNOWN STRATEGY' || s === 'NO_TRADE' || s === 'NO_STRATEGY' || s === 'NONE') {
-    s = 'BREAKOUT_CALL_BUY';
-  }
-  let cls = 'breakout';
-  let iconName = 'zap';
-  if(s.includes('GOLDEN') || s.includes('FAST') || s.includes('VECTOR')) { cls = 'fastpath'; iconName = 'sparkles'; }
-  else if(s.includes('QUANT') || s.includes('STAT_ARB') || s.includes('FACTOR') || s.includes('VECM') || s.includes('LEAD_LAG')) { cls = 'quant'; iconName = 'cpu'; }
-  else if(s.includes('SPREAD') || s.includes('STRADDLE') || s.includes('CONDOR')) { cls = 'spread'; iconName = 'layers'; }
-  else if(s.includes('INDEX') || s.includes('NIFTY') || s.includes('BANKNIFTY') || s.includes('SENSEX')) { cls = 'index'; iconName = 'bar-chart-2'; }
-  else if(s.includes('PULLBACK')) { cls = 'pullback'; iconName = 'trending-down'; }
-  else if(s.includes('MOMENTUM')) { cls = 'momentum'; iconName = 'activity'; }
-  else if(s.includes('REVERSION') || s.includes('RANGE')) { cls = 'reversion'; iconName = 'waves'; }
-  
-  const clean = s.replace(/_/g, ' ').toLowerCase()
-    .replace('call buy', 'Call (CE)')
-    .replace('put sell', 'Put Write (PE)')
-    .replace('put buy', 'Put (PE)')
-    .replace('call sell', 'Call Write (CE)')
-    .replace(/\b\w/g, c => c.toUpperCase());
-    
-  return `<span class="strategy-pill ${cls}">${icon(iconName)} ${escapeHtml(clean)}</span>`;
-}
 const cookieValue = name => document.cookie.split(';').map(value=>value.trim()).find(value=>value.startsWith(`${name}=`))?.split('=').slice(1).join('=') || '';
 async function api(path, options={}) {
   const headers = {'Content-Type':'application/json',...(options.headers||{})};
@@ -149,7 +159,6 @@ async function api(path, options={}) {
   return payload;
 }
 
-const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 function installStockPicker(id){
   const original=document.getElementById(id);if(!original)return;
   const initialSymbol=original.value||'RELIANCE';
