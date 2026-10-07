@@ -225,5 +225,17 @@ timeline
 - [ ] Map Nifty and BankNifty option universe to unlock index trading.
 - [ ] Retrain and promote `direction-v3.0`.
 
-### Step 4: Next Week (Oct 5 – Oct 8)
-- [ ] Execute **Phase C**: Deploy Regime Router, GEX Calculator, Spider Adaptive Bot, and Memo Memory Layer.
+### Step 4: After Market Hours (Post-15:30 IST Execution)
+- [ ] **Phase C Deployment**:
+  - [ ] Deploy and wire `backend/regime_router.py` into live signal gating (suppress breakouts in range, suppress fades in trend).
+  - [ ] Implement Real-Time GEX Engine for Nifty, BankNifty, and Top 5 heavyweights with Zero-Gamma Flip Point detector.
+  - [ ] Connect `backend/spider_bot.py` autonomous delta rebalancing loop (|Delta| > 0.20 threshold) into background worker.
+  - [ ] Activate Dual-Tier Memo memory layer (`backend/intelligence_memory.py`) intraday trap penalties in live scoring.
+- [ ] **Frontend Native ES Module Decomposition (`frontend/app.js` ~4,563 lines)**:
+  - [ ] Create `frontend/modules/metrics.js`: Extract metrics ticker updates, marked P&L formatting (`formatPnlEl`), risk window counters, and brain status indicators.
+  - [ ] Create `frontend/modules/sse.js`: Extract Server-Sent Events listener (`/api/stream`), exponential reconnect backoff, and fallback polling logic.
+  - [ ] Create `frontend/modules/trade_book.js`: Extract paper trades table rendering, audit modal inspection, filters, and export handlers.
+  - [ ] Update `frontend/index.html` to load `<script type="module" src="app.js"></script>`.
+  - [ ] Keep `frontend/app.js` as the clean top-level orchestrator importing and wiring the modules together.
+  - [ ] Validate with `node --check` across all modules and verify SSE streaming in browser.
+
