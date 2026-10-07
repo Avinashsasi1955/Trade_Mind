@@ -262,6 +262,7 @@ class RegimeRouter:
             "confidence": 50.0,
             "symbol": "UNKNOWN",
             "last_price": 0.0,
+            "is_fallback": True,
             "metrics": {"reason": reason},
             "recommended_strategies": ["NO_TRADE"],
             "risk_policy": {

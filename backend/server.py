@@ -588,6 +588,11 @@ class Handler(BaseHTTPRequestHandler):
             symbol = parse_qs(urlparse(self.path).query).get("symbol", ["NIFTY"])[0]
             self._user_id()
             return self._json(200, spider_bot_status(symbol))
+        if path == "/api/derivatives/gex" and method == "GET":
+            symbol = parse_qs(urlparse(self.path).query).get("symbol", ["NIFTY"])[0]
+            self._user_id()
+            from backend.gex_engine import get_cached_or_compute_gex
+            return self._json(200, get_cached_or_compute_gex(symbol))
         if path == "/api/rl/status" and method == "GET":
             symbol = parse_qs(urlparse(self.path).query).get("symbol", ["NIFTY"])[0]
             self._user_id()

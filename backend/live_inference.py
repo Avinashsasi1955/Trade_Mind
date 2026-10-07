@@ -49,6 +49,25 @@ OPTION_UNDERLYING_ALIASES = {"NIFTY 50": "NIFTY", "NIFTY50": "NIFTY", "NIFTY BAN
 IST = ZoneInfo("Asia/Kolkata")
 logger = logging.getLogger("nivesh.live_inference")
 
+BREAKOUT_KEYWORDS = ("BREAKOUT", "BREAKDOWN", "ORB", "MOMENTUM_EXPANSION")
+FADE_KEYWORDS = (
+    "FADE", "MEAN_REVERSION", "COUNTER_TREND", "EXHAUSTION",
+    "RANGE_SUPPORT", "RANGE_RESISTANCE", "FAILED_BREAKOUT",
+    "LEARNING_RANGE_PUT_SELL", "LEARNING_RANGE_CALL_SELL"
+)
+
+
+def is_breakout_strategy(strat_name: str, setup_type: str = "") -> bool:
+    if (setup_type or "").upper() == "BREAKOUT":
+        return True
+    s = (strat_name or "").upper()
+    return any(k in s for k in BREAKOUT_KEYWORDS) and not s.startswith("FAILED_BREAKOUT")
+
+
+def is_fade_strategy(strat_name: str) -> bool:
+    s = (strat_name or "").upper()
+    return any(k in s for k in FADE_KEYWORDS)
+
 
 def _json(value):
     return value if isinstance(value, dict) else json.loads(value)
@@ -787,6 +806,10 @@ class LivePaperInference:
         kind=str(target.get("kind") or "").upper()
         price=Decimal(str(target.get("price") or 0))
         chart=item.get("chart_gate") or {}
+        stop_mult = Decimal(str((item.get("_effective_thresholds") or {}).get("stop_multiplier", 1.0)))
+        if stop_mult <= Decimal("0"):
+            stop_mult = Decimal("1.0")
+
         if kind in {"CE","PE"}:
             chart_sl = chart.get("stop_loss")
             spot = float(item.get("session", {}).get("close") or 0)
@@ -797,24 +820,36 @@ class LivePaperInference:
                 opt_risk = Decimal(str(round(dist * delta, 4)))
                 min_risk = price * Decimal("0.20")
                 max_risk = price * Decimal("0.35")
-                actual_risk = max(min_risk, min(max_risk, opt_risk))
+                actual_risk = min(price * Decimal("0.45"), max(min_risk, min(max_risk, opt_risk)) * stop_mult)
                 actual_reward = actual_risk * Decimal("2.0")  # Enforce 1:2 R:R
                 stop_loss = (price - actual_risk) if side == "BUY" else (price + actual_risk)
                 take_profit = (price + actual_reward) if side == "BUY" else (price - actual_reward)
+                chart["rr"] = 2.0
                 return {"stop_loss": round(stop_loss, 4), "take_profit": round(take_profit, 4), "basis": "instrument",
-                        "source": "underlying_delta_anchored"}
-            sl_pct=self.option_stop_loss_pct
+                        "source": "underlying_delta_anchored", "rr": 2.0}
+            sl_pct=min(Decimal("0.45"), self.option_stop_loss_pct * stop_mult)
             tp_pct=self.option_take_profit_pct
             stop_loss=(price*(Decimal("1")-sl_pct)) if side=="BUY" else (price*(Decimal("1")+sl_pct))
             take_profit=(price*(Decimal("1")+tp_pct)) if side=="BUY" else (price*(Decimal("1")-tp_pct))
+            opt_rr = float(round(tp_pct / sl_pct, 2)) if sl_pct > Decimal("0") else 0.0
+            chart["rr"] = opt_rr
             return {"stop_loss": round(stop_loss, 4), "take_profit": round(take_profit, 4), "basis": "instrument",
-                    "source": "option_volatility_buffer"}
+                    "source": "option_volatility_buffer", "rr": opt_rr}
         stop_loss=chart.get("stop_loss")
         take_profit=chart.get("take_profit")
         stop_loss=Decimal(str(stop_loss)) if stop_loss not in (None,"") else None
         take_profit=Decimal(str(take_profit)) if take_profit not in (None,"") else None
+        rr = None
+        if stop_loss is not None and stop_mult != Decimal("1.0") and price > 0:
+            chart_dist = abs(price - stop_loss)
+            adj_dist = chart_dist * stop_mult
+            stop_loss = (price - adj_dist) if side == "BUY" else (price + adj_dist)
+            if take_profit is not None and adj_dist > 0:
+                reward_dist = abs(take_profit - price)
+                rr = float(round(reward_dist / adj_dist, 2))
+                chart["rr"] = rr
         return {"stop_loss": stop_loss, "take_profit": take_profit, "basis": "instrument",
-                "source": "underlying_chart_levels"}
+                "source": "underlying_chart_levels", "rr": rr}
 
     def _execution_target(self,item: Dict,watermark: datetime) -> Optional[Dict]:
         requested_option=item.get("option_type") if item.get("option_type") in {"CE","PE"} else None
@@ -1373,6 +1408,34 @@ class LivePaperInference:
         lot = int(target.get("lot_size") or 1)
         return max(1, lot)
 
+    def _scale_quantity(self, quantity: int, target: Dict, size_multiplier: float) -> int:
+        """Apply defensive or volatility sizing scaling, respecting option lot constraints."""
+        if quantity <= 0:
+            return 0
+        is_option = str(target.get("kind", "")).upper() in {"CE", "PE"}
+        lot = int(target.get("lot_size") or 1)
+        if 0.0 < size_multiplier < 1.0:
+            if is_option:
+                scaled_lots = int((quantity / lot) * size_multiplier)
+                if scaled_lots < 1:
+                    return 0
+                quantity = scaled_lots * lot
+            else:
+                quantity = max(1, int(quantity * size_multiplier))
+        elif size_multiplier > 1.0:
+            if is_option:
+                scaled_lots = max(1, int((quantity * size_multiplier + lot - 1) // lot))
+                quantity = scaled_lots * lot
+            else:
+                quantity = int(quantity * size_multiplier)
+                price = float(target.get("price") or 0)
+                if price > 0:
+                    max_notional_qty = max(1, int(self.paper_notional / price))
+                    quantity = min(quantity, max_notional_qty)
+        if is_option and quantity > 0:
+            quantity = max(lot, (quantity // lot) * lot)
+        return quantity
+
     def _candidate_grade(self,item: Dict,target: Dict,quality: Dict,market_quality: Dict,consistency: Dict = None) -> Dict:
         """Unified candidate grading across options and cash equities.
         
@@ -1592,6 +1655,7 @@ class LivePaperInference:
         breakout_down=last<prior_low and volume_ratio>=0.75
         pullback_up=trend_up and lows[-1]<=ema_fast<=last and closes[-1]>=closes[-2]
         pullback_down=trend_down and highs[-1]>=ema_fast>=last and closes[-1]<=closes[-2]
+        setup_type = "BREAKOUT" if (breakout_up or breakout_down) else "PULLBACK" if (pullback_up or pullback_down) else "MOMENTUM"
         structure=_structure_analysis(bars)
         signal=1 if (trend_up and (breakout_up or pullback_up or recent_move>0.001)) else -1 if (trend_down and (breakout_down or pullback_down or recent_move<-0.001)) else 0
         if structure.get("accepted") and structure.get("direction"):
@@ -1642,7 +1706,7 @@ class LivePaperInference:
         if opening_range:
             reason+="; opening-range mode uses completed 5m bars plus current forming 5m built from live 1m bars"
         return {"accepted":True,"reason":reason,
-                "strategy":strategy,"option_type":route[0],"side":route[1],"rr":round(rr,2),
+                "strategy":strategy,"setup_type":setup_type,"option_type":route[0],"side":route[1],"rr":round(rr,2),
                 "signal":signal,"confidence":confidence,"components":components,
                 "ml_support_observed":ml_support,
                 "session_case":case,"learning_mode":True,"senior_opportunity":True,
@@ -1894,14 +1958,24 @@ class LivePaperInference:
             allowed_routes=["CE_BUY","PE_BUY","EQ_BUY","EQ_INTRADAY_SHORT"]
 
         regime_classification = None
-        regime_name = "RANGE_MEAN_REVERSION"
+        regime_name = "NEUTRAL"
         try:
             from backend.regime_router import RegimeRouter
             router = RegimeRouter()
             regime_classification = router.classify(bars, symbol="NIFTY")
-            regime_name = regime_classification.get("regime", "RANGE_MEAN_REVERSION")
+            if regime_classification and regime_classification.get("regime"):
+                is_fallback = bool(
+                    regime_classification.get("is_fallback")
+                    or "reason" in (regime_classification.get("metrics") or {})
+                    or regime_classification.get("symbol") == "UNKNOWN"
+                )
+                if is_fallback:
+                    regime_name = "NEUTRAL"
+                else:
+                    regime_name = regime_classification.get("regime")
         except Exception:
-            pass
+            regime_classification = None
+            regime_name = "NEUTRAL"
 
         return {"enabled":True,"session":session,"case":case,"bias":bias,"bars":len(bars),
                 "move_pct":round(move_pct,5),"recent_pct":round(recent_pct,5),
@@ -1942,6 +2016,50 @@ class LivePaperInference:
             thresholds["option_entries_blocked"]=True
         else:
             thresholds["session_mode"]="mixed_selective"
+
+        # Phase C: 3-Regime Router Active Strategy Gating
+        regime_name = (session_case or {}).get("regime_name")
+        if regime_name:
+            regime_name = str(regime_name)
+            thresholds["regime_name"] = regime_name
+            if regime_name == "RANGE_MEAN_REVERSION":
+                thresholds["suppress_breakouts"] = True
+                thresholds["min_rr"] = max(float(thresholds["min_rr"]), 1.65)
+            elif regime_name == "TREND_CONTINUATION":
+                thresholds["suppress_fades"] = True
+                thresholds["session_mode"] = "trend_follow"
+            elif regime_name in ("HIGH_VOL_DEFENSE", "HIGH_VOLATILITY_DEFENSE"):
+                thresholds["defensive_vol_regime"] = True
+                reg_class = (session_case or {}).get("regime_classification") or {}
+                risk_pol = (session_case or {}).get("risk_policy") or reg_class.get("risk_policy") or {}
+                if risk_pol.get("allow_new_entries") is False or (session_case or {}).get("allow_new_entries") is False:
+                    thresholds["block_new_entries"] = True
+                thresholds["min_quality"] = max(float(thresholds["min_quality"]), 72.0)
+                thresholds["min_rr"] = max(float(thresholds["min_rr"]), 2.0)
+
+        # Phase C: Real-Time GEX Engine & Zero-Gamma Flip Point Modulation
+        thresholds["stop_multiplier"] = 1.0
+        thresholds["size_multiplier"] = 1.0
+        try:
+            from backend.gex_engine import TOP_HEAVYWEIGHTS, get_cached_or_compute_gex
+            sym = self._underlying_key(item)
+            if sym in TOP_HEAVYWEIGHTS:
+                gex = get_cached_or_compute_gex(sym, engine=getattr(self, "engine", None))
+                g_regime = str(gex.get("regime") or "LONG_GAMMA_MEAN_REVERSION")
+                zgf = gex.get("zero_gamma_flip")
+                g_flip = float(zgf) if zgf is not None else 0.0
+                s_mult = float(gex.get("stop_multiplier", 1.0))
+                sz_mult = float(gex.get("size_multiplier", 1.0))
+                thresholds["gex_regime"] = g_regime
+                thresholds["gex_flip_strike"] = g_flip
+                thresholds["stop_multiplier"] = s_mult
+                thresholds["size_multiplier"] = sz_mult
+                if g_regime == "VOLATILITY_FLIP_DEFENSE":
+                    thresholds["min_quality"] = max(float(thresholds["min_quality"]), 70.0)
+        except Exception:
+            thresholds["stop_multiplier"] = 1.0
+            thresholds["size_multiplier"] = 1.0
+
         return thresholds
 
     def _market_quality_gate(self,item: Dict,target: Dict) -> Dict:
@@ -2277,6 +2395,12 @@ class LivePaperInference:
             item["_session_case"]=session_case or {}
             item["_effective_thresholds"]=thresholds
             
+            if item.get("_quant_strategy"):
+                chart["strategy"] = str(item["_quant_strategy"])
+            effective_strategy = str((chart.get("strategy") or item.get("strategy") or "")).upper()
+            if effective_strategy:
+                item["_effective_strategy"] = effective_strategy
+
             # Autonomous AI Fast-Path Vector Memory Check
             golden_match = None
             try:
@@ -2294,8 +2418,6 @@ class LivePaperInference:
                 chart["strategy"] = f"GOLDEN_{p_name}"
                 item["probability"] = min(0.95, float(item.get("probability") or 0.70) + (0.15 if is_fast_path else 0.08))
                 thresholds["min_rr"] = max(1.35, float(thresholds.get("min_rr", 1.90)) * 0.75)
-            elif item.get("_quant_strategy"):
-                chart["strategy"] = str(item["_quant_strategy"])
 
             ist_now = watermark.astimezone(IST).time()
             try:
@@ -2307,15 +2429,31 @@ class LivePaperInference:
             except Exception:
                 pass
 
+            if thresholds.get("block_new_entries"):
+                rejected += 1
+                reject_reasons["regime_high_vol_defense_block"] += 1
+                audit(item, "regime_filter", False, "high volatility defense: new entries prohibited by risk policy", thresholds=thresholds)
+                continue
+
+            eval_strat = str(item.get("_effective_strategy") or chart.get("strategy") or item.get("strategy") or "").upper()
+            setup_type = str(chart.get("setup_type") or item.get("setup_type") or "")
+            if thresholds.get("suppress_breakouts") and is_breakout_strategy(eval_strat, setup_type=setup_type):
+                rejected += 1
+                reject_reasons["breakout_suppressed_in_range"] += 1
+                audit(item, "regime_filter", False, f"breakout strategy {eval_strat} suppressed in range regime", thresholds=thresholds)
+                continue
+            if thresholds.get("suppress_fades") and is_fade_strategy(eval_strat):
+                rejected += 1
+                reject_reasons["fade_suppressed_in_trend"] += 1
+                audit(item, "regime_filter", False, f"fade strategy {eval_strat} suppressed in trend regime", thresholds=thresholds)
+                continue
+
             freshness=self._freshness_gate(item,watermark)
             if not freshness.get("accepted"):
                 rejected+=1; reject_reasons["stale_signal_rejected"]+=1
                 audit(item,"signal_freshness",False,freshness.get("reason","stale_signal_rejected"),thresholds=thresholds)
                 continue
             item["_freshness_gate"]=freshness
-            rr=float(chart.get("rr") or 0)
-            if rr<float(thresholds["min_rr"]):
-                rejected+=1; reject_reasons["rr_below_effective_minimum"]+=1; audit(item,"risk_reward",False,"rr_below_effective_minimum",thresholds=thresholds); continue
             key=self._underlying_key(item)
             if key in cooldown:
                 rejected+=1; reject_reasons["cooldown_underlying"]+=1; audit(item,"daily_risk",False,"cooldown_underlying"); continue
@@ -2330,6 +2468,13 @@ class LivePaperInference:
             target=self._execution_target(item,watermark)
             if not target:
                 rejected+=1; reject_reasons["not_executable"]+=1; audit(item,"execution_route",False,"not_executable"); continue
+
+            risk_levels = self._risk_levels_for_target(item, target)
+            effective_rr = float(risk_levels.get("rr") if risk_levels.get("rr") is not None else (chart.get("rr") or 0))
+            if risk_levels.get("rr") is not None and "rr" in chart:
+                chart["rr"] = risk_levels["rr"]
+            if effective_rr < float(thresholds["min_rr"]):
+                rejected+=1; reject_reasons["rr_below_effective_minimum"]+=1; audit(item,"risk_reward",False,"rr_below_effective_minimum",thresholds=thresholds); continue
 
             # Nifty 50 Macro Directional Veto: Never buy stocks during market pullbacks or short into rallies
             # unless the stock exhibits strong alpha / relative strength or is evaluated as a swing setup
@@ -2441,8 +2586,21 @@ class LivePaperInference:
                 continue
             assigned_grade=candidate_grade.get("grade","B")
             quantity=self._target_quantity(target,assigned_grade)
+            size_multiplier = float((thresholds or {}).get("size_multiplier", 1.0))
+            quantity = self._scale_quantity(quantity, target, size_multiplier)
             if quantity<=0:
                 rejected+=1; reject_reasons["grade_c_zero_sizing"]+=1; continue
+            if str(target.get("kind")) in {"CE", "PE"}:
+                rl = self._risk_levels_for_target(item, target)
+                p = Decimal(str(target.get("price") or 0))
+                sl = Decimal(str(rl.get("stop_loss") or 0))
+                if p > Decimal("0") and sl > Decimal("0"):
+                    stop_dist = abs(p - sl)
+                    if (stop_dist * Decimal(quantity)) > self.max_option_loss_rupees:
+                        rejected += 1
+                        reject_reasons["max_option_loss_exceeded"] += 1
+                        audit(item, "risk_limits", False, f"scaled option stop loss ₹{stop_dist * Decimal(quantity):.2f} exceeds cap ₹{self.max_option_loss_rupees:.2f}", target=target)
+                        continue
             adaptive=self._adaptive_gate(item,target,quality)
             if not adaptive.get("accepted"):
                 rejected+=1; reject_reasons["adaptive_trap_rejected"]+=1; audit(item,"adaptive_trap",False,"adaptive_trap_rejected",target=target,quality=quality,market_quality=market_quality,sentiment=sentiment,adaptive=adaptive,sector=sector,thresholds=thresholds); continue
@@ -2665,8 +2823,34 @@ class LivePaperInference:
             probe["option_side"]=gate.get("side","BUY")
             probe["probe_trade"]=True
             probe["senior_opportunity"]=True
+            probe_thresholds=self._effective_thresholds(probe,gate,probe.get("policy_candidate"),session_case or {})
+            if probe_thresholds.get("block_new_entries"):
+                continue
+            probe_strat = str(probe.get("_effective_strategy") or (gate.get("strategy") or probe.get("strategy") or "")).upper()
+            setup_type = str(gate.get("setup_type") or probe.get("setup_type") or "")
+            if probe_thresholds.get("suppress_breakouts") and is_breakout_strategy(probe_strat, setup_type=setup_type):
+                continue
+            if probe_thresholds.get("suppress_fades") and is_fade_strategy(probe_strat):
+                continue
+            probe_stop_mult=float((probe_thresholds or {}).get("stop_multiplier", 1.0))
+            probe_size_mult=float((probe_thresholds or {}).get("size_multiplier", 1.0))
+            probe_min_rr=float((probe_thresholds or {}).get("min_rr", self.min_professional_rr))
+            probe_min_quality=max(float((probe_thresholds or {}).get("min_quality", self.learning_best_min_quality)), float(self.learning_best_min_quality))
+            probe["_effective_thresholds"]={
+                "scanner":"senior_stock_opportunity",
+                "min_confidence":self.senior_stock_min_confidence,
+                "min_quality":probe_min_quality,
+                "min_rr":probe_min_rr,
+                "stop_multiplier":probe_stop_mult,
+                "size_multiplier":probe_size_mult,
+                "block_new_entries":bool(probe_thresholds.get("block_new_entries")),
+            }
             target=self._execution_target(probe,probe["session"]["timestamp"])
             if not target:
+                continue
+            risk_levels=self._risk_levels_for_target(probe,target)
+            target_rr=float(risk_levels.get("rr") if risk_levels.get("rr") is not None else (gate.get("rr") or 0))
+            if target_rr<probe_min_rr:
                 continue
             consistency=self._strategy_consistency_gate(probe,target,session_case)
             if not consistency.get("accepted"):
@@ -2679,15 +2863,21 @@ class LivePaperInference:
             if not sentiment.get("accepted",True):
                 continue
             quality=self._candidate_quality(probe,target,quantity)
-            if float(quality.get("score") or 0)<self.learning_best_min_quality:
+            if float(quality.get("score") or 0)<probe_min_quality:
                 continue
             candidate_grade=self._candidate_grade(probe,target,quality,market_quality,consistency)
             if not candidate_grade.get("accepted",True):
                 continue
             assigned_grade=candidate_grade.get("grade","B")
             quantity=self._target_quantity(target,assigned_grade)
+            quantity=self._scale_quantity(quantity, target, probe_size_mult)
             if quantity<=0:
                 continue
+            if str(target.get("kind")) in {"CE", "PE"}:
+                p = Decimal(str(target.get("price") or 0))
+                sl = Decimal(str(risk_levels.get("stop_loss") or 0))
+                if p > Decimal("0") and sl > Decimal("0") and (abs(p - sl) * Decimal(quantity)) > self.max_option_loss_rupees:
+                    continue
             adaptive=self._adaptive_gate(probe,target,quality)
             if not adaptive.get("accepted"):
                 continue
@@ -2703,8 +2893,6 @@ class LivePaperInference:
             probe["_sector"]=sector_for_symbol(probe.get("symbol"), probe.get("instrument_type"))
             probe["_selector_score"]=float(gate.get("confidence") or 0)+float(sentiment.get("selector_adjustment") or 0)
             probe["_session_case"]=session_case or {}
-            probe["_effective_thresholds"]={"scanner":"senior_stock_opportunity","min_confidence":self.senior_stock_min_confidence,
-                                            "min_quality":self.learning_best_min_quality}
             selected.append(probe)
         selected.sort(key=lambda item:(float(item.get("_selector_score") or 0),float(item.get("_entry_quality",{}).get("score") or 0)),reverse=True)
         return selected[:min(remaining_slots,self.senior_stock_trade_limit,self.max_new_trades_per_cycle)]
@@ -2939,6 +3127,21 @@ class LivePaperInference:
             }
         probe_ranked=[item for item in ranked if item.get("probe_trade")]
         for item in ranked:
+            thresholds = item.get("_effective_thresholds") or self._effective_thresholds(
+                item, item.get("chart_gate") or {}, item.get("policy_candidate"), item.get("_session_case") or session_case
+            )
+            item["_effective_thresholds"] = thresholds
+            if thresholds.get("block_new_entries"):
+                rejected += 1
+                continue
+            item_strat = str(item.get("_effective_strategy") or (item.get("chart_gate", {}).get("strategy") or item.get("strategy") or "")).upper()
+            setup_type = str((item.get("chart_gate") or {}).get("setup_type") or item.get("setup_type") or "")
+            if thresholds.get("suppress_breakouts") and is_breakout_strategy(item_strat, setup_type=setup_type):
+                rejected += 1
+                continue
+            if thresholds.get("suppress_fades") and is_fade_strategy(item_strat):
+                rejected += 1
+                continue
             target=item.get("_execution_target") or self._execution_target(item,causal_watermark)
             if not target:
                 rejected+=1; continue
@@ -2947,6 +3150,9 @@ class LivePaperInference:
                 rejected+=1; continue
             assigned_grade = (item.get("_candidate_grade") or item.get("_option_grade") or {}).get("grade", "B")
             quantity=int(item.get("_execution_quantity") or self._target_quantity(target, assigned_grade))
+            if not item.get("_execution_quantity"):
+                size_mult = float(thresholds.get("size_multiplier", 1.0))
+                quantity = self._scale_quantity(quantity, target, size_mult)
             if quantity <= 0:
                 rejected+=1; continue
             risk_levels=self._risk_levels_for_target(item,target)
@@ -2991,6 +3197,13 @@ class LivePaperInference:
                 quantity = max(1, int(Decimal(str(quantity)) * Decimal(str(agent_eval.get("sizing_factor", 1.0)))))
             except Exception as orch_exc:
                 logger.warning(f"Agentic orchestrator deliberation bypassed due to error: {orch_exc}")
+
+            if str(target.get("kind", "")).upper() in {"CE", "PE"}:
+                lot = int(target.get("lot_size") or 1)
+                quantity = (quantity // lot) * lot
+                if quantity < lot:
+                    rejected += 1
+                    continue
 
             result=record_shadow_signal(self.engine,self.redis,model["version"],int(target["instrument_token"]),target["side"],quantity,
                                         item["probability"],target["price"],item["session"]["timestamp"],
@@ -3112,11 +3325,24 @@ class LivePaperInference:
                 thresholds=self._effective_thresholds(item,item.get("chart_gate",{}),item.get("policy_candidate"),session_case)
                 item["_session_case"]=session_case
                 item["_effective_thresholds"]=thresholds
-                if float(item.get("chart_gate",{}).get("rr") or 0)<float(thresholds["min_rr"]):
+                if thresholds.get("block_new_entries"):
                     rejected+=1
+                    continue
+                item_strat = str(item.get("_effective_strategy") or (item.get("chart_gate", {}).get("strategy") or item.get("strategy") or "")).upper()
+                setup_type = str((item.get("chart_gate") or {}).get("setup_type") or item.get("setup_type") or "")
+                if thresholds.get("suppress_breakouts") and is_breakout_strategy(item_strat, setup_type=setup_type):
+                    rejected += 1
+                    continue
+                if thresholds.get("suppress_fades") and is_fade_strategy(item_strat):
+                    rejected += 1
                     continue
                 target=self._execution_target(item,source_watermark)
                 if not target:
+                    rejected+=1
+                    continue
+                risk_levels=self._risk_levels_for_target(item,target)
+                target_rr=float(risk_levels.get("rr") if risk_levels.get("rr") is not None else (item.get("chart_gate",{}).get("rr") or 0))
+                if target_rr<float(thresholds["min_rr"]):
                     rejected+=1
                     continue
                 consistency=self._strategy_consistency_gate(item,target,session_case)
@@ -3130,7 +3356,12 @@ class LivePaperInference:
                 if self.require_depth_for_entries and not market_quality.get("depth_available"):
                     rejected+=1
                     continue
-                quantity=target["lot_size"]
+                base_qty=target["lot_size"]
+                size_mult=float(thresholds.get("size_multiplier", 1.0))
+                quantity=self._scale_quantity(base_qty, target, size_mult)
+                if quantity<=0:
+                    rejected+=1
+                    continue
                 quality=self._candidate_quality(item,target,quantity)
                 if float(quality.get("score") or 0)<float(thresholds["min_option_quality"]):
                     rejected+=1

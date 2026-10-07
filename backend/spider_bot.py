@@ -80,8 +80,8 @@ class AutonomousSpiderBot:
         max_gamma_threshold: float = 0.05,
         target_delta_neutral: float = 0.0,
     ):
-        self.database_url = database_url or DATABASE_URL or ""
-        self.redis_url = redis_url or REDIS_URL or ""
+        self.database_url = DATABASE_URL if database_url is None else database_url
+        self.redis_url = REDIS_URL if redis_url is None else redis_url
         self.max_delta_threshold = max_delta_threshold
         self.max_gamma_threshold = max_gamma_threshold
         self.target_delta_neutral = target_delta_neutral

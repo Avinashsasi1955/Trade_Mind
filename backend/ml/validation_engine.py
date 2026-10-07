@@ -87,6 +87,12 @@ def record_shadow_signal(engine,redis_client,model_version:str,instrument_token:
             candidate_tp=Decimal(str(chart_tp))
             if (side=="BUY" and candidate_tp>fill) or (side=="SELL" and candidate_tp<fill):
                 take_profit=candidate_tp
+        if instrument["instrument_type"] in {"CE","PE"}:
+            stop_dist = abs(fill - stop_loss)
+            max_loss_cap = Decimal(os.getenv("NIVESH_SHADOW_MAX_OPTION_LOSS_RUPEES", "2500"))
+            if stop_dist * Decimal(quantity) > max_loss_cap:
+                return {"recorded": False, "orders_allowed": False,
+                        "rejection_reason": f"option stop loss ₹{stop_dist * Decimal(quantity):.2f} exceeds cap ₹{max_loss_cap:.2f}"}
         fill_source="DEPTH_SNAPSHOT" if depth else "DECISION_PRICE_FALLBACK"
         initial_tags = ["synthetic_option_model"] if is_synthetic_entry else []
         inserted=connection.execute(text("""INSERT INTO shadow_execution_audits(model_version,instrument_id,signal_at,side,quantity,signal_probability,decision_price,

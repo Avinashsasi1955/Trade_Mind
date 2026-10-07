@@ -786,3 +786,94 @@ def generate_daily_coach_audit() -> Dict:
     from backend.brains.trading_coach import run_coach_audit
     return run_coach_audit(_engine)
 
+
+@celery_app.task(name="backend.tasks.worker.compute_heavyweights_gex")
+def compute_heavyweights_gex() -> Dict:
+    """Phase C: Scheduled 3-minute GEX and Zero-Gamma Flip Point calculation for Top Heavyweights."""
+    from backend.gex_engine import TOP_HEAVYWEIGHTS, get_cached_or_compute_gex
+    results = {}
+    errors = 0
+    for sym in TOP_HEAVYWEIGHTS:
+        try:
+            results[sym] = get_cached_or_compute_gex(sym, engine=_engine, force_refresh=True)
+        except Exception as exc:
+            logger.warning("compute_heavyweights_gex failed for symbol %s: %s", sym, exc)
+            results[sym] = {"error": str(exc)}
+            errors += 1
+    total = len(TOP_HEAVYWEIGHTS)
+    status = "success" if errors == 0 else "failed" if errors == total else "partial"
+    return {"status": status, "evaluated_symbols": list(results.keys()), "results": results, "errors": errors}
+
+
+@celery_app.task(name="backend.tasks.worker.spider_bot_rebalancing_cycle")
+def spider_bot_rebalancing_cycle() -> Dict:
+    """Phase C: Spider Bot Autonomous Delta-Neutral Auto-Balancing Loop (|Delta| > 0.20)."""
+    from backend.spider_bot import AutonomousSpiderBot
+    from backend.config import DATABASE_URL, REDIS_URL
+    from backend.gex_engine import get_cached_or_compute_gex
+
+    bot = AutonomousSpiderBot(database_url=DATABASE_URL, redis_url=REDIS_URL, max_delta_threshold=0.20)
+    adjustments = []
+    try:
+        greeks = bot.evaluate_portfolio_greeks()
+        if greeks.needs_rebalance:
+            live_gex = get_cached_or_compute_gex("NIFTY", engine=_engine, force_refresh=True)
+            if not live_gex.get("has_live_spot"):
+                return {
+                    "status": "skipped",
+                    "reason": "no_live_spot_price",
+                    "net_delta": round(greeks.net_delta, 4),
+                    "needs_rebalance": True,
+                    "adjustments": [],
+                }
+            bar_time_val = live_gex.get("spot_bar_time")
+            is_stale = False
+            if not bar_time_val:
+                is_stale = True
+            else:
+                try:
+                    bar_dt = datetime.fromisoformat(str(bar_time_val).replace("Z", "+00:00"))
+                    if bar_dt.tzinfo is None:
+                        bar_dt = bar_dt.replace(tzinfo=timezone.utc)
+                    if (datetime.now(timezone.utc) - bar_dt).total_seconds() > 900:  # 15 minutes max staleness
+                        is_stale = True
+                except Exception:
+                    is_stale = True
+
+            if is_stale:
+                return {
+                    "status": "skipped",
+                    "reason": "stale_spot_price",
+                    "net_delta": round(greeks.net_delta, 4),
+                    "needs_rebalance": True,
+                    "adjustments": [],
+                }
+            spot_price = float(live_gex["spot_price"])
+            adjustments_objs = bot.formulate_rebalancing_plan(greeks, spot_price=spot_price, underlying="NIFTY")
+            adjustments = [a.__dict__ for a in adjustments_objs]
+            if _engine:
+                try:
+                    with _engine.begin() as conn:
+                        conn.execute(text("""
+                            INSERT INTO monitoring_events(component, level, message, payload, created_at)
+                            VALUES('spider_bot_rebalance', 'WARNING', :msg, :payload, CURRENT_TIMESTAMP)
+                        """), {
+                            "msg": f"Spider Bot Delta Imbalance Triggered ({greeks.net_delta:.2f}). Adjustments required.",
+                            "payload": json.dumps({"greeks": greeks.__dict__, "adjustments": adjustments})
+                        })
+                except Exception as exc:
+                    logger.warning("Failed to record spider_bot_rebalance event to monitoring_events: %s", exc)
+        return {
+            "status": "success",
+            "net_delta": round(greeks.net_delta, 4),
+            "needs_rebalance": greeks.needs_rebalance,
+            "adjustments": adjustments,
+        }
+    finally:
+        if getattr(bot, "engine", None):
+            try:
+                bot.engine.dispose()
+            except Exception:
+                pass
+
+
