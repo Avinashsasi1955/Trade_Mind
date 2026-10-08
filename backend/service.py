@@ -517,6 +517,16 @@ def shadow_trade_book(limit: int = 200) -> Dict:
                 GROUP BY session_date
                 ORDER BY session_date DESC
                 LIMIT 20""")).mappings().all()
+
+            try:
+                connection.execute(text("""
+                    UPDATE shadow_execution_audits
+                    SET holding_days = GREATEST(0, ((CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date - (signal_at AT TIME ZONE 'Asia/Kolkata')::date))
+                    WHERE audit_status = 'RECONCILED' AND net_pnl IS NULL
+                """))
+                connection.commit()
+            except Exception:
+                pass
     except Exception as db_exc:
         print(f"[nivesh] Error reading shadow trade book: {db_exc}")
         if r_client:
@@ -528,38 +538,67 @@ def shadow_trade_book(limit: int = 200) -> Dict:
                 pass
         return {"open": [], "closed": [], "daily": [], "summary": empty_summary, "today": empty_summary,
                 "market_date": datetime.now(IST).date().isoformat(), "orders_allowed": False}
-    items=[]
+    market_date = datetime.now(IST).date()
+    items = []
     for row in rows:
-        entry=_float(row["theoretical_fill_price"] or row["decision_price"])
+        entry = _float(row["theoretical_fill_price"] or row["decision_price"])
         # Use synthetic price for this audit id if calibrated; otherwise batch-fetched latest_price_map
-        live_price=synthetic_price_by_audit.get(int(row["id"])) or latest_price_map.get(int(row["instrument_id"]), None)
-        latest=_float(row["realised_exit_price"] or live_price or entry)
-        qty=int(row["quantity"] or 0)
-        side=str(row["side"])
-        fees=_float(row["estimated_fees"])
-        realised=row["net_pnl"] is not None
-        pnl=_float(row["net_pnl"]) if realised else ((latest-entry)*qty-fees if side=="BUY" else (entry-latest)*qty-fees)
-        notional=entry*qty
-        raw_strat=str(row.get("strategy_tag") or "").strip()
+        live_price = synthetic_price_by_audit.get(int(row["id"])) or latest_price_map.get(int(row["instrument_id"]), None)
+        latest = _float(row["realised_exit_price"] or live_price or entry)
+        qty = int(row["quantity"] or 0)
+        side = str(row["side"])
+        fees = _float(row["estimated_fees"])
+        realised = row["net_pnl"] is not None
+        pnl = _float(row["net_pnl"]) if realised else ((latest - entry) * qty - fees if side == "BUY" else (entry - latest) * qty - fees)
+        notional = entry * qty
+        raw_strat = str(row.get("strategy_tag") or "").strip()
         if not raw_strat or raw_strat in ("UNKNOWN_STRATEGY", "UNKNOWN", "NO_STRATEGY", "None", "NO_TRADE"):
-            raw_strat = "BREAKOUT_CALL_BUY" if side=="BUY" else "BREAKDOWN_PUT_BUY"
-        clean_strat=(raw_strat.replace("_"," ").title()
-                     .replace("Call Buy","Call (CE)")
-                     .replace("Put Sell","Put Write (PE)")
-                     .replace("Put Buy","Put (PE)")
-                     .replace("Call Sell","Call Write (CE)")
-                     .replace("Golden ","Golden: ")
-                     .replace("Quant ","Quant: "))
-        item={**dict(row),
-              "entry_price":round(entry,4),
-              "latest_price":round(latest,4),
-              "estimated_fees":round(fees,2),
-              "notional":round(notional,2),
-              "marked_pnl":round(pnl,2),
-              "pnl_pct":round((pnl/max(1,notional))*100,4),
-              "is_open":not realised,
-              "strategy_tag":raw_strat,
-              "strategy_label":clean_strat}
+            raw_strat = "BREAKOUT_CALL_BUY" if side == "BUY" else "BREAKDOWN_PUT_BUY"
+        clean_strat = (raw_strat.replace("_", " ").title()
+                     .replace("Call Buy", "Call (CE)")
+                     .replace("Put Sell", "Put Write (PE)")
+                     .replace("Put Buy", "Put (PE)")
+                     .replace("Call Sell", "Call Write (CE)")
+                     .replace("Golden ", "Golden: ")
+                     .replace("Quant ", "Quant: "))
+        
+        sig_at = row.get("signal_at")
+        if sig_at:
+            if hasattr(sig_at, "astimezone"):
+                sig_date = sig_at.astimezone(IST).date()
+            elif isinstance(sig_at, datetime):
+                sig_date = sig_at.date()
+            elif isinstance(sig_at, str):
+                sig_date = date.fromisoformat(sig_at.split("T")[0])
+            else:
+                sig_date = market_date
+
+            if realised and row.get("exit_at"):
+                exit_at = row["exit_at"]
+                if hasattr(exit_at, "astimezone"):
+                    exit_date = exit_at.astimezone(IST).date()
+                elif isinstance(exit_at, datetime):
+                    exit_date = exit_at.date()
+                elif isinstance(exit_at, str):
+                    exit_date = date.fromisoformat(exit_at.split("T")[0])
+                else:
+                    exit_date = market_date
+                computed_holding_days = max(0, (exit_date - sig_date).days)
+            else:
+                computed_holding_days = max(0, (market_date - sig_date).days)
+        else:
+            computed_holding_days = int(row.get("holding_days") or 0)
+
+        item = {**dict(row),
+              "entry_price": round(entry, 4),
+              "latest_price": round(latest, 4),
+              "estimated_fees": round(fees, 2),
+              "notional": round(notional, 2),
+              "marked_pnl": round(pnl, 2),
+              "pnl_pct": round((pnl / max(1, notional)) * 100, 4),
+              "is_open": not realised,
+              "strategy_tag": raw_strat,
+              "strategy_label": clean_strat}
         rc = row.get("reasoning_chain")
         if isinstance(rc, str):
             try:
@@ -568,62 +607,66 @@ def shadow_trade_book(limit: int = 200) -> Dict:
                 pass
         item["reasoning_chain"] = rc
         item["trade_mode"] = str(row.get("trade_mode") or "INTRADAY")
-        item["holding_days"] = int(row.get("holding_days") or 0)
-        item["quality"]=score_trade(item)
-        item["senior_agent"]=review_shadow_trade(item)
+        item["holding_days"] = computed_holding_days
+        item["quality"] = score_trade(item)
+        item["senior_agent"] = review_shadow_trade(item)
         items.append(item)
     for item in items:
-        raw_tags=item.get("mistake_tags") or []
-        if isinstance(raw_tags,str):
+        raw_tags = item.get("mistake_tags") or []
+        if isinstance(raw_tags, str):
             try:
-                raw_tags=json.loads(raw_tags)
+                raw_tags = json.loads(raw_tags)
             except Exception:
-                raw_tags=[]
-        item["mistake_tags"]=raw_tags if isinstance(raw_tags,list) else []
+                raw_tags = []
+        item["mistake_tags"] = raw_tags if isinstance(raw_tags, list) else []
     def summarise(selected: List[Dict]) -> Dict:
-        open_items=[item for item in selected if item["is_open"]]
-        closed_items=[item for item in selected if not item["is_open"]]
+        open_items = [item for item in selected if item["is_open"]]
+        closed_items = [item for item in selected if not item["is_open"]]
         inst_metrics = calculate_institutional_metrics(closed_items)
-        realised_pnl=inst_metrics["realised_pnl"]
-        unrealised_pnl=sum(float(item["marked_pnl"]) for item in open_items)
-        estimated_fees=sum(float(item.get("estimated_fees") or 0) for item in selected)
-        quality_scores=[float(item.get("quality",{}).get("score") or 0) for item in selected if item.get("quality")]
-        closed_quality=[float(item.get("quality",{}).get("score") or 0) for item in closed_items if item.get("quality")]
-        open_quality=[float(item.get("quality",{}).get("score") or 0) for item in open_items if item.get("quality")]
-        tags={}; exits={}
+        realised_pnl = inst_metrics["realised_pnl"]
+        unrealised_pnl = sum(float(item["marked_pnl"]) for item in open_items)
+        estimated_fees = sum(float(item.get("estimated_fees") or 0) for item in selected)
+        quality_scores = [float(item.get("quality", {}).get("score") or 0) for item in selected if item.get("quality")]
+        closed_quality = [float(item.get("quality", {}).get("score") or 0) for item in closed_items if item.get("quality")]
+        open_quality = [float(item.get("quality", {}).get("score") or 0) for item in open_items if item.get("quality")]
+        tags = {}; exits = {}
         for item in closed_items:
-            exits[item.get("exit_reason") or "closed"]=exits.get(item.get("exit_reason") or "closed",0)+1
+            exits[item.get("exit_reason") or "closed"] = exits.get(item.get("exit_reason") or "closed", 0) + 1
             for tag in item.get("mistake_tags") or []:
-                tags[str(tag)]=tags.get(str(tag),0)+1
-        feedback=quality_feedback([item.get("quality") for item in selected])
-        return {"open_trades":len(open_items),"closed_trades":len(closed_items),
-                "realised_pnl":round(realised_pnl,2),"unrealised_pnl":round(unrealised_pnl,2),
-                "net_marked_pnl":round(realised_pnl+unrealised_pnl,2),
-                "winning_trades":inst_metrics["winning_trades"],"losing_trades":inst_metrics["losing_trades"],
-                "win_rate_pct":inst_metrics["win_rate_pct"],
-                "profit_factor":inst_metrics["profit_factor"],
-                "sharpe_ratio":inst_metrics["sharpe_ratio"],
-                "sortino_ratio":inst_metrics["sortino_ratio"],
-                "max_drawdown_pct":inst_metrics["max_drawdown_pct"],
-                "gross_profit":inst_metrics["gross_profit"],
-                "gross_loss":inst_metrics["gross_loss"],
-                "roi_pct":inst_metrics["roi_pct"],
-                "estimated_fees":round(estimated_fees,2),
-                "avg_quality_score":round(sum(quality_scores)/len(quality_scores),2) if quality_scores else 0,
-                "open_quality_score":round(sum(open_quality)/len(open_quality),2) if open_quality else 0,
-                "closed_quality_score":round(sum(closed_quality)/len(closed_quality),2) if closed_quality else 0,
-                "quality_feedback":feedback,
-                "exit_reasons":exits,"mistake_tags":tags}
-    open_items=[item for item in items if item["is_open"]]
-    closed_items=[item for item in items if not item["is_open"]]
-    market_date=datetime.now(IST).date()
-    today_items=[item for item in items if item.get("signal_at") and item["signal_at"].astimezone(IST).date()==market_date]
-    result = {"open":open_items,"closed":closed_items,
-            "summary":summarise(items),
-            "today":summarise(today_items),
-            "market_date":market_date.isoformat(),
-            "daily":[dict(row) for row in daily_rows],
-            "orders_allowed":False,
+                tags[str(tag)] = tags.get(str(tag), 0) + 1
+        feedback = quality_feedback([item.get("quality") for item in selected])
+        return {"open_trades": len(open_items), "closed_trades": len(closed_items),
+                "realised_pnl": round(realised_pnl, 2), "unrealised_pnl": round(unrealised_pnl, 2),
+                "net_marked_pnl": round(realised_pnl + unrealised_pnl, 2),
+                "winning_trades": inst_metrics["winning_trades"], "losing_trades": inst_metrics["losing_trades"],
+                "win_rate_pct": inst_metrics["win_rate_pct"],
+                "profit_factor": inst_metrics["profit_factor"],
+                "sharpe_ratio": inst_metrics["sharpe_ratio"],
+                "sortino_ratio": inst_metrics["sortino_ratio"],
+                "max_drawdown_pct": inst_metrics["max_drawdown_pct"],
+                "gross_profit": inst_metrics["gross_profit"],
+                "gross_loss": inst_metrics["gross_loss"],
+                "roi_pct": inst_metrics["roi_pct"],
+                "estimated_fees": round(estimated_fees, 2),
+                "avg_quality_score": round(sum(quality_scores) / len(quality_scores), 2) if quality_scores else 0,
+                "open_quality_score": round(sum(open_quality) / len(open_quality), 2) if open_quality else 0,
+                "closed_quality_score": round(sum(closed_quality) / len(closed_quality), 2) if closed_quality else 0,
+                "quality_feedback": feedback,
+                "exit_reasons": exits, "mistake_tags": tags}
+    open_items = [item for item in items if item["is_open"]]
+    closed_items = [item for item in items if not item["is_open"]]
+    today_items = [
+        item for item in items
+        if item["is_open"]
+        or (item.get("signal_at") and item["signal_at"].astimezone(IST).date() == market_date)
+        or (item.get("exit_at") and item["exit_at"].astimezone(IST).date() == market_date)
+    ]
+    result = {"open": open_items, "closed": closed_items,
+            "summary": summarise(items),
+            "today": summarise(today_items),
+            "market_date": market_date.isoformat(),
+            "daily": [dict(row) for row in daily_rows],
+            "orders_allowed": False,
             "basis":"shadow_execution_audits only; legacy demo portfolio tables excluded"}
     if r_client:
         try:

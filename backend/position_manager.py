@@ -529,19 +529,7 @@ class PositionManager:
                 favorable_r = max(favorable_r, fav_r)
 
                 if not is_hedge_leg:
-                    # Check Stop Loss against the stop level entering this bar (before this bar's high raises it)
-                    prev_sl = running_sl
-                    if prev_sl and l <= prev_sl and not sl_candidate_bar:
-                        sl_candidate_price = prev_sl
-                        if prev_sl >= entry + self.profit_lock_guaranteed_r * r_points:
-                            sl_candidate_reason = "TRAILING_STOP"
-                        elif prev_sl >= entry:
-                            sl_candidate_reason = "BREAKEVEN_STOP"
-                        else:
-                            sl_candidate_reason = "STOP_LOSS"
-                        sl_candidate_bar = b_time
-
-                    # Chronological intra-replay trailing stop progression (applied for subsequent price action)
+                    # Chronological intra-replay trailing stop progression
                     if fav_r >= self.breakeven_trigger_r:
                         be_p = entry + fee_buffer_per_share
                         running_sl = max(running_sl, be_p) if running_sl else be_p
@@ -552,39 +540,30 @@ class PositionManager:
                         ts_p = best_favourable - self.trailing_giveback_r * r_points
                         running_sl = max(running_sl, ts_p) if running_sl else ts_p
 
-                    # Check Take Profit
-                    if take_profit and h >= take_profit and not tp_candidate_bar:
-                        tp_candidate_price = take_profit
-                        tp_candidate_reason = "TAKE_PROFIT"
-                        tp_candidate_bar = b_time
-                    # Check +2.5R Spike
-                    if fav_r >= Decimal("2.50") and not tp_candidate_bar:
-                        tp_candidate_price = entry + Decimal("2.5") * r_points
-                        tp_candidate_reason = "PROFIT_CAPTURE"
-                        tp_candidate_bar = b_time
+                    # 1. Take Profit hit on this bar
+                    if take_profit and h >= take_profit:
+                        exit_price = take_profit
+                        exit_reason = "TAKE_PROFIT"
+                        exit_bar_time = b_time
+                        break
 
-                # If purely intraday, break on first exit triggered
-                if not is_multi_day and not is_hedge_leg:
-                    if tp_candidate_bar and sl_candidate_bar:
-                        # Which occurred first?
-                        if tp_candidate_bar < sl_candidate_bar:
-                            exit_price = tp_candidate_price
-                            exit_reason = tp_candidate_reason
-                            exit_bar_time = tp_candidate_bar
+                    # 2. +2.5R Spike Profit Capture hit on this bar
+                    if fav_r >= Decimal("2.50"):
+                        exit_price = entry + Decimal("2.5") * r_points
+                        exit_reason = "PROFIT_CAPTURE"
+                        exit_bar_time = b_time
+                        break
+
+                    # 3. Stop Loss or Trailed Stop hit on this bar
+                    if running_sl and l <= running_sl:
+                        exit_price = running_sl
+                        if running_sl >= entry + self.profit_lock_guaranteed_r * r_points:
+                            exit_reason = "TRAILING_STOP"
+                        elif running_sl >= entry:
+                            exit_reason = "BREAKEVEN_STOP"
                         else:
-                            exit_price = sl_candidate_price
-                            exit_reason = sl_candidate_reason
-                            exit_bar_time = sl_candidate_bar
-                        break
-                    elif tp_candidate_bar:
-                        exit_price = tp_candidate_price
-                        exit_reason = tp_candidate_reason
-                        exit_bar_time = tp_candidate_bar
-                        break
-                    elif sl_candidate_bar:
-                        exit_price = sl_candidate_price
-                        exit_reason = sl_candidate_reason
-                        exit_bar_time = sl_candidate_bar
+                            exit_reason = "STOP_LOSS"
+                        exit_bar_time = b_time
                         break
             else:  # SELL
                 best_favourable = min(best_favourable, l)
@@ -593,19 +572,7 @@ class PositionManager:
                 favorable_r = max(favorable_r, fav_r)
 
                 if not is_hedge_leg:
-                    # Check Stop Loss against the stop level entering this bar (before this bar's low lowers it)
-                    prev_sl = running_sl
-                    if prev_sl and h >= prev_sl and not sl_candidate_bar:
-                        sl_candidate_price = prev_sl
-                        if prev_sl <= entry - self.profit_lock_guaranteed_r * r_points:
-                            sl_candidate_reason = "TRAILING_STOP"
-                        elif prev_sl <= entry:
-                            sl_candidate_reason = "BREAKEVEN_STOP"
-                        else:
-                            sl_candidate_reason = "STOP_LOSS"
-                        sl_candidate_bar = b_time
-
-                    # Chronological intra-replay trailing stop progression (applied for subsequent price action)
+                    # Chronological intra-replay trailing stop progression
                     if fav_r >= self.breakeven_trigger_r:
                         be_p = entry - fee_buffer_per_share
                         running_sl = min(running_sl, be_p) if running_sl else be_p
@@ -616,53 +583,31 @@ class PositionManager:
                         ts_p = best_favourable + self.trailing_giveback_r * r_points
                         running_sl = min(running_sl, ts_p) if running_sl else ts_p
 
-                    # Check Take Profit
-                    if take_profit and l <= take_profit and not tp_candidate_bar:
-                        tp_candidate_price = take_profit
-                        tp_candidate_reason = "TAKE_PROFIT"
-                        tp_candidate_bar = b_time
-                    # Check +2.5R Spike
-                    if fav_r >= Decimal("2.50") and not tp_candidate_bar:
-                        tp_candidate_price = entry - Decimal("2.5") * r_points
-                        tp_candidate_reason = "PROFIT_CAPTURE"
-                        tp_candidate_bar = b_time
+                    # 1. Take Profit hit on this bar
+                    if take_profit and l <= take_profit:
+                        exit_price = take_profit
+                        exit_reason = "TAKE_PROFIT"
+                        exit_bar_time = b_time
+                        break
 
-                # If purely intraday, break on first exit triggered
-                if not is_multi_day and not is_hedge_leg:
-                    if tp_candidate_bar and sl_candidate_bar:
-                        if tp_candidate_bar < sl_candidate_bar:
-                            exit_price = tp_candidate_price
-                            exit_reason = tp_candidate_reason
-                            exit_bar_time = tp_candidate_bar
+                    # 2. +2.5R Spike Profit Capture hit on this bar
+                    if fav_r >= Decimal("2.50"):
+                        exit_price = max(Decimal("0.05"), entry - Decimal("2.5") * r_points)
+                        exit_reason = "PROFIT_CAPTURE"
+                        exit_bar_time = b_time
+                        break
+
+                    # 3. Stop Loss or Trailed Stop hit on this bar
+                    if running_sl and h >= running_sl:
+                        exit_price = running_sl
+                        if running_sl <= entry - self.profit_lock_guaranteed_r * r_points:
+                            exit_reason = "TRAILING_STOP"
+                        elif running_sl <= entry:
+                            exit_reason = "BREAKEVEN_STOP"
                         else:
-                            exit_price = sl_candidate_price
-                            exit_reason = sl_candidate_reason
-                            exit_bar_time = sl_candidate_bar
+                            exit_reason = "STOP_LOSS"
+                        exit_bar_time = b_time
                         break
-                    elif tp_candidate_bar:
-                        exit_price = tp_candidate_price
-                        exit_reason = tp_candidate_reason
-                        exit_bar_time = tp_candidate_bar
-                        break
-                    elif sl_candidate_bar:
-                        exit_price = sl_candidate_price
-                        exit_reason = sl_candidate_reason
-                        exit_bar_time = sl_candidate_bar
-                        break
-
-        # Multi-day / Swing evaluation:
-        if is_multi_day and not is_hedge_leg:
-            if tp_candidate_bar and (not sl_candidate_bar or tp_candidate_bar < sl_candidate_bar):
-                # Favorable exit condition: If trade reached Take Profit or +2.5R before any stop loss, bank the profit!
-                exit_price = tp_candidate_price
-                exit_reason = tp_candidate_reason
-                exit_bar_time = tp_candidate_bar
-            elif sl_candidate_bar:
-                # Trade never reached TP and breached Stop Loss:
-                # Enforce Stop Loss protection at defined protective barrier (e.g. 47.45) to prevent runaway loss
-                exit_price = sl_candidate_price
-                exit_reason = sl_candidate_reason or "STOP_LOSS"
-                exit_bar_time = sl_candidate_bar
 
         persisted_trail_raw = note_dict.get("trailed_stop_price")
         if not exit_reason and not is_hedge_leg:
@@ -759,11 +704,20 @@ class PositionManager:
 
                 if improved:
                     running_sl = trailed_sl
-                    note_dict["trailed_stop_price"] = round(float(trailed_sl), 4)
+                    sl_flt = round(float(trailed_sl), 4)
+                    old_sl_flt = round(float(orig_trailed), 4) if orig_trailed else (round(float(initial_sl), 4) if initial_sl else sl_flt)
+                    note_dict["trailed_stop_price"] = sl_flt
                     note_dict["initial_stop_loss_price"] = round(float(initial_sl), 4) if initial_sl else None
+                    reason_tag = "PROFIT_TRAILING_LOCK" if (trailed_sl > entry if side == "BUY" else trailed_sl < entry) else "TRAILING_STOP_ACTIVE"
+                    note_dict["risk_manager"] = {
+                        "old_sl": old_sl_flt,
+                        "new_sl": sl_flt,
+                        "reasons": [reason_tag],
+                        "latest": round(float(latest_price), 2),
+                    }
                     if self.redis:
                         try:
-                            self.redis.set(f"nivesh:trailed_stop:{pos['id']}", str(round(float(trailed_sl), 4)), ex=86400)
+                            self.redis.set(f"nivesh:trailed_stop:{pos['id']}", str(sl_flt), ex=86400)
                         except Exception:
                             pass
                     try:
@@ -771,22 +725,23 @@ class PositionManager:
                             if raw_note_parse_failed:
                                 compact_note = {
                                     "original_raw_note": raw_note,
-                                    "trailed_stop_price": round(float(trailed_sl), 4),
+                                    "trailed_stop_price": sl_flt,
                                     "initial_stop_loss_price": round(float(initial_sl), 4) if initial_sl else None,
                                     "synthetic_entry": note_dict.get("synthetic_entry"),
                                     "spread_basket_id": spread_basket_id,
                                     "paired_primary_audit_id": paired_primary_audit_id,
+                                    "risk_manager": note_dict["risk_manager"],
                                 }
                                 conn.execute(
-                                    text("UPDATE shadow_execution_audits SET improvement_note = :note WHERE id = :id AND net_pnl IS NULL"),
-                                    {"note": json.dumps(compact_note, default=str), "id": int(pos["id"])}
+                                    text("UPDATE shadow_execution_audits SET stop_loss_price = :sl, improvement_note = :note WHERE id = :id AND net_pnl IS NULL"),
+                                    {"sl": sl_flt, "note": json.dumps(compact_note, default=str), "id": int(pos["id"])}
                                 )
                             else:
                                 conn.execute(
-                                    text("UPDATE shadow_execution_audits SET improvement_note = :note WHERE id = :id AND net_pnl IS NULL"),
-                                    {"note": json.dumps(note_dict, default=str), "id": int(pos["id"])}
+                                    text("UPDATE shadow_execution_audits SET stop_loss_price = :sl, improvement_note = :note WHERE id = :id AND net_pnl IS NULL"),
+                                    {"sl": sl_flt, "note": json.dumps(note_dict, default=str), "id": int(pos["id"])}
                                 )
-                        logger.info(f"PositionManager Trailed SL for #{pos['id']} {pos['symbol']}: {orig_trailed} -> {round(float(trailed_sl), 4)}")
+                        logger.info(f"PositionManager Trailed SL for #{pos['id']} {pos['symbol']}: {orig_trailed} -> {sl_flt}")
                     except Exception as upd_err:
                         logger.warning(f"Could not persist trailed stop for #{pos['id']}: {upd_err}")
 
@@ -890,6 +845,9 @@ class PositionManager:
             "trade_mode": trade_mode,
             "entry_price": float(entry),
             "latest_price": float(latest_price),
+            "stop_loss_price": float(running_sl) if running_sl is not None else (float(initial_sl) if initial_sl else None),
+            "take_profit_price": float(take_profit) if take_profit else None,
+            "holding_days": max(0, (watermark.astimezone(IST).date() - signal_at.astimezone(IST).date()).days) if is_multi_day else 0,
             "unrealized_pnl": round(float(unrealized_pnl), 2),
             "current_r": round(float(current_r), 2),
             "favorable_r": round(float(favorable_r), 2),

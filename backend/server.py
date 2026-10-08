@@ -627,17 +627,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _static(self, path: str):
         relative = "index.html" if path in {"", "/"} else path.lstrip("/")
-        if relative not in {"index.html", "app.js", "styles.css"}:
-            raise APIError(HTTPStatus.NOT_FOUND, "File not found")
-        frontend_target = (ROOT / "frontend" / relative).resolve()
-        target = frontend_target if frontend_target.is_file() else (ROOT / relative).resolve()
-        if ROOT not in target.parents and target != ROOT:
+        frontend_root = (ROOT / "frontend").resolve()
+        target = (frontend_root / relative).resolve()
+        if frontend_root not in target.parents and target != frontend_root:
             raise APIError(HTTPStatus.FORBIDDEN, "Forbidden")
         if not target.is_file():
             raise APIError(HTTPStatus.NOT_FOUND, "File not found")
+        allowed_exts = {".html", ".js", ".css", ".svg", ".png", ".jpg", ".jpeg", ".ico", ".json", ".woff", ".woff2", ".map"}
+        if target.suffix.lower() not in allowed_exts:
+            raise APIError(HTTPStatus.FORBIDDEN, "Forbidden")
         body = target.read_bytes()
         self.send_response(200)
-        self.send_header("Content-Type", mimetypes.guess_type(target.name)[0] or "application/octet-stream")
+        content_type = mimetypes.guess_type(target.name)[0]
+        if target.suffix.lower() == ".js":
+            content_type = "application/javascript; charset=utf-8"
+        self.send_header("Content-Type", content_type or "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache")
         self._security_headers()

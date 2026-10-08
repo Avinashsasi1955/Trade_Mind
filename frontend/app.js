@@ -1,4 +1,20 @@
-window.addEventListener('error',function(e){const d=document.getElementById('content');if(d)d.innerHTML='<div style="padding:40px;color:#d64d4d;font-family:monospace;font-size:12px;white-space:pre-wrap;">JS Error: '+String(e.message)+'\n'+String(e.filename)+':'+e.lineno+':'+e.colno+'</div>';console.error('Global error:',e)});
+import {
+  icon,
+  logo,
+  money,
+  signedMoney,
+  signedPct,
+  escapeHtml,
+  strategyPill,
+} from './modules/utils.js';
+
+window.addEventListener('error', function(e) {
+  const d = document.getElementById('content');
+  if (d && !d.children.length) {
+    d.innerHTML = '<div style="padding:40px;color:#d64d4d;font-family:monospace;font-size:12px;white-space:pre-wrap;">JS Error: ' + String(e.message) + '\n' + String(e.filename) + ':' + e.lineno + ':' + e.colno + '</div>';
+  }
+  console.error('Global error:', e);
+});
 let trades = [
   { time:'11:42:08', symbol:'RELIANCE', name:'Reliance Industries', action:'BUY', qty:12, price:'2,948.20', value:'35,918.40', pnl:'+₹540.00', pct:'+1.53%', up:true, reason:'Volume was 2.4× the 20-day average with a clean breakout above ₹2,930. The agent sized this at 3.5% of capital because sector momentum remains constructive.' },
   { time:'10:18:34', symbol:'TATAMOTORS', name:'Tata Motors', action:'SELL', qty:25, price:'1,024.50', value:'25,612.50', pnl:'+₹862.50', pct:'+3.49%', up:true, reason:'The position reached its first target while RSI crossed 72. The agent booked the full position as auto-sector breadth began to weaken.' },
@@ -79,45 +95,6 @@ const strategies = [
 const titles = {
   dashboard:['Shadow paper desk','Live-feed validation'], positions:['Live exposure','Open positions'], history:['Execution ledger','Trade history'], analysis:['Minute intelligence','AI market analysis'], charts:['Technical workspace','Advanced charts'], universe:['Exchange master','NSE + BSE universe'], backtest:['Research laboratory','Historical backtesting'], mlresearch:['Model laboratory','ML research pipeline'], sentiment:['Market pulse','Sentiment intelligence'], strategies:['Agent intelligence','Strategy library'], tradebot:['Persistent intelligence','AI trade bot'], pattern_memory:['Vector RAG Engine','Pattern Memory & Replay'], sector_flow:['Relative Strength','Sector Flow & Risk Treemap'], execution:['Safety and control','Execution control'], operations:['System reliability','Production monitoring'], settings:['Workspace controls','Settings']
 };
-
-import {
-  icon,
-  logo,
-  money,
-  signedMoney,
-  signedPct,
-  escapeHtml,
-  formatPnlEl,
-  strategyPill,
-  fmtTime,
-  normaliseTags,
-  shadowActionLabel,
-  shadowStrategyNote,
-  shadowRiskManagerNote,
-  shadowRiskCell,
-  shadowQualityCell,
-  shadowSeniorAgentCell,
-  shadowTradeActions,
-  swingLifecycleCell,
-} from './modules/utils.js';
-import {
-  systemNotifications,
-  addSystemNotification,
-  renderNotificationList,
-  handleMetricsTick,
-  applyMarketUpdate,
-} from './modules/metrics.js';
-import {
-  initSSETransport,
-  closeSSETransport,
-  pollAlerts,
-  getSSEStatus,
-} from './modules/sse.js';
-import {
-  shadowTradeRows,
-  showTradeThoughtModal,
-  bindThoughtButtons,
-} from './modules/trade_book.js';
 
 const content = document.getElementById('content');
 let authToken = '';
@@ -493,22 +470,24 @@ function renderReasoningTicker() {
 function dashboard() {
   const s=liveSummary || {starting_capital:1000000};
   const sh=shadowSummary || {};
-  const tradeSummary=todayTradeSummary(shadowTrades,sh);
   const today=sh.today || {};
   const pnl=today.paper_pnl || today.metrics?.paper_pnl || {};
-  const netPnl=Number(tradeSummary.net_marked_pnl ?? pnl.net_marked_pnl ?? 0);
-  const realisedPnl=Number(tradeSummary.realised_pnl ?? pnl.realised_pnl ?? 0);
-  const unrealisedPnl=Number(tradeSummary.unrealised_pnl ?? pnl.unrealised_pnl ?? 0);
+  const tradeSummary=todayTradeSummary(shadowTrades,sh);
+  const allTimeSummary=shadowTrades.summary || sh.summary || {};
+  const totalNetPnl=Number(allTimeSummary.net_marked_pnl ?? tradeSummary.net_marked_pnl ?? pnl.net_marked_pnl ?? 0);
+  const totalRealisedPnl=Number(allTimeSummary.realised_pnl ?? tradeSummary.realised_pnl ?? pnl.realised_pnl ?? 0);
+  const totalUnrealisedPnl=Number(allTimeSummary.unrealised_pnl ?? tradeSummary.unrealised_pnl ?? pnl.unrealised_pnl ?? 0);
+  const netPnl=totalNetPnl;
+  const realisedPnl=totalRealisedPnl;
+  const unrealisedPnl=totalUnrealisedPnl;
   const capital=Number(s.starting_capital||1000000);
-  const paperValue=capital+netPnl;
+  const paperValue=capital+totalNetPnl;
   const completed=Number(sh.effective_completed_sessions||0);
   const target=Number(sh.target||90);
   const remaining=Number(sh.remaining_sessions ?? target);
-  const closedTrades=Number(tradeSummary.closed_trades ?? pnl.closed_trades ?? 0);
-  const openTrades=Number(tradeSummary.open_trades ?? pnl.open_trades ?? 0);
+  const closedTrades=Number(allTimeSummary.closed_trades ?? tradeSummary.closed_trades ?? pnl.closed_trades ?? 0);
+  const openTrades=Number(allTimeSummary.open_trades ?? tradeSummary.open_trades ?? pnl.open_trades ?? 0);
   const sessionLabel=escapeHtml((today.status||'WAITING').replaceAll('_',' '));
-
-  const allTimeSummary=shadowTrades.summary || sh.summary || {};
   const closedAll=Number(allTimeSummary.closed_trades || 0);
   const winRateVal=allTimeSummary.win_rate_pct != null ? Number(allTimeSummary.win_rate_pct) : (tradeSummary.win_rate_pct != null ? Number(tradeSummary.win_rate_pct) : null);
   const pfVal=allTimeSummary.profit_factor != null ? Number(allTimeSummary.profit_factor) : (tradeSummary.profit_factor != null ? Number(tradeSummary.profit_factor) : null);
@@ -833,7 +812,17 @@ function swingLifecycleCell(t) {
   if (!isSwing) {
     return `<div style="min-width:85px;"><span class="mode-pill intraday">INTRADAY</span><small style="display:block;font-size:9px;color:var(--muted);margin-top:2px;">75m · 15:20 flat</small></div>`;
   }
-  const days = Number(t.holding_days || 0);
+  let days = Number(t.holding_days ?? -1);
+  if (days < 0 || (days === 0 && t.signal_at)) {
+    try {
+      const sigDate = new Date(t.signal_at).toISOString().split('T')[0];
+      const todayDate = new Date().toISOString().split('T')[0];
+      const diffMs = new Date(todayDate) - new Date(sigDate);
+      const computed = Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
+      if (computed > 0) days = computed;
+    } catch (_) {}
+  }
+  if (days < 0) days = 0;
   const maxDays = Number(t.max_holding_days || 5);
   const pct = Math.min(100, Math.round(((days + 1) / maxDays) * 100));
   return `<div class="swing-lifecycle-wrap">

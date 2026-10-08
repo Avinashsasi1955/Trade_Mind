@@ -128,7 +128,7 @@ def paper_pnl_summary(engine, session_date: date = None) -> Dict:
             COALESCE(SUM(net_pnl) FILTER(WHERE net_pnl > 0),0) gross_profit,
             ABS(COALESCE(SUM(net_pnl) FILTER(WHERE net_pnl <= 0),0)) gross_loss
             FROM shadow_execution_audits
-            WHERE (signal_at AT TIME ZONE 'Asia/Kolkata')::date=:day"""),{"day":day}).mappings().one()
+            WHERE (COALESCE(exit_at, signal_at) AT TIME ZONE 'Asia/Kolkata')::date=:day"""),{"day":day}).mappings().one()
         open_mark=connection.execute(text("""WITH open_audits AS (
             SELECT a.id,a.instrument_id,a.side,a.quantity,a.theoretical_fill_price,a.estimated_fees,a.signal_at
             FROM shadow_execution_audits a
@@ -136,13 +136,16 @@ def paper_pnl_summary(engine, session_date: date = None) -> Dict:
               AND (a.signal_at AT TIME ZONE 'Asia/Kolkata')::date<=:day
         ), marked AS (
             SELECT a.*,
-                (SELECT b.close_price FROM live_market_bars b
-                 WHERE b.instrument_id=a.instrument_id
-                   AND b.interval IN ('1minute','5minute')
-                   AND b.bar_time>=a.signal_at
-                   AND (b.bar_time AT TIME ZONE 'Asia/Kolkata')::date=:day
-                 ORDER BY b.bar_time DESC, CASE b.interval WHEN '1minute' THEN 0 ELSE 1 END
-                 LIMIT 1) mark_price
+                COALESCE(
+                    (SELECT b.close_price FROM live_market_bars b
+                     WHERE b.instrument_id=a.instrument_id
+                       AND b.interval IN ('1minute','5minute')
+                       AND b.bar_time>=a.signal_at
+                       AND (b.bar_time AT TIME ZONE 'Asia/Kolkata')::date<=:day
+                     ORDER BY b.bar_time DESC, CASE b.interval WHEN '1minute' THEN 0 ELSE 1 END
+                     LIMIT 1),
+                    a.theoretical_fill_price
+                ) mark_price
             FROM open_audits a
         )
         SELECT COUNT(*) open_trades,

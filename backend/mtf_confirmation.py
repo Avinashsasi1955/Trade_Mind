@@ -42,7 +42,8 @@ def evaluate_mtf_confirmation(symbol: str, direction: str = "LONG") -> Dict:
             details["daily_close"] = last_close
             details["daily_ema20"] = round(ema20, 2)
         else:
-            checks["daily_macro"] = True  # Neutral pass if daily history sparse
+            checks["daily_macro"] = False
+            details["daily_status"] = "insufficient_candles"
 
         # 2. 15m Structure Check
         m15_res = chart_data(symbol, "15m")
@@ -56,7 +57,8 @@ def evaluate_mtf_confirmation(symbol: str, direction: str = "LONG") -> Dict:
                 checks["m15_structure"] = True
             details["m15_close"] = last_m15["close"]
         else:
-            checks["m15_structure"] = True
+            checks["m15_structure"] = False
+            details["m15_status"] = "insufficient_candles"
 
         # 3. Micro 5m/1m Trigger Check
         m5_res = chart_data(symbol, "5m")
@@ -71,12 +73,13 @@ def evaluate_mtf_confirmation(symbol: str, direction: str = "LONG") -> Dict:
                 checks["m1_micro_trigger"] = True
             details["m5_volume_expansion"] = vol_expansion
         else:
-            checks["m1_micro_trigger"] = True
+            checks["m1_micro_trigger"] = False
+            details["m5_status"] = "insufficient_candles"
 
     except Exception as exc:
         logger.warning(f"MTF evaluation error for {symbol}: {exc}")
-        # Default fail-safe
-        checks = {"daily_macro": True, "m15_structure": True, "m1_micro_trigger": True}
+        checks = {"daily_macro": False, "m15_structure": False, "m1_micro_trigger": False}
+        details["error"] = str(exc)
 
     score = sum(33.33 for passed in checks.values() if passed)
     confirmed = score >= 66.0  # At least 2 of 3 timeframes fully aligned
@@ -88,5 +91,5 @@ def evaluate_mtf_confirmation(symbol: str, direction: str = "LONG") -> Dict:
         "mtf_score": round(score, 1),
         "checks": checks,
         "details": details,
-        "verdict": "TRIPLE_CONFIRMED" if score > 90 else "CONFIRMED" if confirmed else "UNCONFIRMED_MTF_CONFLICT"
+        "verdict": "TRIPLE_CONFIRMED" if score > 90 else "CONFIRMED" if confirmed else "UNCONFIRMED_MTF_CONFLICT" if any(details.get(k) == "insufficient_candles" for k in ["daily_status", "m15_status", "m5_status"]) or "error" in details else "FAILED_MTF_ALIGNMENT"
     }

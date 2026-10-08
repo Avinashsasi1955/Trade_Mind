@@ -265,7 +265,17 @@ export function swingLifecycleCell(t) {
   if (!isSwing) {
     return `<div style="min-width:85px;"><span class="mode-pill intraday">INTRADAY</span><small style="display:block;font-size:9px;color:var(--muted);margin-top:2px;">75m · 15:20 flat</small></div>`;
   }
-  const days = Number(t.holding_days || 0);
+  let days = Number(t.holding_days ?? -1);
+  if (days < 0 || (days === 0 && t.signal_at)) {
+    try {
+      const sigDate = new Date(t.signal_at).toISOString().split('T')[0];
+      const todayDate = new Date().toISOString().split('T')[0];
+      const diffMs = new Date(todayDate) - new Date(sigDate);
+      const computed = Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
+      if (computed > 0) days = computed;
+    } catch (_) {}
+  }
+  if (days < 0) days = 0;
   const maxDays = Number(t.max_holding_days || 5);
   const pct = Math.min(100, Math.round(((days + 1) / maxDays) * 100));
   return `<div class="swing-lifecycle-wrap">
