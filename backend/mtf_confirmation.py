@@ -45,20 +45,22 @@ def evaluate_mtf_confirmation(symbol: str, direction: str = "LONG") -> Dict:
             checks["daily_macro"] = False
             details["daily_status"] = "insufficient_candles"
 
-        # 2. 15m Structure Check
+        # 2. 15m Structure Check (BOS/CHoCH & Swing Structure via _structure_analysis)
         m15_res = chart_data(symbol, "15m")
         m15_candles = m15_res.get("candles", [])
-        if len(m15_candles) >= 5:
-            last_m15 = m15_candles[-1]
-            prev_m15 = m15_candles[-2]
-            if direction == "LONG" and last_m15["close"] >= prev_m15["low"]:
+        from .strategies.chart_gate import _structure_analysis
+        struct = _structure_analysis(m15_candles)
+        if struct.get("accepted"):
+            struct_dir = struct.get("direction", 0)
+            if direction == "LONG" and struct_dir > 0:
                 checks["m15_structure"] = True
-            elif direction == "SHORT" and last_m15["close"] <= prev_m15["high"]:
+            elif direction == "SHORT" and struct_dir < 0:
                 checks["m15_structure"] = True
-            details["m15_close"] = last_m15["close"]
+            details["m15_structure"] = struct.get("bias", "neutral")
+            details["m15_reason"] = struct.get("reason", "")
         else:
             checks["m15_structure"] = False
-            details["m15_status"] = "insufficient_candles"
+            details["m15_status"] = struct.get("reason", "insufficient_structure_candles")
 
         # 3. Micro 5m/1m Trigger Check
         m5_res = chart_data(symbol, "5m")

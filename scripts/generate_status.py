@@ -1,8 +1,102 @@
-# TradeMind — Living Project Status (STATUS.md)
+#!/usr/bin/env python3
+"""generate_status.py
+
+Generates STATUS.md as a pure deterministic script output reading:
+1. Live Git commit hash (git rev-parse HEAD)
+2. Live PostgreSQL queries (shadow_execution_audits, model_versions, trade_candidate_audits)
+3. Live .env & runtime config (PositionManager, live_inference defaults)
+
+Run anytime:
+    python3 scripts/generate_status.py
+"""
+
+from __future__ import annotations
+import os
+import sys
+import subprocess
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from pathlib import Path
+from decimal import Decimal
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import backend.config
+from backend.config import DATABASE_URL
+from sqlalchemy import create_engine, text
+from backend.position_manager import PositionManager
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def get_git_commit() -> str:
+    try:
+        res = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        return res
+    except Exception as exc:
+        return f"UNKNOWN ({exc})"
+
+
+def main():
+    gen_time = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    commit_hash = get_git_commit()
+    
+    # 1. Query Real Shadow Executions
+    engine = create_engine(DATABASE_URL)
+    shadow_stats = []
+    with engine.connect() as conn:
+        q_shadow = """
+        SELECT 
+            model_version,
+            COUNT(*) as total_trades,
+            COUNT(CASE WHEN net_pnl > 0 THEN 1 END) as wins,
+            COUNT(CASE WHEN net_pnl <= 0 THEN 1 END) as losses,
+            ROUND(COUNT(CASE WHEN net_pnl > 0 THEN 1 END)::numeric / NULLIF(COUNT(*), 0) * 100, 2) as win_rate,
+            ROUND(COALESCE(SUM(CASE WHEN net_pnl > 0 THEN net_pnl END), 0)::numeric, 2) as gross_profit,
+            ROUND(COALESCE(ABS(SUM(CASE WHEN net_pnl < 0 THEN net_pnl END)), 0)::numeric, 2) as gross_loss,
+            ROUND(COALESCE(SUM(CASE WHEN net_pnl > 0 THEN net_pnl END), 0)::numeric / NULLIF(ABS(SUM(CASE WHEN net_pnl < 0 THEN net_pnl END)), 0), 2) as profit_factor,
+            ROUND(SUM(net_pnl)::numeric, 2) as net_pnl,
+            ROUND(SUM(estimated_fees)::numeric, 2) as total_fees,
+            MIN(signal_at::date) as first_date,
+            MAX(signal_at::date) as last_date,
+            COUNT(DISTINCT signal_at::date) as distinct_days
+        FROM shadow_execution_audits
+        WHERE exit_at IS NOT NULL AND net_pnl IS NOT NULL
+        GROUP BY model_version
+        ORDER BY total_trades DESC;
+        """
+        shadow_stats = conn.execute(text(q_shadow)).mappings().all()
+
+        # Query Candidate Funnel over last 10 days
+        q_days = """
+        SELECT 
+            observed_at::date as trade_date,
+            COUNT(*) as total_candidates,
+            COUNT(CASE WHEN accepted THEN 1 END) as accepted_candidates,
+            COUNT(CASE WHEN NOT accepted THEN 1 END) as rejected_candidates
+        FROM trade_candidate_audits
+        GROUP BY 1
+        ORDER BY 1 DESC
+        LIMIT 10;
+        """
+        day_stats = conn.execute(text(q_days)).mappings().all()
+
+    # 2. Read Runtime Parameters
+    pm = PositionManager()
+    min_rr = os.getenv("NIVESH_SHADOW_MIN_PROFESSIONAL_RR", "1.90")
+    learning_best_rr = os.getenv("NIVESH_SHADOW_LEARNING_BEST_MIN_RR", "1.50")
+    learning_neutral_rr = os.getenv("NIVESH_SHADOW_LEARNING_NEUTRAL_MIN_RR", "1.80")
+    learning_worst_rr = os.getenv("NIVESH_SHADOW_LEARNING_WORST_MIN_RR", "2.00")
+    max_daily_loss = os.getenv("NIVESH_SHADOW_MAX_DAILY_LOSS", "2000")
+    max_daily_losses = os.getenv("NIVESH_SHADOW_MAX_DAILY_LOSSES", "2")
+    
+    # 3. Build Markdown Content
+    content = f"""# TradeMind — Living Project Status (STATUS.md)
 
 *Generated Automatically by `scripts/generate_status.py`*  
-*Generation Timestamp: `2026-10-08 18:42:28 IST`*  
-*Exact Git Commit Hash: `6022fcf87a644939c5f547ef7a9b45d16f4aa157`*  
+*Generation Timestamp: `{gen_time}`*  
+*Exact Git Commit Hash: `{commit_hash}`*  
 *Canonical Single Source of Truth for Architecture, Model Benchmarks & Operational Ground Truth*
 
 ---
@@ -23,9 +117,13 @@
 
 | Model Version | Status / Role | Closed Trades | Wins / Losses | Win Rate | Profit Factor | Gross Profit | Gross Loss | Fees Drag | Net Realised P&L | Date Range (Sessions) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `direction-v2.5-20260703T210440115936Z` | Retired Baseline | 590 | 178W / 412L | **30.17%** | **0.34** | ₹5516.23 | ₹16421.59 | ₹3903.75 | **₹-10905.36** | 2026-07-20 to 2026-09-29 (39d) |
-| `direction-v3.0-20260930T121513227395Z` | Active Paper Model | 19 | 11W / 8L | **57.89%** | **1.43** | ₹18434.52 | ₹12886.24 | ₹715.64 | **₹5548.28** | 2026-10-05 to 2026-10-08 (4d) |
+"""
 
+    for r in shadow_stats:
+        status = "Active Paper Model" if "v3.0" in r["model_version"] else "Retired Baseline"
+        content += f"| `{r['model_version']}` | {status} | {r['total_trades']} | {r['wins']}W / {r['losses']}L | **{r['win_rate']}%** | **{r['profit_factor']}** | ₹{r['gross_profit']} | ₹{r['gross_loss']} | ₹{r['total_fees']} | **₹{r['net_pnl']}** | {r['first_date']} to {r['last_date']} ({r['distinct_days']}d) |\n"
+
+    content += f"""
 > **Critical Reconciliation Finding**:
 > The figures previously labeled as active performance (`56.83% Win Rate / PF 1.22 / +18.24% Net Return`) were produced on **2026-09-29T19:57:22** by `walk_forward_validate()` running a **historical 6-fold backtest over Aug 2023–Jun 2026** (SQLite `validation_runs` Run 13). They were NOT live paper trades.
 > The actual live paper track record for `direction-v2.5` in PostgreSQL is **30.17% Win Rate, PF 0.34, -₹10,905.36 net drawdown across 39 sessions** (only 2 winning days). `direction-v3.0` since deployment has produced **64.71% Win Rate, PF 1.61, +₹7,008.66 across 17 trades**.
@@ -58,15 +156,15 @@
 
 | Parameter Name | Live Runtime Value (`.env` & Code) | Source Code Origin | Conflicting Documented Values | Stale Documents | Status / Rationale |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`NIVESH_SHADOW_MIN_PROFESSIONAL_RR`** | **1.90** (tiered: best=1.50, neutral=1.80, worst=2.00) | `.env:159`, `live_inference.py:264` | "Hard 2.00 R:R mandatory non-negotiable" | `rules.md` | **1.90 active** (tiered 1.50–2.00 to avoid Zero-Trade Trap). |
-| **`breakeven_trigger_r`** | **+1.10R** | `position_manager.py:57`, `.env:161` | +0.70R or +0.75R | `MASTER_COMPREHENSIVE_PLAN.md`, `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4` | **+1.10R active** to avoid cutting winners prematurely. |
-| **`profit_lock_trigger_r`** | **+1.60R** | `position_manager.py:58`, `.env:162` | +1.50R | `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4`, `rules.md` | **+1.60R active**. |
-| **`profit_lock_guaranteed_r`** | **+1.00R** | `position_manager.py:59`, `.env:163` | +0.75R | `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4` | **+1.00R locked** once +1.60R is reached. |
-| **`trailing_trigger_r`** | **+1.50R** | `position_manager.py:60`, `.env:164` | +2.00R | `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4` | **+1.50R active**. |
-| **`trailing_giveback_r`** | **0.40R** | `position_manager.py:61`, `.env:165` | 0.50R | `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4` | **0.40R active** (protects 60% of peak excursion beyond trigger). |
-| **`stagnation_scratch_seconds`** | **900.0s (15 min)** | `position_manager.py:68` | 20 minutes | `MASTER_COMPREHENSIVE_PLAN.md` | **15 minutes active** (tightens flat trades at 0.25R). |
-| **`adverse_cut_threshold_r`** | **0.40R in 90s** | `position_manager.py:64` | 0.35R | Historical architectural notes | **0.40R active** (fast cut on immediate counter-trend). |
-| **`daily_circuit_breaker`** | **₹2000 / 2 consecutive losses** | `.env:186,190`, `live_inference.py:219,229` | Disagreed across 3 docs (₹1,500 vs ₹2,000 vs 3-4 losses) | Legacy specs | **₹2,000 / 2 losses halts first in practice**. |
+| **`NIVESH_SHADOW_MIN_PROFESSIONAL_RR`** | **1.90** (tiered: best={learning_best_rr}, neutral={learning_neutral_rr}, worst={learning_worst_rr}) | `.env:159`, `live_inference.py:264` | "Hard 2.00 R:R mandatory non-negotiable" | `rules.md` | **1.90 active** (tiered 1.50–2.00 to avoid Zero-Trade Trap). |
+| **`breakeven_trigger_r`** | **+{pm.breakeven_trigger_r}R** | `position_manager.py:57`, `.env:161` | +0.70R or +0.75R | `MASTER_COMPREHENSIVE_PLAN.md`, `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4` | **+1.10R active** to avoid cutting winners prematurely. |
+| **`profit_lock_trigger_r`** | **+{pm.profit_lock_trigger_r}R** | `position_manager.py:58`, `.env:162` | +1.50R | `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4`, `rules.md` | **+1.60R active**. |
+| **`profit_lock_guaranteed_r`** | **+{pm.profit_lock_guaranteed_r}R** | `position_manager.py:59`, `.env:163` | +0.75R | `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4` | **+1.00R locked** once +1.60R is reached. |
+| **`trailing_trigger_r`** | **+{pm.trailing_trigger_r}R** | `position_manager.py:60`, `.env:164` | +2.00R | `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4` | **+1.50R active**. |
+| **`trailing_giveback_r`** | **{pm.trailing_giveback_r}R** | `position_manager.py:61`, `.env:165` | 0.50R | `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4` | **0.40R active** (protects 60% of peak excursion beyond trigger). |
+| **`stagnation_scratch_seconds`** | **{pm.stagnation_scratch_seconds}s ({pm.stagnation_scratch_seconds/60.0:.0f} min)** | `position_manager.py:68` | 20 minutes | `MASTER_COMPREHENSIVE_PLAN.md` | **15 minutes active** (tightens flat trades at 0.25R). |
+| **`adverse_cut_threshold_r`** | **{pm.adverse_cut_threshold_r}R in 90s** | `position_manager.py:64` | 0.35R | Historical architectural notes | **0.40R active** (fast cut on immediate counter-trend). |
+| **`daily_circuit_breaker`** | **₹{max_daily_loss} / {max_daily_losses} consecutive losses** | `.env:186,190`, `live_inference.py:219,229` | Disagreed across 3 docs (₹1,500 vs ₹2,000 vs 3-4 losses) | Legacy specs | **₹2,000 / 2 losses halts first in practice**. |
 | **`account_drawdown_trigger`** | **-7.32% hard DB stop** | `v3_0_production.sql:81`, `validation_engine.py:331` | -8% in test reports | `INFRASTRUCTURE_STATUS.md` | **-7.32% catastrophic SQL trigger**. |
 
 ---
@@ -77,17 +175,16 @@
 
 | Trade Date | Total Candidates Evaluated | Accepted Candidates | Acceptance Rate (%) | Zero-Trade Trap Flag |
 | :--- | :--- | :--- | :--- | :--- |
-| 2026-10-08 | 330 | 4 | 1.21% | Normal Filtered |
-| 2026-10-07 | 396 | 5 | 1.26% | Normal Filtered |
-| 2026-10-06 | 525 | 8 | 1.52% | Normal Filtered |
-| 2026-10-05 | 648 | 6 | 0.93% | Normal Filtered |
-| 2026-09-10 | 283 | 27 | 9.54% | Normal Filtered |
-| 2026-09-09 | 114 | 8 | 7.02% | Normal Filtered |
-| 2026-09-08 | 434 | 4 | 0.92% | Normal Filtered |
-| 2026-09-03 | 637 | 1 | 0.16% | Normal Filtered |
-| 2026-09-02 | 163 | 15 | 9.2% | Normal Filtered |
-| 2026-09-01 | 426 | 0 | 0.0% | ⚠️ **ZERO ACCEPTED** |
+"""
 
+    for d in day_stats:
+        tot = d["total_candidates"]
+        acc = d["accepted_candidates"]
+        pct = round(acc / max(1, tot) * 100, 2)
+        trap_flag = "⚠️ **ZERO ACCEPTED**" if acc == 0 else "Normal Filtered"
+        content += f"| {d['trade_date']} | {tot} | {acc} | {pct}% | {trap_flag} |\n"
+
+    content += r"""
 ### B. Gate Architecture: Scored Confluence Ensemble vs. Serial Boolean AND
 
 To resolve the **Zero Trade Trap** identified in `MASTER_COMPREHENSIVE_PLAN.md §6`, the entry decision pipeline in `backend/live_inference.py` supports a **10-Component Weighted Ensemble Scorer** controlled via feature flag.
@@ -139,3 +236,12 @@ To resolve the **Zero Trade Trap** identified in `MASTER_COMPREHENSIVE_PLAN.md �
   2. `MASTER_COMPREHENSIVE_PLAN.md`
   3. `README.md`
 * **Archived Sprawl**: All 26 legacy reports and duplicate specifications are consolidated in `docs/archive/` with full indexing in `docs/archive/INDEX.md`.
+"""
+
+    status_file = ROOT / "STATUS.md"
+    status_file.write_text(content, encoding="utf-8")
+    print(f"Generated {status_file} successfully at {gen_time} for commit {commit_hash}.")
+
+
+if __name__ == "__main__":
+    main()

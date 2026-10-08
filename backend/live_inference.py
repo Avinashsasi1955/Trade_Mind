@@ -328,6 +328,8 @@ class LivePaperInference:
         self.morning_min_bars=max(12,int(os.getenv("NIVESH_SHADOW_MORNING_MIN_BARS","18")))
         self.morning_stop_widen_factor=Decimal(os.getenv("NIVESH_SHADOW_MORNING_STOP_WIDEN","1.5"))
         self.min_profit_to_fee_ratio=Decimal(os.getenv("NIVESH_SHADOW_MIN_PROFIT_FEE_RATIO","2.5"))
+        self.use_weighted_ensemble=os.getenv("NIVESH_SHADOW_USE_WEIGHTED_ENSEMBLE","0")=="1"
+        self.weighted_ensemble_min_score=float(os.getenv("NIVESH_SHADOW_WEIGHTED_ENSEMBLE_MIN_SCORE","75.0"))
         self.max_directional_concentration=Decimal(os.getenv("NIVESH_SHADOW_MAX_DIRECTIONAL_CONCENTRATION","0.70"))
 
     def _is_force_flat_time(self,watermark: datetime) -> bool:
@@ -2292,6 +2294,155 @@ class LivePaperInference:
         except Exception as exc:
             return {"inserted":0,"error":type(exc).__name__}
 
+    def _calculate_weighted_ensemble_score(
+        self,
+        item: Dict,
+        target: Dict,
+        chart: Dict,
+        policy: Any,
+        thresholds: Dict,
+        consistency: Dict,
+        nifty_trend: int,
+        stock_alpha: bool,
+    ) -> Tuple[float, Dict[str, Dict]]:
+        """Calculate 10-component weighted ensemble score (0-100 pts) matching MASTER_COMPREHENSIVE_PLAN.md §6.
+        
+        Hard risk/safety gates (execution_route, portfolio limits, directional balance, sector caps,
+        option risk ceilings, morning cooloff) are evaluated separately as mandatory vetoes.
+        """
+        breakdown = {}
+        cg_reason = str(chart.get("reason", "") or "")
+        
+        # 1. Chart Gate Quality (15 pts) - Core chart pattern formation & confirmation
+        cg_accepted = bool(chart.get("accepted"))
+        cg_quality = float(chart.get("quality", 0) or 0)
+        if cg_accepted:
+            s_chart = 15.0
+        elif "less than 6 completed 5m" in cg_reason or "no instrument-local" in cg_reason:
+            s_chart = 0.0
+        elif cg_quality > 0:
+            s_chart = min(15.0, round(cg_quality * 0.15, 2))
+        else:
+            s_chart = 5.0
+        breakdown["chart_gate_quality"] = {
+            "score": s_chart, "max": 15.0, "pass": cg_accepted,
+            "reason": "full confirmation" if cg_accepted else cg_reason
+        }
+
+        # 2. Risk:Reward Margin (15 pts) - Mathematical expectancy
+        risk_levels = self._risk_levels_for_target(item, target)
+        effective_rr = float(risk_levels.get("rr") if risk_levels.get("rr") is not None else (chart.get("rr") or 0))
+        target_rr = float(thresholds.get("min_rr", 1.90))
+        if effective_rr >= target_rr:
+            s_rr = 15.0
+        elif effective_rr >= 1.20:
+            s_rr = round(15.0 * (effective_rr - 1.20) / max(0.1, target_rr - 1.20), 2)
+        else:
+            s_rr = 0.0
+        breakdown["risk_reward_margin"] = {
+            "score": s_rr, "max": 15.0, "pass": effective_rr >= target_rr,
+            "value": round(effective_rr, 2), "target": round(target_rr, 2)
+        }
+
+        # 3. Expected Net Edge Margin (15 pts) - Statistical edge net of costs
+        policy_edge = float(getattr(policy, "expected_net_edge_bps", 0) or 0) if policy else float(item.get("expected_net_edge_bps", 0) or 0)
+        target_edge = float(thresholds.get("min_edge_bps", 25.0))
+        if policy_edge >= target_edge:
+            s_edge = 15.0
+        elif policy_edge > 0:
+            s_edge = round(15.0 * policy_edge / max(1.0, target_edge), 2)
+        else:
+            s_edge = 0.0
+        breakdown["net_edge_margin"] = {
+            "score": s_edge, "max": 15.0, "pass": policy_edge >= target_edge,
+            "value": round(policy_edge, 1), "target": round(target_edge, 1)
+        }
+
+        # 4. Multi-Timeframe (MTF) Alignment (15 pts) - Higher timeframe confluence
+        mtf = consistency.get("multi_timeframe") or {}
+        aligned_frames = int(mtf.get("aligned_frames", 0) or 0)
+        ready_frames = int(mtf.get("ready_frames", 0) or 0)
+        mtf_reason = str(consistency.get("reason", "") or "")
+        if "multi-timeframe" in mtf_reason or "timeframe" in mtf_reason:
+            s_mtf = 5.0 if "1 timeframe" in mtf_reason else 0.0
+        elif aligned_frames >= 3:
+            s_mtf = 15.0
+        elif aligned_frames == 2:
+            s_mtf = 10.0
+        elif aligned_frames == 1:
+            s_mtf = 5.0
+        else:
+            s_mtf = 10.0 if not mtf.get("strong_conflict") else 0.0
+        breakdown["mtf_alignment"] = {
+            "score": s_mtf, "max": 15.0, "pass": s_mtf >= 10.0,
+            "aligned_frames": aligned_frames, "ready_frames": ready_frames
+        }
+
+        # 5. Nifty Index Trend (10 pts) - Market beta alignment
+        tgt_side = str(target.get("side", "")).upper()
+        tgt_kind = str(target.get("kind", "")).upper()
+        is_derivative = tgt_kind in {"CE", "PE", "FUT"}
+        if is_derivative:
+            underlying_dir = -1 if (tgt_kind == "PE" and tgt_side == "BUY") or (tgt_kind == "CE" and tgt_side == "SELL") else 1
+        else:
+            underlying_dir = 1 if tgt_side == "BUY" else -1
+            
+        if nifty_trend == underlying_dir:
+            s_nifty = 10.0
+        elif nifty_trend == 0:
+            s_nifty = 7.0
+        elif stock_alpha:
+            s_nifty = 5.0
+        else:
+            s_nifty = 0.0
+        breakdown["nifty_index_trend"] = {
+            "score": s_nifty, "max": 10.0, "pass": s_nifty >= 5.0,
+            "nifty_trend": nifty_trend, "trade_dir": underlying_dir, "stock_alpha": stock_alpha
+        }
+
+        # 6. VWAP Overextension Filter (10 pts) - Mean reversion risk
+        is_vwap_overextended = "overextended" in cg_reason or "VWAP" in cg_reason
+        s_vwap = 0.0 if is_vwap_overextended else 10.0
+        breakdown["vwap_overextension"] = {
+            "score": s_vwap, "max": 10.0, "pass": not is_vwap_overextended,
+            "reason": cg_reason if is_vwap_overextended else "within normal volatility band"
+        }
+
+        # 7. ASI Divergence / Trap (5 pts) - Breakout vs liquidity sweep
+        is_asi_trap = "ASI" in cg_reason or "trap" in cg_reason.lower()
+        s_asi = 0.0 if is_asi_trap else 5.0
+        breakdown["asi_divergence"] = {
+            "score": s_asi, "max": 5.0, "pass": not is_asi_trap,
+            "reason": cg_reason if is_asi_trap else "no sweep trap"
+        }
+
+        # 8. Wyckoff RVOL Volume Spread (5 pts) - Volume expansion
+        is_wyckoff_div = "Wyckoff" in cg_reason or "RVOL" in cg_reason
+        s_rvol = 0.0 if is_wyckoff_div else 5.0
+        breakdown["wyckoff_rvol"] = {
+            "score": s_rvol, "max": 5.0, "pass": not is_wyckoff_div,
+            "reason": cg_reason if is_wyckoff_div else "volume confirms spread"
+        }
+
+        # 9. Volume Profile Value Area (5 pts) - VAH / VAL location
+        is_vp_exhaustion = "Volume Profile" in cg_reason or "VAH" in cg_reason or "VAL" in cg_reason
+        s_vp = 0.0 if is_vp_exhaustion else 5.0
+        breakdown["volume_profile_value_area"] = {
+            "score": s_vp, "max": 5.0, "pass": not is_vp_exhaustion,
+            "reason": cg_reason if is_vp_exhaustion else "favourable value area location"
+        }
+
+        # 10. ADX Chop Filter (5 pts) - Trending vs consolidation
+        is_choppy = "ADX" in cg_reason or "choppy" in cg_reason
+        s_adx = 0.0 if is_choppy else 5.0
+        breakdown["adx_chop"] = {
+            "score": s_adx, "max": 5.0, "pass": not is_choppy,
+            "reason": cg_reason if is_choppy else "trending market environment"
+        }
+
+        total_score = round(s_chart + s_rr + s_edge + s_mtf + s_nifty + s_vwap + s_asi + s_rvol + s_vp + s_adx, 2)
+        return total_score, breakdown
+
     def _select_top_trade_candidates(self,created: List[Dict],open_state: Dict,risk_state: Dict,
                                      available_slots: int,watermark: datetime,model_version: str = "",
                                      session_case: Optional[Dict] = None) -> Dict:
@@ -2374,14 +2525,19 @@ class LivePaperInference:
                     "freshness":item.get("_freshness_gate") or {},
                     "session_case":session_case or {},
                     "effective_thresholds":thresholds or {},
+                    "weighted_ensemble":item.get("_weighted_ensemble") or {},
                     "open_state":{"open_count":open_state.get("count",0)},
                     "risk_state":{"blocked":risk_state.get("blocked"),"reasons":risk_state.get("reasons",[])},
                 },default=str),
             })
         for item in created:
             chart=item.get("chart_gate") or {}
-            if not chart.get("accepted"):
+            if not self.use_weighted_ensemble and not chart.get("accepted"):
                 rejected+=1; reject_reasons["chart_gate_rejected"]+=1; audit(item,"chart_gate",False,"chart_gate_rejected"); continue
+            elif self.use_weighted_ensemble and not chart.get("accepted"):
+                cg_r = str(chart.get("reason", "") or "")
+                if "less than 6 completed 5m" in cg_r or "no instrument-local" in cg_r:
+                    rejected+=1; reject_reasons["chart_gate_rejected"]+=1; audit(item,"chart_gate",False,"insufficient_live_candles"); continue
             if not item.get("signal"):
                 if not self.learning_mode_enabled:
                     rejected+=1; reject_reasons["no_model_signal"]+=1; audit(item,"model_signal",False,"no_model_signal"); continue
@@ -2473,11 +2629,7 @@ class LivePaperInference:
             effective_rr = float(risk_levels.get("rr") if risk_levels.get("rr") is not None else (chart.get("rr") or 0))
             if risk_levels.get("rr") is not None and "rr" in chart:
                 chart["rr"] = risk_levels["rr"]
-            if effective_rr < float(thresholds["min_rr"]):
-                rejected+=1; reject_reasons["rr_below_effective_minimum"]+=1; audit(item,"risk_reward",False,"rr_below_effective_minimum",thresholds=thresholds); continue
 
-            # Nifty 50 Macro Directional Veto: Never buy stocks during market pullbacks or short into rallies
-            # unless the stock exhibits strong alpha / relative strength or is evaluated as a swing setup
             tgt_side = str(target.get("side", "")).upper()
             tgt_kind = str(target.get("kind", "")).upper()
             is_derivative = tgt_kind in {"CE", "PE", "FUT"}
@@ -2486,6 +2638,7 @@ class LivePaperInference:
             else:
                 underlying_dir = 1 if tgt_side == "BUY" else -1
 
+            stock_alpha = False
             if item.get("instrument_type") == "EQ" and not is_derivative:
                 pre_quality = self._candidate_quality(item, target, self._target_quantity(target, "A"))
                 stock_alpha = bool(
@@ -2493,22 +2646,11 @@ class LivePaperInference:
                     (item.get("policy_candidate") and getattr(item.get("policy_candidate"), "score", 0) >= 0.75) or
                     (float((pre_quality or {}).get("score") or 0.0) >= 78.0)
                 )
-                if not stock_alpha:
-                    if nifty_trend == -1 and underlying_dir == 1:
-                        rejected += 1; reject_reasons["nifty_macro_downtrend_veto"] += 1
-                        audit(item, "macro_index_gate", False, "stock BUY rejected: Nifty 50 5m is in downtrend (EMA9 < EMA21)", target=target, thresholds=thresholds)
-                        continue
-                    elif nifty_trend == 1 and underlying_dir == -1:
-                        rejected += 1; reject_reasons["nifty_macro_uptrend_veto"] += 1
-                        audit(item, "macro_index_gate", False, "stock SHORT rejected: Nifty 50 5m is in uptrend (EMA9 > EMA21)", target=target, thresholds=thresholds)
-                        continue
 
-            consistency=self._strategy_consistency_gate(item,target,session_case)
-            if not consistency.get("accepted"):
-                rejected+=1; reject_reasons["strategy_consistency_rejected"]+=1
-                audit(item,"strategy_consistency",False,consistency.get("reason","strategy_consistency_rejected"),target=target,thresholds=thresholds,consistency=consistency)
-                continue
-            item["_strategy_consistency"]=consistency
+            consistency = self._strategy_consistency_gate(item, target, session_case)
+            item["_strategy_consistency"] = consistency
+
+            # HARD VETO: Directional Balance Cap
             total_session = int(risk_state.get("closed_trades", 0)) + int(open_state.get("count", 0))
             if total_session >= 5:
                 strat_dir = int(consistency.get("strategy_direction", 0) or 0)
@@ -2521,9 +2663,10 @@ class LivePaperInference:
                     audit(item, "directional_balance", False, f"{dir_label} concentration would exceed {self.max_directional_concentration}", target=target)
                     continue
 
-            sector=sector_for_symbol(item.get("symbol"), item.get("instrument_type"))
-            if sector_counts[sector]>=self.max_open_per_sector:
-                rejected+=1; reject_reasons["sector_exposure_limit"]+=1; audit(item,"sector_limits",False,"sector_exposure_limit",target=target,sector=sector); continue
+            # HARD VETO: Sector limits and cooldowns
+            sector = sector_for_symbol(item.get("symbol"), item.get("instrument_type"))
+            if sector_counts[sector] >= self.max_open_per_sector:
+                rejected += 1; reject_reasons["sector_exposure_limit"] += 1; audit(item, "sector_limits", False, "sector_exposure_limit", target=target, sector=sector); continue
             open_sector_dirs = open_state.get("sector_directions", {})
             if sector in open_sector_dirs:
                 strat_dir = int(consistency.get("strategy_direction", 0) or 0)
@@ -2532,90 +2675,172 @@ class LivePaperInference:
                     audit(item, "sector_correlation", False, f"sector {sector} already has opposite direction open", target=target, sector=sector)
                     continue
             if sector in risk_state.get("cooldown_sectors", set()):
-                rejected+=1; reject_reasons["sector_cooldown_active"]+=1
-                audit(item,"sector_limits",False,f"sector {sector} in cooldown after repeated intraday losses",target=target,sector=sector)
+                rejected += 1; reject_reasons["sector_cooldown_active"] += 1
+                audit(item, "sector_limits", False, f"sector {sector} in cooldown after repeated intraday losses", target=target, sector=sector)
                 continue
-            sentiment=self._sentiment_gate(item,target)
-            if not sentiment.get("accepted") and not is_fast_path:
-                rejected+=1; reject_reasons["sentiment_gate_rejected"]+=1; audit(item,"sentiment_gate",False,"sentiment_gate_rejected",target=target,sentiment=sentiment,sector=sector); continue
-            market_quality=self._market_quality_gate(item,target)
-            if not market_quality.get("accepted") and not is_fast_path:
-                rejected+=1; reject_reasons["market_quality_rejected"]+=1; audit(item,"market_quality",False,"market_quality_rejected",target=target,market_quality=market_quality,sentiment=sentiment,sector=sector); continue
-            if self.require_depth_for_entries and not market_quality.get("depth_available") and not is_fast_path:
-                rejected+=1; reject_reasons["depth_required_no_fallback_fill"]+=1; audit(item,"market_depth",False,"depth_required_no_fallback_fill",target=target,market_quality=market_quality,sentiment=sentiment,sector=sector); continue
 
-            policy_edge = float(getattr(policy,"expected_net_edge_bps",0) or 0)
-            if policy and policy_edge < float(thresholds["min_edge_bps"]):
-                rejected+=1; reject_reasons["net_edge_below_effective_minimum"]+=1
-                audit(item,"net_edge",False,"net_edge_below_effective_minimum",target=target,market_quality=market_quality,sentiment=sentiment,sector=sector,thresholds=thresholds)
-                continue
-            quantity=self._target_quantity(target,"A")
-            tgt_price = float(target.get("price") or 0)
-            tp_price = float(self._risk_levels_for_target(item, target).get("take_profit") or 0)
-            if tgt_price > 0 and tp_price > 0 and quantity > 0:
-                try:
-                    seg = "OPTIONS" if str(target.get("kind")) in {"CE", "PE"} else "EQUITY_INTRADAY"
-                    side_str = str(target.get("side", "BUY")).upper()
-                    opp_side = "SELL" if side_str == "BUY" else "BUY"
-                    c_entry = estimate_zerodha_costs(seg, side_str, Decimal(str(tgt_price)), quantity).total
-                    c_exit = estimate_zerodha_costs(seg, opp_side, Decimal(str(tp_price)), quantity).total
-                    est_fees = float(c_entry + c_exit)
-                    exp_profit = abs(tp_price - tgt_price) * quantity
-                    net_profit = exp_profit - est_fees
-                    if est_fees > 0 and (exp_profit < est_fees * float(self.min_profit_to_fee_ratio) or net_profit < 10.0):
-                        rejected += 1; reject_reasons["fee_ratio_too_low"] += 1
-                        audit(item, "fee_gate", False, f"expected net profit {net_profit:.1f} < ₹10 min or profit {exp_profit:.1f} < {self.min_profit_to_fee_ratio}x fees {est_fees:.1f}", target=target, sector=sector)
+            if self.use_weighted_ensemble:
+                # Weighted Ensemble Evaluation (>= 75.0 / 100)
+                score, breakdown = self._calculate_weighted_ensemble_score(
+                    item=item,
+                    target=target,
+                    chart=chart,
+                    policy=policy,
+                    thresholds=thresholds,
+                    consistency=consistency,
+                    nifty_trend=nifty_trend,
+                    stock_alpha=stock_alpha,
+                )
+                passed_ensemble = score >= self.weighted_ensemble_min_score
+                for g_name, g_info in breakdown.items():
+                    audit(item, f"gate_{g_name}", g_info.get("pass", False), str(g_info.get("reason", "evaluated")),
+                          score=g_info.get("score"), max_score=g_info.get("max"), target=target, thresholds=thresholds)
+                audit(item, "weighted_ensemble", passed_ensemble,
+                      f"ensemble score {score:.1f}/{100.0} (min {self.weighted_ensemble_min_score:.1f})",
+                      target=target, thresholds=thresholds, ensemble_score=score, breakdown=breakdown)
+                if not passed_ensemble:
+                    rejected += 1; reject_reasons["weighted_ensemble_score_low"] += 1; continue
+
+                sentiment = self._sentiment_gate(item, target)
+                market_quality = self._market_quality_gate(item, target)
+                candidate_grade = {"grade": "B", "accepted": True, "score": score}
+                assigned_grade = "B"
+                quantity = self._target_quantity(target, assigned_grade)
+                size_multiplier = float((thresholds or {}).get("size_multiplier", 1.0))
+                quantity = self._scale_quantity(quantity, target, size_multiplier)
+                if quantity <= 0:
+                    rejected += 1; reject_reasons["grade_c_zero_sizing"] += 1; continue
+
+                # HARD VETO: Option stop loss ceiling
+                if str(target.get("kind")) in {"CE", "PE"}:
+                    rl = self._risk_levels_for_target(item, target)
+                    p = Decimal(str(target.get("price") or 0))
+                    sl = Decimal(str(rl.get("stop_loss") or 0))
+                    if p > Decimal("0") and sl > Decimal("0"):
+                        stop_dist = abs(p - sl)
+                        if (stop_dist * Decimal(quantity)) > self.max_option_loss_rupees:
+                            rejected += 1
+                            reject_reasons["max_option_loss_exceeded"] += 1
+                            audit(item, "risk_limits", False, f"scaled option stop loss ₹{stop_dist * Decimal(quantity):.2f} exceeds cap ₹{self.max_option_loss_rupees:.2f}", target=target)
+                            continue
+
+                quality = self._candidate_quality(item, target, quantity)
+                adaptive = self._adaptive_gate(item, target, quality)
+                item["_execution_target"] = target
+                item["_execution_quantity"] = quantity
+                item["_entry_quality"] = quality
+                item["_option_grade"] = candidate_grade
+                item["_candidate_grade"] = candidate_grade
+                item["_market_quality"] = market_quality
+                item["_sentiment_gate"] = sentiment
+                item["_adaptive_gate"] = adaptive
+                item["_sector"] = sector
+                item["_selector_score"] = score
+                item["_senior_decision_report"] = self._senior_decision_report(
+                    item, target, quality, market_quality, sentiment, adaptive, consistency, candidate_grade
+                )
+                eligible.append(item)
+            else:
+                # Legacy Sequential AND-Cascade
+                if effective_rr < float(thresholds["min_rr"]):
+                    rejected += 1; reject_reasons["rr_below_effective_minimum"] += 1; audit(item, "risk_reward", False, "rr_below_effective_minimum", thresholds=thresholds); continue
+
+                if item.get("instrument_type") == "EQ" and not is_derivative and not stock_alpha:
+                    if nifty_trend == -1 and underlying_dir == 1:
+                        rejected += 1; reject_reasons["nifty_macro_downtrend_veto"] += 1
+                        audit(item, "macro_index_gate", False, "stock BUY rejected: Nifty 50 5m is in downtrend (EMA9 < EMA21)", target=target, thresholds=thresholds)
                         continue
-                except Exception:
-                    pass
-            quality=self._candidate_quality(item,target,quantity)
-            if float(quality.get("score") or 0)<float(thresholds["min_quality"]):
-                rejected+=1; reject_reasons["quality_below_effective_minimum"]+=1; audit(item,"quality_score",False,"quality_below_effective_minimum",target=target,quality=quality,market_quality=market_quality,sentiment=sentiment,sector=sector,thresholds=thresholds); continue
-            if target.get("kind") in {"CE","PE"}:
-                if float(quality.get("score") or 0)<float(thresholds["min_option_quality"]):
-                    rejected+=1; reject_reasons["option_quality_below_effective_minimum"]+=1; audit(item,"option_grade",False,"option_quality_below_effective_minimum",target=target,quality=quality,market_quality=market_quality,sentiment=sentiment,sector=sector,thresholds=thresholds); continue
-                opt_fresh=self._freshness_gate(item,watermark,is_option=True)
-                if not opt_fresh.get("accepted"):
-                    rejected+=1; reject_reasons["option_stale_rejected"]+=1
-                    audit(item,"option_freshness",False,opt_fresh.get("reason","option stale"),target=target,quality=quality,thresholds=thresholds)
+                    elif nifty_trend == 1 and underlying_dir == -1:
+                        rejected += 1; reject_reasons["nifty_macro_uptrend_veto"] += 1
+                        audit(item, "macro_index_gate", False, "stock SHORT rejected: Nifty 50 5m is in uptrend (EMA9 > EMA21)", target=target, thresholds=thresholds)
+                        continue
+
+                if not consistency.get("accepted"):
+                    rejected += 1; reject_reasons["strategy_consistency_rejected"] += 1
+                    audit(item, "strategy_consistency", False, consistency.get("reason", "strategy_consistency_rejected"), target=target, thresholds=thresholds, consistency=consistency)
                     continue
-            candidate_grade=self._candidate_grade(item,target,quality,market_quality,item.get("_strategy_consistency"))
-            if not candidate_grade.get("accepted",True):
-                rejected+=1; reject_reasons["grade_c_counterfactual_only"]+=1
-                audit(item,"grade_fencing",False,candidate_grade.get("reason","grade C counterfactual only"),target=target,quality=quality,market_quality=market_quality,sentiment=sentiment,sector=sector,thresholds={**thresholds,"candidate_grade":candidate_grade,"option_grade":candidate_grade})
-                continue
-            assigned_grade=candidate_grade.get("grade","B")
-            quantity=self._target_quantity(target,assigned_grade)
-            size_multiplier = float((thresholds or {}).get("size_multiplier", 1.0))
-            quantity = self._scale_quantity(quantity, target, size_multiplier)
-            if quantity<=0:
-                rejected+=1; reject_reasons["grade_c_zero_sizing"]+=1; continue
-            if str(target.get("kind")) in {"CE", "PE"}:
-                rl = self._risk_levels_for_target(item, target)
-                p = Decimal(str(target.get("price") or 0))
-                sl = Decimal(str(rl.get("stop_loss") or 0))
-                if p > Decimal("0") and sl > Decimal("0"):
-                    stop_dist = abs(p - sl)
-                    if (stop_dist * Decimal(quantity)) > self.max_option_loss_rupees:
-                        rejected += 1
-                        reject_reasons["max_option_loss_exceeded"] += 1
-                        audit(item, "risk_limits", False, f"scaled option stop loss ₹{stop_dist * Decimal(quantity):.2f} exceeds cap ₹{self.max_option_loss_rupees:.2f}", target=target)
+
+                sentiment = self._sentiment_gate(item, target)
+                if not sentiment.get("accepted") and not is_fast_path:
+                    rejected += 1; reject_reasons["sentiment_gate_rejected"] += 1; audit(item, "sentiment_gate", False, "sentiment_gate_rejected", target=target, sentiment=sentiment, sector=sector); continue
+                market_quality = self._market_quality_gate(item, target)
+                if not market_quality.get("accepted") and not is_fast_path:
+                    rejected += 1; reject_reasons["market_quality_rejected"] += 1; audit(item, "market_quality", False, "market_quality_rejected", target=target, market_quality=market_quality, sentiment=sentiment, sector=sector); continue
+                if self.require_depth_for_entries and not market_quality.get("depth_available") and not is_fast_path:
+                    rejected += 1; reject_reasons["depth_required_no_fallback_fill"] += 1; audit(item, "market_depth", False, "depth_required_no_fallback_fill", target=target, market_quality=market_quality, sentiment=sentiment, sector=sector); continue
+
+                policy_edge = float(getattr(policy, "expected_net_edge_bps", 0) or 0)
+                if policy and policy_edge < float(thresholds["min_edge_bps"]):
+                    rejected += 1; reject_reasons["net_edge_below_effective_minimum"] += 1
+                    audit(item, "net_edge", False, "net_edge_below_effective_minimum", target=target, market_quality=market_quality, sentiment=sentiment, sector=sector, thresholds=thresholds)
+                    continue
+                quantity = self._target_quantity(target, "A")
+                tgt_price = float(target.get("price") or 0)
+                tp_price = float(self._risk_levels_for_target(item, target).get("take_profit") or 0)
+                if tgt_price > 0 and tp_price > 0 and quantity > 0:
+                    try:
+                        seg = "OPTIONS" if str(target.get("kind")) in {"CE", "PE"} else "EQUITY_INTRADAY"
+                        side_str = str(target.get("side", "BUY")).upper()
+                        opp_side = "SELL" if side_str == "BUY" else "BUY"
+                        c_entry = estimate_zerodha_costs(seg, side_str, Decimal(str(tgt_price)), quantity).total
+                        c_exit = estimate_zerodha_costs(seg, opp_side, Decimal(str(tp_price)), quantity).total
+                        est_fees = float(c_entry + c_exit)
+                        exp_profit = abs(tp_price - tgt_price) * quantity
+                        net_profit = exp_profit - est_fees
+                        if est_fees > 0 and (exp_profit < est_fees * float(self.min_profit_to_fee_ratio) or net_profit < 10.0):
+                            rejected += 1; reject_reasons["fee_ratio_too_low"] += 1
+                            audit(item, "fee_gate", False, f"expected net profit {net_profit:.1f} < ₹10 min or profit {exp_profit:.1f} < {self.min_profit_to_fee_ratio}x fees {est_fees:.1f}", target=target, sector=sector)
+                            continue
+                    except Exception:
+                        pass
+                quality = self._candidate_quality(item, target, quantity)
+                if float(quality.get("score") or 0) < float(thresholds["min_quality"]):
+                    rejected += 1; reject_reasons["quality_below_effective_minimum"] += 1; audit(item, "quality_score", False, "quality_below_effective_minimum", target=target, quality=quality, market_quality=market_quality, sentiment=sentiment, sector=sector, thresholds=thresholds); continue
+                if target.get("kind") in {"CE", "PE"}:
+                    if float(quality.get("score") or 0) < float(thresholds["min_option_quality"]):
+                        rejected += 1; reject_reasons["option_quality_below_effective_minimum"] += 1; audit(item, "option_grade", False, "option_quality_below_effective_minimum", target=target, quality=quality, market_quality=market_quality, sentiment=sentiment, sector=sector, thresholds=thresholds); continue
+                    opt_fresh = self._freshness_gate(item, watermark, is_option=True)
+                    if not opt_fresh.get("accepted"):
+                        rejected += 1; reject_reasons["option_stale_rejected"] += 1
+                        audit(item, "option_freshness", False, opt_fresh.get("reason", "option stale"), target=target, quality=quality, thresholds=thresholds)
                         continue
-            adaptive=self._adaptive_gate(item,target,quality)
-            if not adaptive.get("accepted"):
-                rejected+=1; reject_reasons["adaptive_trap_rejected"]+=1; audit(item,"adaptive_trap",False,"adaptive_trap_rejected",target=target,quality=quality,market_quality=market_quality,sentiment=sentiment,adaptive=adaptive,sector=sector,thresholds=thresholds); continue
-            item["_execution_target"]=target
-            item["_execution_quantity"]=quantity
-            item["_entry_quality"]=quality
-            item["_option_grade"]=candidate_grade
-            item["_candidate_grade"]=candidate_grade
-            item["_market_quality"]=market_quality
-            item["_sentiment_gate"]=sentiment
-            item["_adaptive_gate"]=adaptive
-            item["_sector"]=sector
-            item["_selector_score"]=self._selector_score(item,quality,target)
-            item["_senior_decision_report"]=self._senior_decision_report(item,target,quality,market_quality,sentiment,adaptive,item.get("_strategy_consistency") or {},candidate_grade)
-            eligible.append(item)
+                candidate_grade = self._candidate_grade(item, target, quality, market_quality, item.get("_strategy_consistency"))
+                if not candidate_grade.get("accepted", True):
+                    rejected += 1; reject_reasons["grade_c_counterfactual_only"] += 1
+                    audit(item, "grade_fencing", False, candidate_grade.get("reason", "grade C counterfactual only"), target=target, quality=quality, market_quality=market_quality, sentiment=sentiment, sector=sector, thresholds={**thresholds, "candidate_grade": candidate_grade, "option_grade": candidate_grade})
+                    continue
+                assigned_grade = candidate_grade.get("grade", "B")
+                quantity = self._target_quantity(target, assigned_grade)
+                size_multiplier = float((thresholds or {}).get("size_multiplier", 1.0))
+                quantity = self._scale_quantity(quantity, target, size_multiplier)
+                if quantity <= 0:
+                    rejected += 1; reject_reasons["grade_c_zero_sizing"] += 1; continue
+                if str(target.get("kind")) in {"CE", "PE"}:
+                    rl = self._risk_levels_for_target(item, target)
+                    p = Decimal(str(target.get("price") or 0))
+                    sl = Decimal(str(rl.get("stop_loss") or 0))
+                    if p > Decimal("0") and sl > Decimal("0"):
+                        stop_dist = abs(p - sl)
+                        if (stop_dist * Decimal(quantity)) > self.max_option_loss_rupees:
+                            rejected += 1
+                            reject_reasons["max_option_loss_exceeded"] += 1
+                            audit(item, "risk_limits", False, f"scaled option stop loss ₹{stop_dist * Decimal(quantity):.2f} exceeds cap ₹{self.max_option_loss_rupees:.2f}", target=target)
+                            continue
+                adaptive = self._adaptive_gate(item, target, quality)
+                if not adaptive.get("accepted"):
+                    rejected += 1; reject_reasons["adaptive_trap_rejected"] += 1; audit(item, "adaptive_trap", False, "adaptive_trap_rejected", target=target, quality=quality, market_quality=market_quality, sentiment=sentiment, adaptive=adaptive, sector=sector, thresholds=thresholds); continue
+                item["_execution_target"] = target
+                item["_execution_quantity"] = quantity
+                item["_entry_quality"] = quality
+                item["_option_grade"] = candidate_grade
+                item["_candidate_grade"] = candidate_grade
+                item["_market_quality"] = market_quality
+                item["_sentiment_gate"] = sentiment
+                item["_adaptive_gate"] = adaptive
+                item["_sector"] = sector
+                item["_selector_score"] = self._selector_score(item, quality, target)
+                item["_senior_decision_report"] = self._senior_decision_report(item, target, quality, market_quality, sentiment, adaptive, item.get("_strategy_consistency") or {}, candidate_grade)
+                eligible.append(item)
         eligible.sort(key=lambda item:(item["_selector_score"],
                                        1 if item.get("policy_candidate") and item["policy_candidate"].accepted else 0,
                                        float(item.get("_entry_quality",{}).get("score") or 0),
