@@ -58,9 +58,9 @@ def main():
             ROUND(COALESCE(SUM(CASE WHEN net_pnl > 0 THEN net_pnl END), 0)::numeric / NULLIF(ABS(SUM(CASE WHEN net_pnl < 0 THEN net_pnl END)), 0), 2) as profit_factor,
             ROUND(SUM(net_pnl)::numeric, 2) as net_pnl,
             ROUND(SUM(estimated_fees)::numeric, 2) as total_fees,
-            MIN(signal_at::date) as first_date,
-            MAX(signal_at::date) as last_date,
-            COUNT(DISTINCT signal_at::date) as distinct_days
+            MIN((signal_at AT TIME ZONE 'Asia/Kolkata')::date) as first_date,
+            MAX((signal_at AT TIME ZONE 'Asia/Kolkata')::date) as last_date,
+            COUNT(DISTINCT (signal_at AT TIME ZONE 'Asia/Kolkata')::date) as distinct_days
         FROM shadow_execution_audits
         WHERE exit_at IS NOT NULL AND net_pnl IS NOT NULL
         GROUP BY model_version
@@ -68,10 +68,10 @@ def main():
         """
         shadow_stats = conn.execute(text(q_shadow)).mappings().all()
 
-        # Query Candidate Funnel over last 10 days
+        # Query Candidate Funnel over last 10 days in IST
         q_days = """
         SELECT 
-            observed_at::date as trade_date,
+            (observed_at AT TIME ZONE 'Asia/Kolkata')::date as trade_date,
             COUNT(*) as total_candidates,
             COUNT(CASE WHEN accepted THEN 1 END) as accepted_candidates,
             COUNT(CASE WHEN NOT accepted THEN 1 END) as rejected_candidates
@@ -85,11 +85,12 @@ def main():
     # 2. Read Runtime Parameters
     pm = PositionManager()
     min_rr = os.getenv("NIVESH_SHADOW_MIN_PROFESSIONAL_RR", "1.90")
-    learning_best_rr = os.getenv("NIVESH_SHADOW_LEARNING_BEST_MIN_RR", "1.50")
-    learning_neutral_rr = os.getenv("NIVESH_SHADOW_LEARNING_NEUTRAL_MIN_RR", "1.80")
-    learning_worst_rr = os.getenv("NIVESH_SHADOW_LEARNING_WORST_MIN_RR", "2.00")
+    learning_best_rr = os.getenv("NIVESH_SHADOW_LEARNING_BEST_MIN_RR", "1.80")
+    learning_neutral_rr = os.getenv("NIVESH_SHADOW_LEARNING_NEUTRAL_MIN_RR", "2.00")
+    learning_worst_rr = os.getenv("NIVESH_SHADOW_LEARNING_WORST_MIN_RR", min_rr)
     max_daily_loss = os.getenv("NIVESH_SHADOW_MAX_DAILY_LOSS", "2000")
     max_daily_losses = os.getenv("NIVESH_SHADOW_MAX_DAILY_LOSSES", "2")
+    max_consecutive_losses = os.getenv("NIVESH_SHADOW_MAX_CONSECUTIVE_LOSSES", "3")
     
     # 3. Build Markdown Content
     content = f"""# TradeMind — Living Project Status (STATUS.md)
@@ -164,7 +165,7 @@ def main():
 | **`trailing_giveback_r`** | **{pm.trailing_giveback_r}R** | `position_manager.py:61`, `.env:165` | 0.50R | `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4` | **0.40R active** (protects 60% of peak excursion beyond trigger). |
 | **`stagnation_scratch_seconds`** | **{pm.stagnation_scratch_seconds}s ({pm.stagnation_scratch_seconds/60.0:.0f} min)** | `position_manager.py:68` | 20 minutes | `MASTER_COMPREHENSIVE_PLAN.md` | **15 minutes active** (tightens flat trades at 0.25R). |
 | **`adverse_cut_threshold_r`** | **{pm.adverse_cut_threshold_r}R in 90s** | `position_manager.py:64` | 0.35R | Historical architectural notes | **0.40R active** (fast cut on immediate counter-trend). |
-| **`daily_circuit_breaker`** | **₹{max_daily_loss} / {max_daily_losses} consecutive losses** | `.env:186,190`, `live_inference.py:219,229` | Disagreed across 3 docs (₹1,500 vs ₹2,000 vs 3-4 losses) | Legacy specs | **₹2,000 / 2 losses halts first in practice**. |
+| **`daily_circuit_breaker`** | **₹{max_daily_loss} max daily loss / {max_daily_losses} daily losses / {max_consecutive_losses} consecutive losses** | `.env:186,190`, `live_inference.py:219,229` | Disagreed across 3 docs (₹1,500 vs ₹2,000 vs 3-4 losses) | Legacy specs | **₹2,000 / 2 session losses halts first in practice**. |
 | **`account_drawdown_trigger`** | **-7.32% hard DB stop** | `v3_0_production.sql:81`, `validation_engine.py:331` | -8% in test reports | `INFRASTRUCTURE_STATUS.md` | **-7.32% catastrophic SQL trigger**. |
 
 ---

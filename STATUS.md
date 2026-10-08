@@ -1,8 +1,8 @@
 # TradeMind — Living Project Status (STATUS.md)
 
 *Generated Automatically by `scripts/generate_status.py`*  
-*Generation Timestamp: `2026-10-08 18:42:28 IST`*  
-*Exact Git Commit Hash: `6022fcf87a644939c5f547ef7a9b45d16f4aa157`*  
+*Generation Timestamp: `2026-10-08 19:04:30 IST`*  
+*Exact Git Commit Hash: `20f5f3eb5fa7449210cc59bf6f114bc9f94f4c39`*  
 *Canonical Single Source of Truth for Architecture, Model Benchmarks & Operational Ground Truth*
 
 ---
@@ -66,7 +66,7 @@
 | **`trailing_giveback_r`** | **0.40R** | `position_manager.py:61`, `.env:165` | 0.50R | `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4` | **0.40R active** (protects 60% of peak excursion beyond trigger). |
 | **`stagnation_scratch_seconds`** | **900.0s (15 min)** | `position_manager.py:68` | 20 minutes | `MASTER_COMPREHENSIVE_PLAN.md` | **15 minutes active** (tightens flat trades at 0.25R). |
 | **`adverse_cut_threshold_r`** | **0.40R in 90s** | `position_manager.py:64` | 0.35R | Historical architectural notes | **0.40R active** (fast cut on immediate counter-trend). |
-| **`daily_circuit_breaker`** | **₹2000 / 2 consecutive losses** | `.env:186,190`, `live_inference.py:219,229` | Disagreed across 3 docs (₹1,500 vs ₹2,000 vs 3-4 losses) | Legacy specs | **₹2,000 / 2 losses halts first in practice**. |
+| **`daily_circuit_breaker`** | **₹2000 max daily loss / 2 daily losses / 3 consecutive losses** | `.env:186,190`, `live_inference.py:219,229` | Disagreed across 3 docs (₹1,500 vs ₹2,000 vs 3-4 losses) | Legacy specs | **₹2,000 / 2 session losses halts first in practice**. |
 | **`account_drawdown_trigger`** | **-7.32% hard DB stop** | `v3_0_production.sql:81`, `validation_engine.py:331` | -8% in test reports | `INFRASTRUCTURE_STATUS.md` | **-7.32% catastrophic SQL trigger**. |
 
 ---

@@ -2679,7 +2679,22 @@ class LivePaperInference:
                 audit(item, "sector_limits", False, f"sector {sector} in cooldown after repeated intraday losses", target=target, sector=sector)
                 continue
 
+            # HARD VETO: Physically invalid execution price or inverted SL/TP geometry
+            if not consistency.get("accepted"):
+                c_reason = str(consistency.get("reason", ""))
+                if "inverted" in c_reason or "invalid execution price" in c_reason:
+                    rejected += 1; reject_reasons["strategy_consistency_rejected"] += 1
+                    audit(item, "strategy_consistency", False, c_reason, target=target, thresholds=thresholds, consistency=consistency)
+                    continue
+
             if self.use_weighted_ensemble:
+                # HARD VETO: Market quality must be valid for execution
+                market_quality = self._market_quality_gate(item, target)
+                if not market_quality.get("accepted") and not is_fast_path:
+                    rejected += 1; reject_reasons["market_quality_rejected"] += 1
+                    audit(item, "market_quality", False, market_quality.get("reason", "market_quality_rejected"), target=target, market_quality=market_quality, thresholds=thresholds)
+                    continue
+
                 # Weighted Ensemble Evaluation (>= 75.0 / 100)
                 score, breakdown = self._calculate_weighted_ensemble_score(
                     item=item,
@@ -2692,17 +2707,21 @@ class LivePaperInference:
                     stock_alpha=stock_alpha,
                 )
                 passed_ensemble = score >= self.weighted_ensemble_min_score
+                item["_weighted_ensemble"] = {
+                    "score": score,
+                    "min_score": self.weighted_ensemble_min_score,
+                    "breakdown": breakdown,
+                }
                 for g_name, g_info in breakdown.items():
                     audit(item, f"gate_{g_name}", g_info.get("pass", False), str(g_info.get("reason", "evaluated")),
-                          score=g_info.get("score"), max_score=g_info.get("max"), target=target, thresholds=thresholds)
+                          target=target, thresholds=thresholds)
                 audit(item, "weighted_ensemble", passed_ensemble,
                       f"ensemble score {score:.1f}/{100.0} (min {self.weighted_ensemble_min_score:.1f})",
-                      target=target, thresholds=thresholds, ensemble_score=score, breakdown=breakdown)
+                      target=target, thresholds=thresholds, selector_score=score, consistency=consistency)
                 if not passed_ensemble:
                     rejected += 1; reject_reasons["weighted_ensemble_score_low"] += 1; continue
 
                 sentiment = self._sentiment_gate(item, target)
-                market_quality = self._market_quality_gate(item, target)
                 candidate_grade = {"grade": "B", "accepted": True, "score": score}
                 assigned_grade = "B"
                 quantity = self._target_quantity(target, assigned_grade)

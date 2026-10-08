@@ -37,6 +37,6 @@
 
 ## Authority Notice
 All operational parameters, database queries, and deployment commands defer strictly to:
-1. [STATUS.md](file:///Users/avinash/Documents/Codex/2026-06-27/design-a-modern-distinctive-ui-ux/STATUS.md) (dynamically generated from live database, git commit, and runtime config)
-2. [MASTER_COMPREHENSIVE_PLAN.md](file:///Users/avinash/Documents/Codex/2026-06-27/design-a-modern-distinctive-ui-ux/MASTER_COMPREHENSIVE_PLAN.md)
-3. [README.md](file:///Users/avinash/Documents/Codex/2026-06-27/design-a-modern-distinctive-ui-ux/README.md)
+1. [STATUS.md](../../STATUS.md) (dynamically generated from live database, git commit, and runtime config)
+2. [MASTER_COMPREHENSIVE_PLAN.md](../../MASTER_COMPREHENSIVE_PLAN.md)
+3. [README.md](../../README.md)

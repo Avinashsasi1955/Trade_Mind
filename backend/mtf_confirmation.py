@@ -60,7 +60,8 @@ def evaluate_mtf_confirmation(symbol: str, direction: str = "LONG") -> Dict:
             details["m15_reason"] = struct.get("reason", "")
         else:
             checks["m15_structure"] = False
-            details["m15_status"] = struct.get("reason", "insufficient_structure_candles")
+            details["m15_reason"] = struct.get("reason", "insufficient_structure_candles")
+            details["m15_status"] = "insufficient_candles" if len(m15_candles) < 8 else "structure_failed"
 
         # 3. Micro 5m/1m Trigger Check
         m5_res = chart_data(symbol, "5m")
@@ -93,5 +94,5 @@ def evaluate_mtf_confirmation(symbol: str, direction: str = "LONG") -> Dict:
         "mtf_score": round(score, 1),
         "checks": checks,
         "details": details,
-        "verdict": "TRIPLE_CONFIRMED" if score > 90 else "CONFIRMED" if confirmed else "UNCONFIRMED_MTF_CONFLICT" if any(details.get(k) == "insufficient_candles" for k in ["daily_status", "m15_status", "m5_status"]) or "error" in details else "FAILED_MTF_ALIGNMENT"
+        "verdict": "TRIPLE_CONFIRMED" if score > 90 else "CONFIRMED" if confirmed else "INSUFFICIENT_DATA" if any(details.get(k) == "insufficient_candles" for k in ["daily_status", "m15_status", "m5_status"]) or "error" in details else "FAILED_MTF_ALIGNMENT"
     }
