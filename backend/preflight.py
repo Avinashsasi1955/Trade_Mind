@@ -52,16 +52,38 @@ def run_preflight(database_url=None,redis_url=None,require_integrations=True):
         checks["instrument_master"]={"passed":token_count>=50 if require_integrations else True,"detail":detail}
         calendar=connection.execute(text("SELECT session_status,source FROM exchange_trading_calendar WHERE exchange='NSE' AND session_date=:day"),{"day":now.date()}).mappings().one_or_none()
         from backend.config import IS_PRODUCTION
+        import logging
+        preflight_logger = logging.getLogger("nivesh.preflight")
         if not calendar:
             if IS_PRODUCTION:
                 calendar_passed = False
                 calendar_detail = f"CRITICAL: Missing exchange_trading_calendar row for {now.date()}; run scripts/sync_trading_calendar.py"
+                preflight_logger.critical(calendar_detail)
             else:
                 calendar_passed = now.weekday() < 5
                 calendar_detail = "weekend closed" if now.weekday() >= 5 else "weekday fallback; official row not loaded"
         else:
-            calendar_passed = now.weekday() < 5 and calendar["session_status"] != "CLOSED"
+            if calendar["session_status"] == "SPECIAL":
+                calendar_passed = True
+            elif calendar["session_status"] == "CLOSED":
+                calendar_passed = False
+            else:
+                calendar_passed = now.weekday() < 5
             calendar_detail = f"{calendar['session_status']} ({calendar['source']})"
+
+        # Check future calendar coverage and raise CRITICAL warning if fewer than 30 future days left
+        future_days = int(connection.execute(
+            text("SELECT COUNT(*) FROM exchange_trading_calendar WHERE exchange='NSE' AND session_date > :day"),
+            {"day": now.date()}
+        ).scalar() or 0)
+        if future_days < 30:
+            crit_msg = (
+                f"CRITICAL: Exchange trading calendar has only {future_days} future days loaded (< 30 days remaining)! "
+                f"Run scripts/sync_trading_calendar.py to prevent outages."
+            )
+            preflight_logger.critical(crit_msg)
+            calendar_detail += f"; CRITICAL: only {future_days} future calendar days remain"
+
         checks["exchange_calendar"]={"passed":calendar_passed,"detail":calendar_detail}
         heartbeat=connection.execute(text("SELECT created_at FROM monitoring_events WHERE component='celery_worker' ORDER BY id DESC LIMIT 1")).scalar_one_or_none()
         checks["worker_heartbeat"]={"passed":bool(heartbeat and heartbeat>=datetime.now(heartbeat.tzinfo)-timedelta(minutes=3)),

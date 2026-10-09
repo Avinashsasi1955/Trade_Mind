@@ -1,98 +1,129 @@
 {
-  "source": "NSE Official Trading Holidays 2026 Circular / Calendar (NSE/CMTR/2026)",
-  "year": 2026,
   "exchange": "NSE",
+  "year": 2026,
+  "source": "NSE Circular Ref. No: 172/2025 (Download Ref No: NSE/CMTR/71775) dated December 12, 2025 and Maharashtra Municipal Election Circular",
+  "description": "Official NSE Trading Holidays and Special Sessions Schedule for Calendar Year 2026 (Capital Market Segment)",
   "holidays": [
+    {
+      "date": "2026-01-15",
+      "name": "Municipal Corporation Election - Maharashtra",
+      "day": "Thursday",
+      "status": "CLOSED"
+    },
     {
       "date": "2026-01-26",
       "name": "Republic Day",
+      "day": "Monday",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-02-15",
+      "name": "Mahashivratri",
+      "day": "Sunday",
       "status": "CLOSED"
     },
     {
       "date": "2026-03-03",
       "name": "Holi",
+      "day": "Tuesday",
       "status": "CLOSED"
     },
     {
-      "date": "2026-03-20",
-      "name": "Id-Ul-Fitr (Ramzan Id)",
+      "date": "2026-03-21",
+      "name": "Id-Ul-Fitr (Ramadan Eid)",
+      "day": "Saturday",
       "status": "CLOSED"
     },
     {
-      "date": "2026-03-27",
-      "name": "Ram Navami",
+      "date": "2026-03-26",
+      "name": "Shri Ram Navami",
+      "day": "Thursday",
       "status": "CLOSED"
     },
     {
       "date": "2026-03-31",
-      "name": "Mahavir Jayanti",
+      "name": "Shri Mahavir Jayanti",
+      "day": "Tuesday",
       "status": "CLOSED"
     },
     {
       "date": "2026-04-03",
       "name": "Good Friday",
+      "day": "Friday",
       "status": "CLOSED"
     },
     {
       "date": "2026-04-14",
       "name": "Dr. Baba Saheb Ambedkar Jayanti",
+      "day": "Tuesday",
       "status": "CLOSED"
     },
     {
       "date": "2026-05-01",
       "name": "Maharashtra Day",
+      "day": "Friday",
       "status": "CLOSED"
     },
     {
-      "date": "2026-05-27",
-      "name": "Bakri Id / Eid-ul-Adha",
+      "date": "2026-05-28",
+      "name": "Bakri Id",
+      "day": "Thursday",
       "status": "CLOSED"
     },
     {
-      "date": "2026-06-25",
+      "date": "2026-06-26",
       "name": "Muharram",
+      "day": "Friday",
       "status": "CLOSED"
     },
     {
       "date": "2026-08-15",
       "name": "Independence Day",
+      "day": "Saturday",
       "status": "CLOSED"
     },
     {
-      "date": "2026-08-25",
-      "name": "Milad-un-Nabi (Id-e-Milad)",
+      "date": "2026-09-14",
+      "name": "Ganesh Chaturthi",
+      "day": "Monday",
       "status": "CLOSED"
     },
     {
       "date": "2026-10-02",
       "name": "Mahatma Gandhi Jayanti",
+      "day": "Friday",
       "status": "CLOSED"
     },
     {
       "date": "2026-10-20",
       "name": "Dussehra",
+      "day": "Tuesday",
       "status": "CLOSED"
     },
     {
       "date": "2026-11-08",
       "name": "Diwali Laxmi Pujan (Muhurat Trading)",
+      "day": "Sunday",
       "status": "SPECIAL",
       "opens_at": "18:15:00",
       "closes_at": "19:15:00"
     },
     {
       "date": "2026-11-10",
-      "name": "Diwali Balipratipada",
+      "name": "Diwali-Balipratipada",
+      "day": "Tuesday",
       "status": "CLOSED"
     },
     {
       "date": "2026-11-24",
-      "name": "Gurunanak Jayanti",
+      "name": "Prakash Gurpurb Sri Guru Nanak Dev",
+      "day": "Tuesday",
       "status": "CLOSED"
     },
     {
       "date": "2026-12-25",
       "name": "Christmas",
+      "day": "Friday",
       "status": "CLOSED"
     }
   ]

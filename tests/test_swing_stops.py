@@ -143,7 +143,7 @@ class TestSwingStopsAndRisk(unittest.TestCase):
                     exchange TEXT,
                     symbol TEXT,
                     instrument_id INTEGER,
-                    signal TEXT,
+                    signal INTEGER CHECK(typeof(signal) = 'integer'),
                     probability NUMERIC,
                     decision_price NUMERIC,
                     selector_stage TEXT,
@@ -698,12 +698,23 @@ class TestSwingStopsAndRisk(unittest.TestCase):
         self.assertEqual(reason2, SWING_REJECTED_STOP_CAP_EXCEEDED)
 
     def test_rejected_swing_candidate_audit_funnel_logging(self):
-        """When a swing candidate is rejected during live inference, it records SWING_REJECTED_<why>
-        in trade_candidate_audits so the funnel diagnostic can count it."""
+        """Test production method LiveInferenceService._record_swing_rejection_audit.
+        
+        Asserts:
+        - Uses INTEGER signal (1 for BUY, -1 for SELL), strictly enforced by table CHECK constraint.
+        - Updates existing candidate audit row or inserts if missing.
+        - Correctly sets selector_stage='swing_risk', accepted=False, and rejection_reason=SWING_REJECTED_<why>.
+        - Gracefully handles schemas with and without trade_mode.
+        """
         from datetime import datetime, timezone
+        from backend.live_inference import LiveInferenceService
         now_dt = datetime.now(timezone.utc)
 
-        # Pre-insert candidate that was initially marked accepted in top10
+        # Create service instance bound to test engine
+        service = LiveInferenceService.__new__(LiveInferenceService)
+        service.engine = self.engine
+
+        # Pre-insert candidate that was initially marked accepted in top10 with INTEGER signal (1 for BUY)
         with self.engine.begin() as conn:
             conn.execute(text("""
                 INSERT INTO trade_candidate_audits (
@@ -711,32 +722,232 @@ class TestSwingStopsAndRisk(unittest.TestCase):
                     signal, probability, decision_price, selector_stage, accepted,
                     rejection_reason, trade_mode
                 ) VALUES (
-                    :dt, 'v1.0', 'NSE', 'TCS', 1, 'BUY', 0.85, 3500.0, 'accepted_top10', 1, NULL, 'SWING'
+                    :dt, 'v1.0', 'NSE', 'TCS', 1, 1, 0.85, 3500.0, 'accepted_top10', 1, NULL, 'SWING'
                 )
             """), {"dt": now_dt})
 
-        # Simulate swing rejection audit update
-        reject_code = SWING_REJECTED_THIN_HISTORY
-        with self.engine.begin() as conn:
-            conn.execute(text("""
-                UPDATE trade_candidate_audits
-                SET accepted = 0,
-                    rejection_reason = :reason,
-                    selector_stage = 'swing_risk'
-                WHERE symbol = 'TCS'
-            """), {"reason": reject_code})
+        # Test updating existing candidate via production method
+        item = {
+            "symbol": "TCS",
+            "instrument_id": 1,
+            "exchange": "NSE",
+            "signal": 1,
+            "session": {"timestamp": now_dt},
+            "probability": 0.85,
+        }
+        target = {"side": "BUY", "price": 3500.0}
 
-        # Verify audit row state for funnel reporting
+        service._record_swing_rejection_audit(
+            item=item,
+            target=target,
+            model_version="v1.0",
+            reject_code=SWING_REJECTED_THIN_HISTORY,
+        )
+
+        # Verify audit row state in database
         with self.engine.connect() as conn:
             row = conn.execute(text("""
-                SELECT selector_stage, accepted, rejection_reason, trade_mode
+                SELECT selector_stage, accepted, rejection_reason, trade_mode, signal
                 FROM trade_candidate_audits WHERE symbol = 'TCS'
             """)).mappings().one()
 
             self.assertEqual(row["selector_stage"], "swing_risk")
             self.assertEqual(int(row["accepted"]), 0)
-            self.assertEqual(row["rejection_reason"], "SWING_REJECTED_THIN_HISTORY")
+            self.assertEqual(row["rejection_reason"], SWING_REJECTED_THIN_HISTORY)
+            self.assertEqual(row["signal"], 1)
+
+        # Test inserting a new candidate that did not exist previously (e.g. INFY SELL)
+        item_new = {
+            "symbol": "INFY",
+            "instrument_id": 3,
+            "exchange": "NSE",
+            "session": {"timestamp": now_dt},
+            "probability": 0.72,
+        }
+        target_new = {"side": "SELL", "price": 1800.0}
+
+        service._record_swing_rejection_audit(
+            item=item_new,
+            target=target_new,
+            model_version="v1.0",
+            reject_code=SWING_REJECTED_STOP_CAP_EXCEEDED,
+        )
+
+        with self.engine.connect() as conn:
+            row_new = conn.execute(text("""
+                SELECT selector_stage, accepted, rejection_reason, trade_mode, signal
+                FROM trade_candidate_audits WHERE symbol = 'INFY'
+            """)).mappings().one()
+
+            self.assertEqual(row_new["selector_stage"], "swing_risk")
+            self.assertEqual(int(row_new["accepted"]), 0)
+            self.assertEqual(row_new["rejection_reason"], SWING_REJECTED_STOP_CAP_EXCEEDED)
+            self.assertEqual(row_new["signal"], -1, "SELL side must be recorded as integer -1")
+
+    def test_record_swing_rejection_audit_without_trade_mode_column(self):
+        """Test production method when trade_mode column is not present (pre-v3_17 schema)."""
+        from datetime import datetime, timezone
+        from backend.live_inference import LiveInferenceService
+        now_dt = datetime.now(timezone.utc)
+
+        # Separate engine without trade_mode column
+        from sqlalchemy import create_engine
+        legacy_engine = create_engine("sqlite:///:memory:")
+        with legacy_engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE trade_candidate_audits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    observed_at TIMESTAMP,
+                    model_version TEXT,
+                    exchange TEXT,
+                    symbol TEXT,
+                    instrument_id INTEGER,
+                    signal INTEGER CHECK(typeof(signal) = 'integer'),
+                    probability NUMERIC,
+                    decision_price NUMERIC,
+                    selector_stage TEXT,
+                    accepted BOOLEAN,
+                    rejection_reason TEXT
+                );
+            """))
+
+        service = LiveInferenceService.__new__(LiveInferenceService)
+        service.engine = legacy_engine
+
+        item = {
+            "symbol": "WIPRO",
+            "instrument_id": 4,
+            "exchange": "NSE",
+            "session": {"timestamp": now_dt},
+            "probability": 0.65,
+        }
+        target = {"side": "BUY", "price": 450.0}
+
+        # Must succeed without referencing non-existent trade_mode column
+        service._record_swing_rejection_audit(
+            item=item,
+            target=target,
+            model_version="v1.0",
+            reject_code=SWING_REJECTED_THIN_HISTORY,
+        )
+
+        with legacy_engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT selector_stage, accepted, rejection_reason, signal
+                FROM trade_candidate_audits WHERE symbol = 'WIPRO'
+            """)).mappings().one()
+
+            self.assertEqual(row["selector_stage"], "swing_risk")
+            self.assertEqual(int(row["accepted"]), 0)
+            self.assertEqual(row["signal"], 1)
+
+    def test_record_swing_rejection_audit_logs_warning_on_sql_error(self):
+        """Test that LiveInferenceService._record_swing_rejection_audit logs at WARNING on SQL failure."""
+        from datetime import datetime, timezone
+        from backend.live_inference import LiveInferenceService
+        now_dt = datetime.now(timezone.utc)
+
+        # Point engine to an empty in-memory engine where trade_candidate_audits table does not exist
+        from sqlalchemy import create_engine
+        broken_engine = create_engine("sqlite:///:memory:")
+
+        service = LiveInferenceService.__new__(LiveInferenceService)
+        service.engine = broken_engine
+
+        item = {"symbol": "SBIN", "session": {"timestamp": now_dt}}
+        target = {"side": "BUY", "price": 800.0}
+
+        with self.assertLogs("nivesh", level="WARNING") as cm:
+            service._record_swing_rejection_audit(
+                item=item,
+                target=target,
+                model_version="v1.0",
+                reject_code=SWING_REJECTED_THIN_HISTORY,
+            )
+
+        self.assertTrue(
+            any("Failed to record swing rejection in candidate audit log for SBIN" in r.getMessage() for r in cm.records),
+            "Must log at WARNING level on SQL failure"
+        )
+
+    def test_nse_holidays_2026_file_accuracy(self):
+        """Verify data/nse_holidays_2026.json accuracy against official NSE schedule:
+        - Asserts every holiday falls on the expected weekday.
+        - Asserts no weekend-only holiday is marked as a weekday closure.
+        - Models Nov 8 (Sunday) as a special Muhurat session with announced hours, not CLOSED.
+        - Removes Aug 25, Mar 20, and Mar 27.
+        - Confirms all 16 official weekday holidays.
+        """
+        import json
+        from pathlib import Path
+        holiday_file = Path(__file__).resolve().parent.parent / "data" / "nse_holidays_2026.json"
+        self.assertTrue(holiday_file.exists(), f"Missing holiday file at {holiday_file}")
+
+        with open(holiday_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.assertEqual(data["year"], 2026)
+        self.assertIn("172/2025", data["source"])
+        holidays = {h["date"]: h for h in data["holidays"]}
+
+        # Specific dates that must NOT be present
+        self.assertNotIn("2026-08-25", holidays, "Aug 25 is not an NSE holiday")
+        self.assertNotIn("2026-03-20", holidays, "Mar 20 is not a holiday (Id-Ul-Fitr is Saturday Mar 21)")
+        self.assertNotIn("2026-03-27", holidays, "Mar 27 is not a holiday (Ram Navami is Mar 26)")
+
+        # Verify Diwali Laxmi Pujan (Muhurat Trading) on Nov 8 (Sunday)
+        nov8 = holidays.get("2026-11-08")
+        self.assertIsNotNone(nov8)
+        self.assertEqual(nov8["status"], "SPECIAL", "Nov 8 must be SPECIAL Muhurat session, not CLOSED")
+        self.assertEqual(nov8["opens_at"], "18:15:00")
+        self.assertEqual(nov8["closes_at"], "19:15:00")
+        self.assertEqual(nov8["day"], "Sunday")
+
+        # Official 16 weekday holidays for 2026
+        expected_weekday_holidays = {
+            "2026-01-15": ("Thursday", "Municipal Corporation Election - Maharashtra"),
+            "2026-01-26": ("Monday", "Republic Day"),
+            "2026-03-03": ("Tuesday", "Holi"),
+            "2026-03-26": ("Thursday", "Shri Ram Navami"),
+            "2026-03-31": ("Tuesday", "Shri Mahavir Jayanti"),
+            "2026-04-03": ("Friday", "Good Friday"),
+            "2026-04-14": ("Tuesday", "Dr. Baba Saheb Ambedkar Jayanti"),
+            "2026-05-01": ("Friday", "Maharashtra Day"),
+            "2026-05-28": ("Thursday", "Bakri Id"),
+            "2026-06-26": ("Friday", "Muharram"),
+            "2026-09-14": ("Monday", "Ganesh Chaturthi"),
+            "2026-10-02": ("Friday", "Mahatma Gandhi Jayanti"),
+            "2026-10-20": ("Tuesday", "Dussehra"),
+            "2026-11-10": ("Tuesday", "Diwali-Balipratipada"),
+            "2026-11-24": ("Tuesday", "Prakash Gurpurb Sri Guru Nanak Dev"),
+            "2026-12-25": ("Friday", "Christmas"),
+        }
+
+        weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+        for date_str, (exp_day, exp_name) in expected_weekday_holidays.items():
+            self.assertIn(date_str, holidays, f"Missing expected weekday holiday {date_str} ({exp_name})")
+            h = holidays[date_str]
+            self.assertEqual(h["status"], "CLOSED")
+            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+            actual_day = weekday_names[dt.weekday()]
+            self.assertEqual(actual_day, exp_day, f"{date_str} must be a {exp_day}, was {actual_day}")
+            self.assertEqual(h["day"], exp_day)
+            self.assertTrue(dt.weekday() < 5, f"{date_str} must be a weekday")
+
+        # Weekend-only holidays in the file
+        weekend_holidays = {
+            "2026-02-15": "Sunday",    # Mahashivratri
+            "2026-03-21": "Saturday",  # Id-Ul-Fitr
+            "2026-08-15": "Saturday",  # Independence Day
+        }
+        for date_str, exp_day in weekend_holidays.items():
+            self.assertIn(date_str, holidays)
+            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+            self.assertTrue(dt.weekday() >= 5, f"{date_str} must be a weekend")
+            self.assertEqual(weekday_names[dt.weekday()], exp_day)
 
 
 if __name__ == "__main__":
     unittest.main()
+

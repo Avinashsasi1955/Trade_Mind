@@ -9,10 +9,11 @@ Requires Python 3.12. Local preview dependencies are installed from `requirement
 Copy `.env.example` to `.env` and add provider credentials there. The server loads this file at startup without overriding environment variables supplied by a production secret manager. `.env` is excluded from Git and Docker builds.
 
 ```bash
+python scripts/sync_trading_calendar.py --verify-today
 python3 -m backend.server
 ```
 
-The command above is loopback development only. Production containers run `uvicorn backend.asgi:app` behind the HTTPS load balancer and WAF.
+The command above is loopback development only. Production containers run `uvicorn backend.asgi:app` behind the HTTPS load balancer and WAF. Note that the NSE trading calendar for 2026 is loaded from `data/nse_holidays_2026.json`. A CRITICAL alert is raised if fewer than 30 future session days remain.
 
 Open `http://127.0.0.1:4173` and sign in with:
 
@@ -22,6 +23,7 @@ Open `http://127.0.0.1:4173` and sign in with:
 Run tests:
 
 ```bash
+python scripts/sync_trading_calendar.py
 python3 -m unittest discover -s tests -v
 ```
 

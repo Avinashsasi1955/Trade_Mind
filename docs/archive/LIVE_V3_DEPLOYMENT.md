@@ -18,12 +18,15 @@ References: [SEBI retail algo circular](https://www.sebi.gov.in/legal/circulars/
 3. Apply `migrations/postgres/v3_0_production.sql` using a dedicated migration role. Verify constraints, trigger behavior and point-in-time restore before importing data.
 4. Run exactly one Celery Beat instance. Start FinBERT workers with concurrency `1`; scale by adding explicitly sized workers rather than increasing concurrency inside a memory-constrained process.
 5. Configure PostgreSQL backups, WAL archiving, TLS, connection limits and alerts. Configure Redis authentication, TLS/persistence and memory eviction policy appropriate for a task broker.
+6. Synchronize Exchange Trading Calendar: Run `python scripts/sync_trading_calendar.py --verify-today` on every deployment and CI/startup preflight.
+   *Notice on Calendar Horizon:* The calendar dataset currently covers 2026 via `data/nse_holidays_2026.json`. Preflight emits a CRITICAL warning when fewer than 30 future sessions remain. Prior to December 2026, `data/nse_holidays_2027.json` must be committed and synced via `python scripts/sync_trading_calendar.py --year 2027` to prevent production startup blocks.
 
 Staging command after secrets are configured:
 
 ```bash
 docker compose -f docker-compose.v3.yml config
 docker compose -f docker-compose.v3.yml up -d postgres redis worker beat
+python scripts/sync_trading_calendar.py --verify-today
 ```
 
 ## 3. Migrate SQLite data with reconciliation

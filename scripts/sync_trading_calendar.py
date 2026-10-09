@@ -173,6 +173,10 @@ def verify_today_calendar(engine: Any, exchange: str = "NSE", fail_loudly: bool 
             text("SELECT session_status, opens_at, closes_at, source FROM exchange_trading_calendar WHERE exchange = :ex AND session_date = :day"),
             {"ex": exchange, "day": today_ist}
         ).mappings().one_or_none()
+        future_count = int(conn.execute(
+            text("SELECT COUNT(*) FROM exchange_trading_calendar WHERE exchange = :ex AND session_date > :day"),
+            {"ex": exchange, "day": today_ist}
+        ).scalar() or 0)
 
     if row is None:
         msg = (
@@ -184,7 +188,13 @@ def verify_today_calendar(engine: Any, exchange: str = "NSE", fail_loudly: bool 
             raise RuntimeError(msg)
         return False
 
-    logger.info(f"Verified {exchange} session for today ({today_ist}): {row['session_status']} ({row['source']})")
+    if future_count < 30:
+        logger.critical(
+            f"CRITICAL: Loaded calendar for {exchange} has only {future_count} future days remaining (< 30 days)! "
+            f"Please load the upcoming year's calendar via scripts/sync_trading_calendar.py --year {today_ist.year + 1}."
+        )
+
+    logger.info(f"Verified {exchange} session for today ({today_ist}): {row['session_status']} ({row['source']}); {future_count} future days remaining.")
     return True
 
 

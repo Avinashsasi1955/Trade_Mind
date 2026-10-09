@@ -2294,6 +2294,121 @@ class LivePaperInference:
         except Exception as exc:
             return {"inserted":0,"error":type(exc).__name__}
 
+    def _record_swing_rejection_audit(
+        self,
+        item: Dict[str, Any],
+        target: Optional[Dict[str, Any]],
+        model_version: Optional[str],
+        reject_code: str,
+    ) -> None:
+        """Record swing candidate rejection in trade_candidate_audits table.
+
+        - Converts string side ('BUY'/'SELL') to INTEGER signal (1 / -1) as required by Postgres schema.
+        - Includes trade_mode only if the column exists in trade_candidate_audits (v3_17 migration).
+        - Emits a warning with full SQL error on failures instead of swallowing.
+        """
+        raw_sig = item.get("signal")
+        if raw_sig is not None and str(raw_sig).lstrip("-").isdigit():
+            sig_int = int(raw_sig)
+        else:
+            s_val = str((target or {}).get("side") or "").upper()
+            sig_int = 1 if s_val == "BUY" else (-1 if s_val == "SELL" else 0)
+
+        wm = (item.get("session") or {}).get("timestamp") or datetime.now(timezone.utc)
+        if isinstance(wm, str):
+            try:
+                wm_dt = datetime.fromisoformat(wm)
+            except Exception:
+                wm_dt = datetime.now(timezone.utc)
+        else:
+            wm_dt = wm
+
+        wm_start = wm_dt - timedelta(minutes=2)
+        wm_end = wm_dt + timedelta(minutes=2)
+
+        sym = str(item.get("symbol") or "")
+        inst_id = int(item.get("instrument_id") or 0) or None
+
+        try:
+            from sqlalchemy import inspect
+            insp = inspect(self.engine)
+            cols = {c["name"] for c in insp.get_columns("trade_candidate_audits")}
+            has_trade_mode = "trade_mode" in cols
+        except Exception:
+            has_trade_mode = False
+
+        try:
+            with self.engine.begin() as connection:
+                updated = connection.execute(text("""
+                    UPDATE trade_candidate_audits
+                    SET accepted = FALSE,
+                        rejection_reason = :reason,
+                        selector_stage = 'swing_risk'
+                    WHERE symbol = :symbol 
+                      AND observed_at >= :wm_start
+                      AND observed_at <= :wm_end
+                      AND (accepted = TRUE OR accepted = 1)
+                      AND (instrument_id = :instrument_id OR instrument_id IS NULL)
+                      AND (model_version = :model_version OR model_version IS NULL)
+                """), {
+                    "symbol": sym,
+                    "instrument_id": inst_id,
+                    "model_version": model_version,
+                    "wm_start": wm_start,
+                    "wm_end": wm_end,
+                    "reason": reject_code,
+                }).rowcount
+
+                if not updated:
+                    if has_trade_mode:
+                        connection.execute(text("""
+                            INSERT INTO trade_candidate_audits (
+                                observed_at, model_version, exchange, symbol, instrument_id,
+                                signal, probability, decision_price, selector_stage, accepted,
+                                rejection_reason, trade_mode
+                            ) VALUES (
+                                :observed_at, :model_version, :exchange, :symbol, :instrument_id,
+                                :signal, :probability, :decision_price, 'swing_risk', FALSE,
+                                :reason, 'SWING'
+                            )
+                        """), {
+                            "observed_at": wm_dt,
+                            "model_version": model_version,
+                            "exchange": item.get("exchange", "NSE"),
+                            "symbol": sym,
+                            "instrument_id": inst_id,
+                            "signal": sig_int,
+                            "probability": float(item.get("probability") or 0.0),
+                            "decision_price": float((target or {}).get("price") or 0.0),
+                            "reason": reject_code,
+                        })
+                    else:
+                        connection.execute(text("""
+                            INSERT INTO trade_candidate_audits (
+                                observed_at, model_version, exchange, symbol, instrument_id,
+                                signal, probability, decision_price, selector_stage, accepted,
+                                rejection_reason
+                            ) VALUES (
+                                :observed_at, :model_version, :exchange, :symbol, :instrument_id,
+                                :signal, :probability, :decision_price, 'swing_risk', FALSE,
+                                :reason
+                            )
+                        """), {
+                            "observed_at": wm_dt,
+                            "model_version": model_version,
+                            "exchange": item.get("exchange", "NSE"),
+                            "symbol": sym,
+                            "instrument_id": inst_id,
+                            "signal": sig_int,
+                            "probability": float(item.get("probability") or 0.0),
+                            "decision_price": float((target or {}).get("price") or 0.0),
+                            "reason": reject_code,
+                        })
+        except Exception as audit_err:
+            logger.warning(
+                f"Failed to record swing rejection in candidate audit log for {sym} ({reject_code}): {audit_err}"
+            )
+
     def _calculate_weighted_ensemble_score(
         self,
         item: Dict,
@@ -3502,75 +3617,23 @@ class LivePaperInference:
                         reject_code = swing_reason or "SWING_REJECTED_UNKNOWN"
                         logger.warning(f"Swing setup rejected for {item.get('symbol')} ({reject_code}); skipping candidate")
                         rejected += 1
-                        try:
-                            with self.engine.begin() as connection:
-                                updated = connection.execute(text("""
-                                    UPDATE trade_candidate_audits
-                                    SET accepted = FALSE,
-                                        rejection_reason = :reason,
-                                        selector_stage = 'swing_risk'
-                                    WHERE symbol = :symbol 
-                                      AND observed_at >= :watermark - INTERVAL '2 minutes'
-                                      AND observed_at <= :watermark + INTERVAL '2 minutes'
-                                      AND accepted = TRUE
-                                      AND (instrument_id = :instrument_id OR instrument_id IS NULL)
-                                      AND (model_version = :model_version OR model_version IS NULL)
-                                """), {
-                                    "symbol": item.get("symbol"),
-                                    "instrument_id": int(item.get("instrument_id") or 0) or None,
-                                    "model_version": model.get("version"),
-                                    "watermark": item["session"]["timestamp"],
-                                    "reason": reject_code
-                                }).rowcount
-                                if not updated:
-                                    connection.execute(text("""
-                                        INSERT INTO trade_candidate_audits (
-                                            observed_at, model_version, exchange, symbol, instrument_id,
-                                            signal, probability, decision_price, selector_stage, accepted,
-                                            rejection_reason, trade_mode
-                                        ) VALUES (
-                                            :observed_at, :model_version, :exchange, :symbol, :instrument_id,
-                                            :signal, :probability, :decision_price, 'swing_risk', FALSE,
-                                            :reason, 'SWING'
-                                        )
-                                    """), {
-                                        "observed_at": item["session"]["timestamp"],
-                                        "model_version": model.get("version"),
-                                        "exchange": item.get("exchange", "NSE"),
-                                        "symbol": item.get("symbol"),
-                                        "instrument_id": int(item.get("instrument_id") or 0) or None,
-                                        "signal": target.get("side", "BUY"),
-                                        "probability": float(item.get("probability") or 0.0),
-                                        "decision_price": float(target.get("price") or 0.0),
-                                        "reason": reject_code,
-                                    })
-                        except Exception as audit_err:
-                            logger.debug(f"Failed to record swing rejection in candidate audit log: {audit_err}")
+                        self._record_swing_rejection_audit(
+                            item=item,
+                            target=target,
+                            model_version=model.get("version"),
+                            reject_code=reject_code,
+                        )
                         continue
                 except Exception as sw_exc:
                     logger.warning(f"Swing risk computation failed for {item.get('symbol')}: {sw_exc}; skipping candidate")
                     rejected += 1
-                    try:
-                        with self.engine.begin() as connection:
-                            connection.execute(text("""
-                                UPDATE trade_candidate_audits
-                                SET accepted = FALSE,
-                                    rejection_reason = 'SWING_REJECTED_ERROR',
-                                    selector_stage = 'swing_risk'
-                                WHERE symbol = :symbol 
-                                  AND observed_at >= :watermark - INTERVAL '2 minutes'
-                                  AND observed_at <= :watermark + INTERVAL '2 minutes'
-                                  AND accepted = TRUE
-                                  AND (instrument_id = :instrument_id OR instrument_id IS NULL)
-                                  AND (model_version = :model_version OR model_version IS NULL)
-                            """), {
-                                "symbol": item.get("symbol"),
-                                "instrument_id": int(item.get("instrument_id") or 0) or None,
-                                "model_version": model.get("version"),
-                                "watermark": item["session"]["timestamp"],
-                            })
-                    except Exception:
-                        pass
+                    self._record_swing_rejection_audit(
+                        item=item,
+                        target=target,
+                        model_version=model.get("version"),
+                        reject_code="SWING_REJECTED_ERROR",
+                    )
+                    continue
                     continue
 
             if str(target.get("kind", "")).upper() in {"CE", "PE"}:
@@ -3984,3 +4047,7 @@ class LivePaperInference:
                 "provisional_intraday_model":provisional_intraday,
                 "evidence_quality":"exploratory paper evidence" if provisional_intraday else "formal completed-bar evidence",
                 "orders_allowed":False}
+
+
+LiveInferenceService = LivePaperInference
+
