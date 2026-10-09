@@ -698,6 +698,38 @@ def run_profit_harvest_ab_replay(
     exclusion_reasons: Dict[str, int] = {}
     valid_trades: List[Dict[str, Any]] = []
 
+    def _has_1m_resolution(bars_list: List[Dict[str, Any]]) -> bool:
+        if not bars_list:
+            return False
+        if any(b.get("interval") in ("1minute", "1m") for b in bars_list[:5]):
+            return True
+        if len(bars_list) >= 2 and (bars_list[0].get("bar_time") or bars_list[0].get("timestamp")) and (bars_list[1].get("bar_time") or bars_list[1].get("timestamp")):
+            try:
+                bt0 = bars_list[0].get("bar_time") or bars_list[0].get("timestamp")
+                bt1 = bars_list[1].get("bar_time") or bars_list[1].get("timestamp")
+                t0 = datetime.fromisoformat(bt0) if isinstance(bt0, str) else bt0
+                t1 = datetime.fromisoformat(bt1) if isinstance(bt1, str) else bt1
+                if 0 < abs((t1 - t0).total_seconds()) <= 60:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    # Pick one resolution per run: 1-minute where present, else 5-minute
+    has_1m_in_run = False
+    for t in trade_samples:
+        r_bars = t.get("bars") or []
+        if _has_1m_resolution(r_bars):
+            has_1m_in_run = True
+            break
+        bars_1m_check = [b for b in r_bars if b.get("interval") in ("1minute", "1m")]
+        if bars_1m_check:
+            has_1m_in_run = True
+            break
+
+    run_resolution = "1m" if has_1m_in_run else "5m"
+    dropped_resolution_count = 0
+
     for t in trade_samples:
         raw_bars = t.get("bars") or []
         if not raw_bars:
@@ -711,16 +743,30 @@ def run_profit_harvest_ab_replay(
         else:
             candidate_bars = raw_bars
 
-        # Walk on 1-minute bars if present; else 5m (never mixed)
+        # Filter strictly to the chosen run resolution
         bars_1m = [b for b in candidate_bars if b.get("interval") in ("1minute", "1m")]
         bars_5m = [b for b in candidate_bars if b.get("interval") in ("5minute", "5m")]
 
-        if bars_1m:
-            chosen_bars = bars_1m
-        elif bars_5m:
-            chosen_bars = bars_5m
+        if run_resolution == "1m":
+            if bars_1m:
+                chosen_bars = bars_1m
+            elif _has_1m_resolution(candidate_bars):
+                chosen_bars = candidate_bars
+            else:
+                trades_excluded += 1
+                dropped_resolution_count += 1
+                exclusion_reasons["DROPPED_NOT_1M_RESOLUTION"] = exclusion_reasons.get("DROPPED_NOT_1M_RESOLUTION", 0) + 1
+                continue
         else:
-            chosen_bars = candidate_bars
+            if bars_5m:
+                chosen_bars = bars_5m
+            elif not _has_1m_resolution(candidate_bars):
+                chosen_bars = candidate_bars
+            else:
+                trades_excluded += 1
+                dropped_resolution_count += 1
+                exclusion_reasons["DROPPED_NOT_5M_RESOLUTION"] = exclusion_reasons.get("DROPPED_NOT_5M_RESOLUTION", 0) + 1
+                continue
 
         # Validate continuity: coverage with no gaps > 10m
         is_valid, exc_reason = validate_bar_continuity(
@@ -888,6 +934,11 @@ def run_profit_harvest_ab_replay(
             except Exception:
                 pass
 
+        sub_minute_exits = {"EARLY_ADVERSE_CUT", "STAGNATION_GUARD"}
+        is_sub_minute_unmodelled = (run_resolution != "1m" and rec_reason in sub_minute_exits)
+        is_unmodelled_trade = (rec_reason in UNMODELLED_EXITS) or is_sub_minute_unmodelled
+        is_core_trade = (rec_reason in MODELLED_CORE_EXITS) and not is_sub_minute_unmodelled
+
         eval_records.append({
             "id": t.get("id"),
             "symbol": t.get("symbol"),
@@ -908,8 +959,8 @@ def run_profit_harvest_ab_replay(
             "diff_r_match": diff_r_match,
             "reason_match": reason_match,
             "fell_through": fell_through,
-            "is_core": (rec_reason in MODELLED_CORE_EXITS),
-            "is_unmodelled": (rec_reason in UNMODELLED_EXITS),
+            "is_core": is_core_trade,
+            "is_unmodelled": is_unmodelled_trade,
             "is_triggered": is_triggered,
             "trade_mode": str(t.get("trade_mode") or "INTRADAY").upper(),
             "trade_date": t_date,
@@ -922,7 +973,7 @@ def run_profit_harvest_ab_replay(
 
     core_trades = [r for r in eval_records if r["is_core"]]
     core_matched = sum(1 for r in core_trades if r["diff_r_match"])
-    fidelity_core_pct = (core_matched / len(core_trades) * 100.0) if core_trades else 100.0
+    fidelity_core_pct = (core_matched / len(core_trades) * 100.0) if core_trades else 0.0
 
     unmodelled_count = sum(1 for r in eval_records if r["is_unmodelled"])
 
@@ -977,15 +1028,15 @@ def run_profit_harvest_ab_replay(
             "ci_95": (round(m_ci[0], 4), round(m_ci[1], 4)),
         }
 
-    # Recommendation determination (Phase 2d):
-    # 1. Fidelity gate: >= 80% on both overall and modelled subset
+    # Recommendation determination (Phase 2d / 3b):
+    # 1. Fidelity gate: >= 80% on both overall and modelled subset, and at least 1 modelled exit trade
     # 2. Triggered gate: >= 100 triggered trades in the TEST half
-    # 3. Test CI: strictly excludes zero (> 0.0) for ENABLE
-    if fidelity_all_pct < 80.0 or fidelity_core_pct < 80.0:
+    # 3. Test CI & Train Delta: BOTH test CI lower bound > 0.0 AND train-half mean delta > 0.0 for ENABLE
+    if len(core_trades) == 0 or fidelity_all_pct < 80.0 or fidelity_core_pct < 80.0:
         recommendation = "REPLAY_NOT_FAITHFUL"
     elif test_triggered_count < 100:
         recommendation = "INSUFFICIENT_TRIGGERED_TRADES"
-    elif test_ci_95[0] > 0.0:
+    elif test_ci_95[0] > 0.0 and train_delta_mean_r > 0.0:
         recommendation = "ENABLE"
     elif test_ci_95[1] < 0.0:
         recommendation = "KEEP_OFF"
@@ -1010,6 +1061,8 @@ def run_profit_harvest_ab_replay(
             "trades_used": N,
             "trades_excluded": trades_excluded,
             "exclusion_reasons": exclusion_reasons,
+            "run_resolution": run_resolution,
+            "dropped_resolution_count": dropped_resolution_count,
         },
         "fidelity": {
             "trades_compared": N,

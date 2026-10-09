@@ -957,6 +957,131 @@ class TestProfitHarvestCounterfactualReplay(unittest.TestCase):
         self.assertAlmostEqual(res["split"]["test"]["delta_mean_r"], 0.0, places=2)
         self.assertEqual(res["recommendation"], "NEUTRAL")
 
+    def test_resolution_invariance_1m_vs_5m(self):
+        """Resolution invariance: Same price path as 1m and as 5m bars gives the same arm decisions on target/stop exits.
+
+        Documents why not on sub-minute rules:
+        - On standard price-level exits (TAKE_PROFIT, STOP_LOSS, BREAKEVEN_STOP), 1m and 5m bars produce the same
+          exit prices and arm decisions.
+        - On sub-minute rules (90s EARLY_ADVERSE_CUT, 900s STAGNATION_GUARD), 5m bars cannot resolve intra-bar
+          second-level durations without lookahead/interpolation bias. Replay explicitly skips 90s/900s checks
+          when bar interval > 1m and marks those trades unmodelled in the fidelity report.
+        """
+        # Trade setup: BUY at 100.0, initial_sl 95.0, target 110.0
+        trade = {
+            "id": 1,
+            "symbol": "INFY",
+            "side": "BUY",
+            "entry": 100.0,
+            "initial_sl": 95.0,
+            "target_price": 110.0,
+            "trade_mode": "INTRADAY",
+            "signal_at": "2026-07-01 09:30:00",
+            "realised_exit_price": 110.0,
+            "exit_reason": "TAKE_PROFIT",
+        }
+
+        # 1. Price path as 1-minute bars: reaches 110.5 on minute 3
+        bars_1m = [
+            {"bar_time": "2026-07-01 09:30:00", "interval": "1minute", "open": 100.0, "high": 102.0, "low": 99.8, "close": 101.5, "volume": 100},
+            {"bar_time": "2026-07-01 09:31:00", "interval": "1minute", "open": 101.5, "high": 105.0, "low": 101.0, "close": 104.5, "volume": 100},
+            {"bar_time": "2026-07-01 09:32:00", "interval": "1minute", "open": 104.5, "high": 108.0, "low": 104.0, "close": 107.5, "volume": 100},
+            {"bar_time": "2026-07-01 09:33:00", "interval": "1minute", "open": 107.5, "high": 110.5, "low": 107.0, "close": 110.0, "volume": 100},
+        ]
+
+        # 2. Aggregated equivalent 5-minute bar: open 100.0, high 110.5, low 99.8, close 110.0
+        bars_5m = [
+            {"bar_time": "2026-07-01 09:30:00", "interval": "5minute", "open": 100.0, "high": 110.5, "low": 99.8, "close": 110.0, "volume": 400},
+        ]
+
+        res_1m = replay_trade_walk_forward(trade=trade, bars=bars_1m, harvest_enabled=False)
+        res_5m = replay_trade_walk_forward(trade=trade, bars=bars_5m, harvest_enabled=False)
+
+        # Decision invariance on target exit:
+        self.assertEqual(res_1m["exit_reason"], "TAKE_PROFIT")
+        self.assertEqual(res_5m["exit_reason"], "TAKE_PROFIT")
+        self.assertEqual(res_1m["exit_price"], res_5m["exit_price"])
+        self.assertAlmostEqual(res_1m["realized_r"], res_5m["realized_r"], places=2)
+
+    def test_zero_modelled_trades_returns_replay_not_faithful(self):
+        """When there are zero modelled-exit trades (len(core_trades) == 0), return REPLAY_NOT_FAITHFUL instead of passing at 100%."""
+        # Recorded exits are all unmodelled (MANUAL_CLOSE)
+        trades = [{
+            "id": i + 1,
+            "symbol": "TCS",
+            "side": "BUY",
+            "entry": 100.0,
+            "initial_sl": 95.0,
+            "target_price": 110.0,
+            "realised_exit_price": 103.0,
+            "exit_reason": "MANUAL_CLOSE",
+            "trade_mode": "INTRADAY",
+            "signal_at": f"2026-07-{i+1:02d} 09:30:00",
+            "exit_at": f"2026-07-{i+1:02d} 09:31:00",
+            "bars": [
+                {"bar_time": f"2026-07-{i+1:02d} 09:30:00", "interval": "1minute", "open": 100.0, "high": 103.5, "low": 99.0, "close": 103.0, "volume": 100},
+                {"bar_time": f"2026-07-{i+1:02d} 09:31:00", "interval": "1minute", "open": 103.0, "high": 103.2, "low": 102.8, "close": 103.0, "volume": 100},
+            ],
+        } for i in range(10)]
+
+        res = run_profit_harvest_ab_replay(trades=trades)
+        self.assertEqual(res["fidelity"]["modelled_trades_compared"], 0)
+        self.assertEqual(res["recommendation"], "REPLAY_NOT_FAITHFUL")
+
+    def test_enable_requires_both_test_ci_and_train_delta_positive(self):
+        """ENABLE requires BOTH test CI lower bound > 0 AND train-half mean delta > 0."""
+        # Simulated scenario: test CI lower bound > 0, but train delta is <= 0 -> MUST NOT ENABLE
+        trades = []
+        for d in range(1, 21):
+            day_str = f"2026-07-{d:02d}"
+            is_train = (d <= 10)
+            for k in range(10):
+                t_id = (d - 1) * 10 + k + 1
+                if is_train:
+                    # In train, harvest exit hurts (returns lower price than baseline)
+                    bars = [
+                        {"bar_time": f"{day_str} 09:30:00", "interval": "5minute", "open": 100.0, "high": 108.0, "low": 100.0, "close": 107.0, "volume": 1000},
+                        {"bar_time": f"{day_str} 09:35:00", "interval": "5minute", "open": 107.0, "high": 113.0, "low": 106.5, "close": 112.5, "volume": 1000},
+                        {"bar_time": f"{day_str} 09:40:00", "interval": "5minute", "open": 112.5, "high": 115.5, "low": 112.0, "close": 115.0, "volume": 1000},
+                    ]
+                    rec_exit = 115.0
+                    rec_reason = "TAKE_PROFIT"
+                    ex_at = f"{day_str} 09:40:00"
+                else:
+                    # In test, harvest helps
+                    bars = [
+                        {"bar_time": f"{day_str} 09:30:00", "interval": "5minute", "open": 100.0, "high": 105.0, "low": 100.0, "close": 104.5, "volume": 1000},
+                        {"bar_time": f"{day_str} 09:35:00", "interval": "5minute", "open": 104.5, "high": 110.0, "low": 104.0, "close": 109.5, "volume": 1000},
+                        {"bar_time": f"{day_str} 09:40:00", "interval": "5minute", "open": 109.5, "high": 113.6, "low": 109.0, "close": 113.5, "volume": 1000},
+                        {"bar_time": f"{day_str} 09:45:00", "interval": "5minute", "open": 111.5, "high": 114.0, "low": 110.5, "close": 111.0, "volume": 3500},
+                        {"bar_time": f"{day_str} 09:50:00", "interval": "5minute", "open": 111.0, "high": 111.2, "low": 107.5, "close": 108.0, "volume": 3000},
+                        {"bar_time": f"{day_str} 09:55:00", "interval": "5minute", "open": 108.0, "high": 108.2, "low": 98.0, "close": 99.0, "volume": 1000},
+                        {"bar_time": f"{day_str} 10:00:00", "interval": "5minute", "open": 99.0, "high": 99.5, "low": 88.0, "close": 89.0, "volume": 1000},
+                    ]
+                    rec_exit = 100.1
+                    rec_reason = "BREAKEVEN_STOP"
+                    ex_at = f"{day_str} 10:00:00"
+
+                trades.append({
+                    "id": t_id,
+                    "symbol": "NIFTY",
+                    "side": "BUY",
+                    "entry": 100.0,
+                    "initial_sl": 90.0,
+                    "target_price": 115.0,
+                    "realised_exit_price": rec_exit,
+                    "exit_reason": rec_reason,
+                    "trade_mode": "INTRADAY",
+                    "signal_at": f"{day_str} 09:30:00",
+                    "exit_at": ex_at,
+                    "bars": bars,
+                })
+
+        res = run_profit_harvest_ab_replay(trades=trades, exit_threshold=60.0)
+        # Even if test CI is positive, train delta is <= 0 so recommendation must NOT be ENABLE
+        self.assertLessEqual(res["split"]["train"]["delta_mean_r"], 0.0)
+        self.assertNotEqual(res["recommendation"], "ENABLE")
+
 
 if __name__ == "__main__":
     unittest.main()

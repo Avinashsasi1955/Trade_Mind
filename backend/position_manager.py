@@ -1888,13 +1888,15 @@ def replay_trade_walk_forward(
     current_5m_bucket_bars: List[Dict[str, Any]] = []
     current_bucket_min: Optional[int] = None
     is_5m_input = False
-    if bars and any(b.get("interval") in ("5minute", "5m") for b in bars[:2]):
+    if bars and any(b.get("interval") in ("5minute", "5m", "15minute", "15m", "30minute", "30m", "60minute", "60m", "day") for b in bars[:2]):
         is_5m_input = True
-    elif len(bars) >= 2 and bars[0].get("bar_time") and bars[1].get("bar_time"):
+    elif len(bars) >= 2 and (bars[0].get("bar_time") or bars[0].get("timestamp")) and (bars[1].get("bar_time") or bars[1].get("timestamp")):
         try:
-            t0 = datetime.fromisoformat(bars[0]["bar_time"]) if isinstance(bars[0]["bar_time"], str) else bars[0]["bar_time"]
-            t1 = datetime.fromisoformat(bars[1]["bar_time"]) if isinstance(bars[1]["bar_time"], str) else bars[1]["bar_time"]
-            if abs((t1 - t0).total_seconds()) >= 240:
+            bt0 = bars[0].get("bar_time") or bars[0].get("timestamp")
+            bt1 = bars[1].get("bar_time") or bars[1].get("timestamp")
+            t0 = datetime.fromisoformat(bt0) if isinstance(bt0, str) else bt0
+            t1 = datetime.fromisoformat(bt1) if isinstance(bt1, str) else bt1
+            if abs((t1 - t0).total_seconds()) > 60:
                 is_5m_input = True
         except Exception:
             pass
@@ -1971,15 +1973,15 @@ def replay_trade_walk_forward(
             current_r = ((b_close - entry) / r_points) if side == "BUY" else ((entry - b_close) / r_points)
             favorable_r_now = ((best_favourable - entry) / r_points) if side == "BUY" else ((entry - best_favourable) / r_points)
 
-            # RULE 1: Immediate Adverse Cut (0 to 90 seconds)
-            if elapsed_seconds <= ADVERSE_CUT_WINDOW_SECONDS:
+            # RULE 1: Immediate Adverse Cut (0 to 90 seconds) - skip if bar interval > 1m
+            if not is_5m_input and elapsed_seconds <= ADVERSE_CUT_WINDOW_SECONDS:
                 if current_r <= -ADVERSE_CUT_THRESHOLD_R and favorable_r_now <= Decimal("0.10"):
                     exit_price = b_close
                     exit_reason = "EARLY_ADVERSE_CUT"
                     break
 
-            # RULE 2: 15-Minute STAGNATION_GUARD (900 seconds)
-            if elapsed_seconds >= STAGNATION_SCRATCH_SECONDS:
+            # RULE 2: 15-Minute STAGNATION_GUARD (900 seconds) - skip if bar interval > 1m
+            if not is_5m_input and elapsed_seconds >= STAGNATION_SCRATCH_SECONDS:
                 if favorable_r_now < STAGNATION_MIN_EXPANSION_R:
                     exit_price = b_close
                     exit_reason = "STAGNATION_GUARD"
@@ -2014,8 +2016,8 @@ def replay_trade_walk_forward(
         if favorable_r >= Decimal(str(trailing_trigger_r)):
             trailing_stop_price = (best_favourable - Decimal(str(trailing_giveback_r)) * r_points) if side == "BUY" else (best_favourable + Decimal(str(trailing_giveback_r)) * r_points)
 
-        # 5-minute Stagnation Tighten (300 seconds)
-        if trade_mode not in ("SWING", "POSITIONAL") and elapsed_seconds >= STAGNATION_TIGHTEN_SECONDS and favorable_r < Decimal("0.20"):
+        # 5-minute Stagnation Tighten (300 seconds) - skip if bar interval > 1m
+        if not is_5m_input and trade_mode not in ("SWING", "POSITIONAL") and elapsed_seconds >= STAGNATION_TIGHTEN_SECONDS and favorable_r < Decimal("0.20"):
             stag_sl = (entry - STAGNATION_TIGHTEN_R * r_points) if side == "BUY" else (entry + STAGNATION_TIGHTEN_R * r_points)
             if side == "BUY" and (running_sl is None or stag_sl > running_sl):
                 running_sl = stag_sl
@@ -2119,14 +2121,18 @@ def replay_trade_walk_forward(
                 elif breakeven_price and running_sl <= breakeven_price:
                     running_sl_reason = "BREAKEVEN_STOP"
 
+    exit_bar_time = None
     if exit_price is None:
         last_b = bars[-1]
+        exit_bar_time = last_b.get("bar_time") or last_b.get("timestamp")
         if pending_market_exit is not None:
             exit_price = Decimal(str(last_b.get("close_price") if last_b.get("close_price") is not None else last_b.get("close", entry)))
             exit_reason = pending_market_exit
         else:
             exit_price = Decimal(str(trade.get("realised_exit_price") or last_b.get("close_price") or last_b.get("close") or entry))
             exit_reason = "FELL_THROUGH_TO_RECORDED"
+    else:
+        exit_bar_time = b_time
 
     # Apply fees and 2-tick slippage
     slippage_per_share = Decimal(str(tick_size)) * Decimal("2")
@@ -2135,11 +2141,21 @@ def replay_trade_walk_forward(
     net_pnl = gross_pnl - fees
     realized_r = float(((net_exit - entry) - (fees / quantity)) / r_points) if side == "BUY" else float(((entry - net_exit) - (fees / quantity)) / r_points)
 
+    exit_date_str = None
+    if exit_bar_time:
+        try:
+            edt = datetime.fromisoformat(str(exit_bar_time))
+            exit_date_str = (edt.astimezone(IST).date() if edt.tzinfo else edt.date()).isoformat()
+        except Exception:
+            pass
+
     return {
         "exit_price": float(exit_price),
         "exit_reason": exit_reason,
         "net_pnl": float(net_pnl),
         "realized_r": round(realized_r, 4),
         "max_favorable": float(best_favourable),
+        "exit_time": str(exit_bar_time) if exit_bar_time else None,
+        "exit_date": exit_date_str,
     }
 

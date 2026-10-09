@@ -12,13 +12,15 @@ import numpy as np
 
 
 class PurgedGroupTimeSeriesSplit:
-    """Chronological walk-forward split grouped by trading day with purge and embargo buffers."""
+    """Chronological walk-forward / purged K-fold split grouped by trading day with purge and embargo buffers."""
 
     def __init__(
         self,
         n_splits: int = 5,
         purge_days: int = 5,
         embargo_days: int = 2,
+        max_label_horizon_days: int = 1,
+        cv_mode: str = "expanding",
         min_train_days: Optional[int] = None,
     ) -> None:
         if n_splits < 1:
@@ -27,10 +29,15 @@ class PurgedGroupTimeSeriesSplit:
             raise ValueError(f"purge_days must be non-negative, got {purge_days}")
         if embargo_days < 0:
             raise ValueError(f"embargo_days must be non-negative, got {embargo_days}")
+        if max_label_horizon_days < 1:
+            raise ValueError(f"max_label_horizon_days must be at least 1, got {max_label_horizon_days}")
 
         self.n_splits = int(n_splits)
-        self.purge_days = int(purge_days)
+        # Purge must be at least the maximum label horizon in trading days
+        self.purge_days = max(int(purge_days), int(max_label_horizon_days))
+        self.max_label_horizon_days = int(max_label_horizon_days)
         self.embargo_days = int(embargo_days)
+        self.cv_mode = str(cv_mode).lower()  # "expanding" or "kfold"
         self.min_train_days = min_train_days
 
     def get_n_splits(self, X: Any = None, y: Any = None, groups: Any = None) -> int:
@@ -64,46 +71,73 @@ class PurgedGroupTimeSeriesSplit:
         unique_days = sorted(list(set(groups_arr)))
         n_days = len(unique_days)
 
-        min_required_days = self.n_splits + self.purge_days + 2
+        min_required_days = self.n_splits + self.purge_days + self.embargo_days + 2
         if n_days < min_required_days:
             raise ValueError(
                 f"Insufficient unique trading days ({n_days}) for {self.n_splits} splits "
-                f"with {self.purge_days} purge days (requires at least {min_required_days} days)."
+                f"with {self.purge_days} purge days and {self.embargo_days} embargo days "
+                f"(requires at least {min_required_days} days)."
             )
 
         day_to_indices = {day: np.where(groups_arr == day)[0] for day in unique_days}
 
-        # Determine initial train window and test fold window sizes in days
-        min_train = self.min_train_days or max(self.purge_days + 1, int(n_days * 0.40))
-        remaining_days = n_days - min_train
+        if self.cv_mode == "kfold":
+            # Purged K-Fold CV with post-test embargo
+            fold_size = max(1, n_days // self.n_splits)
+            for fold in range(self.n_splits):
+                test_start_idx = fold * fold_size
+                test_end_idx = test_start_idx + fold_size if fold < self.n_splits - 1 else n_days
+                test_days = unique_days[test_start_idx:test_end_idx]
 
-        test_fold_size = max(1, remaining_days // self.n_splits)
+                # Pre-test training days (must be prior to test_start minus purge_days)
+                pre_train_end = max(0, test_start_idx - self.purge_days)
+                pre_train_days = unique_days[:pre_train_end]
 
-        for fold in range(self.n_splits):
-            test_start_idx = min_train + (fold * test_fold_size)
-            test_end_idx = test_start_idx + test_fold_size if fold < self.n_splits - 1 else n_days
+                # Post-test training days (must be after test_end plus embargo_days)
+                post_train_start = min(n_days, test_end_idx + self.embargo_days)
+                post_train_days = unique_days[post_train_start:]
 
-            if test_start_idx >= n_days:
-                break
+                train_days = pre_train_days + post_train_days
+                if not train_days:
+                    raise ValueError(f"Fold {fold}: purge/embargo eliminated all training days.")
 
-            test_days = unique_days[test_start_idx:test_end_idx]
-            if not test_days:
-                continue
+                train_idx = np.concatenate([day_to_indices[d] for d in train_days])
+                test_idx = np.concatenate([day_to_indices[d] for d in test_days])
+                yield train_idx, test_idx
+        else:
+            # Expanding walk-forward mode with purge before test and embargo spacing
+            min_train = self.min_train_days or max(self.purge_days + 1, int(n_days * 0.40))
+            remaining_days = n_days - min_train
+            test_fold_size = max(1, remaining_days // self.n_splits)
 
-            # Train days strictly before test start minus purge buffer
-            train_end_idx = max(0, test_start_idx - self.purge_days)
-            train_days = unique_days[:train_end_idx]
+            cursor = min_train
+            for fold in range(self.n_splits):
+                test_start_idx = cursor
+                test_end_idx = min(n_days, test_start_idx + test_fold_size if fold < self.n_splits - 1 else n_days)
 
-            if not train_days:
-                raise ValueError(
-                    f"Fold {fold}: purge window ({self.purge_days} days) eliminated all training days."
-                )
+                if test_start_idx >= n_days:
+                    break
 
-            # Build array indices
-            train_idx = np.concatenate([day_to_indices[d] for d in train_days])
-            test_idx = np.concatenate([day_to_indices[d] for d in test_days])
+                test_days = unique_days[test_start_idx:test_end_idx]
+                if not test_days:
+                    continue
 
-            yield train_idx, test_idx
+                # Train days strictly before test start minus purge buffer
+                train_end_idx = max(0, test_start_idx - self.purge_days)
+                train_days = unique_days[:train_end_idx]
+
+                if not train_days:
+                    raise ValueError(
+                        f"Fold {fold}: purge window ({self.purge_days} days) eliminated all training days."
+                    )
+
+                train_idx = np.concatenate([day_to_indices[d] for d in train_days])
+                test_idx = np.concatenate([day_to_indices[d] for d in test_days])
+
+                yield train_idx, test_idx
+
+                # Advance cursor past test fold plus embargo buffer to prevent serial autocorrelation
+                cursor = test_end_idx + self.embargo_days
 
 
 def compute_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: Optional[np.ndarray] = None) -> Dict[str, float]:
