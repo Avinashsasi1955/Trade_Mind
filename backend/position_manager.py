@@ -1841,6 +1841,8 @@ def replay_trade_walk_forward(
     fee_buffer = ((fees * Decimal("2.5")) + (Decimal("2") * Decimal(str(tick_size)) * quantity)) / max(Decimal("1"), quantity)
 
     running_sl = initial_sl
+    running_sl_reason = "STOP_LOSS"
+    pending_market_exit: Optional[str] = None
     best_favourable = entry
     exit_price: Optional[Decimal] = None
     exit_reason: Optional[str] = None
@@ -1849,7 +1851,7 @@ def replay_trade_walk_forward(
     # Track 5m closed candles for reversal analysis
     closed_5m_bars: List[Dict[str, Any]] = []
 
-    for b in bars:
+    for i, b in enumerate(bars):
         b_open = Decimal(str(b.get("open_price") if b.get("open_price") is not None else b.get("open", entry)))
         b_high = Decimal(str(b.get("high_price") if b.get("high_price") is not None else b.get("high", entry)))
         b_low = Decimal(str(b.get("low_price") if b.get("low_price") is not None else b.get("low", entry)))
@@ -1857,7 +1859,75 @@ def replay_trade_walk_forward(
         b_vol = float(b.get("volume") or 0)
         b_time = b.get("bar_time")
 
-        # Update favorable excursion
+        # -------------------------------------------------------------
+        # STEP 1: IN-BAR CHECK OF PRIOR STOPS & TARGETS (BEFORE THIS BAR)
+        # -------------------------------------------------------------
+        if pending_market_exit is not None:
+            exit_price = b_open
+            exit_reason = pending_market_exit
+            break
+
+        # Check existing stop loss and take profit against current bar's range
+        if side == "BUY":
+            if running_sl and b_open <= running_sl:
+                exit_price = b_open
+                exit_reason = "GAP_DOWN_STOP"
+                break
+            elif running_sl and b_low <= running_sl:
+                exit_price = running_sl
+                exit_reason = running_sl_reason
+                break
+            elif take_profit and b_open >= take_profit:
+                exit_price = b_open
+                exit_reason = "TAKE_PROFIT"
+                break
+            elif take_profit and b_high >= take_profit:
+                exit_price = take_profit
+                exit_reason = "TAKE_PROFIT"
+                break
+        else:  # SELL
+            if running_sl and b_open >= running_sl:
+                exit_price = b_open
+                exit_reason = "GAP_UP_STOP"
+                break
+            elif running_sl and b_high >= running_sl:
+                exit_price = running_sl
+                exit_reason = running_sl_reason
+                break
+            elif take_profit and b_open <= take_profit:
+                exit_price = b_open
+                exit_reason = "TAKE_PROFIT"
+                break
+            elif take_profit and b_low <= take_profit:
+                exit_price = take_profit
+                exit_reason = "TAKE_PROFIT"
+                break
+
+        # Check modeled intraday force-flat exit at 15:15 IST
+        trade_mode = str(trade.get("trade_mode") or "INTRADAY").upper()
+        if trade_mode not in ("SWING", "POSITIONAL") and b_time:
+            try:
+                b_dt = datetime.fromisoformat(b_time) if isinstance(b_time, str) else b_time
+                ist_dt = b_dt.astimezone(IST) if getattr(b_dt, "tzinfo", None) else b_dt.replace(tzinfo=IST)
+                if ist_dt.hour > 15 or (ist_dt.hour == 15 and ist_dt.minute >= 15):
+                    exit_price = b_close
+                    exit_reason = "FORCE_FLAT"
+                    break
+            except Exception:
+                pass
+
+        # -------------------------------------------------------------
+        # STEP 2: BAR SURVIVED -> COMPUTE EXCURSION & RATCHETS AT CLOSE FOR NEXT BAR
+        # -------------------------------------------------------------
+        closed_5m_bars.append({
+            "open": float(b_open),
+            "high": float(b_high),
+            "low": float(b_low),
+            "close": float(b_close),
+            "volume": b_vol,
+            "bar_time": b_time,
+        })
+
         if side == "BUY":
             best_favourable = max(best_favourable, b_high)
             favorable_r = (best_favourable - entry) / r_points
@@ -1876,16 +1946,6 @@ def replay_trade_walk_forward(
         trailing_stop_price = None
         if favorable_r >= Decimal(str(trailing_trigger_r)):
             trailing_stop_price = (best_favourable - Decimal(str(trailing_giveback_r)) * r_points) if side == "BUY" else (best_favourable + Decimal(str(trailing_giveback_r)) * r_points)
-
-        # Accumulate 5m candle
-        closed_5m_bars.append({
-            "open": float(b_open),
-            "high": float(b_high),
-            "low": float(b_low),
-            "close": float(b_close),
-            "volume": b_vol,
-            "bar_time": b_time,
-        })
 
         # Profit-Harvest Layer (Only active when harvest_enabled is True)
         if harvest_enabled and take_profit is not None:
@@ -1913,9 +1973,8 @@ def replay_trade_walk_forward(
                         tighten_threshold=tighten_threshold,
                     )
                     if rev_res["action"] == "EXIT":
-                        exit_price = b_close
-                        exit_reason = "PROFIT_HARVEST_REVERSAL_EXIT"
-                        break
+                        # Takes effect at NEXT bar's open
+                        pending_market_exit = "PROFIT_HARVEST_REVERSAL_EXIT"
                     elif rev_res["action"] == "TIGHTEN":
                         harvest_stop = calculate_harvest_stop(
                             side=side,
@@ -1925,69 +1984,35 @@ def replay_trade_walk_forward(
                             lock_fraction=lock_fraction,
                         )
 
-        # Ratchet trailing stop loss
+        # Ratchet trailing stop loss for NEXT bar
         candidates = [p for p in (running_sl, profit_lock_price, breakeven_price, trailing_stop_price, harvest_stop if harvest_enabled else None) if p is not None]
         if candidates:
-            trailed_sl = max(candidates) if side == "BUY" else min(candidates)
-            if side == "BUY":
-                running_sl = max(running_sl, trailed_sl) if running_sl else trailed_sl
-            else:
-                running_sl = min(running_sl, trailed_sl) if running_sl else trailed_sl
-
-        # Check stops and targets execution on current bar
-        if side == "BUY":
-            if running_sl and b_open <= running_sl:
-                exit_price = b_open
-                exit_reason = "GAP_DOWN_STOP"
-                break
-            elif running_sl and b_low <= running_sl:
-                exit_price = running_sl
+            next_sl = max(candidates) if side == "BUY" else min(candidates)
+            if side == "BUY" and next_sl > running_sl:
+                running_sl = next_sl
                 if harvest_stop and running_sl == harvest_stop:
-                    exit_reason = "PROFIT_HARVEST_STOP"
+                    running_sl_reason = "PROFIT_HARVEST_STOP"
                 elif profit_lock_price and running_sl >= profit_lock_price:
-                    exit_reason = "TRAILING_STOP"
+                    running_sl_reason = "TRAILING_STOP"
                 elif breakeven_price and running_sl >= breakeven_price:
-                    exit_reason = "BREAKEVEN_STOP"
-                else:
-                    exit_reason = "STOP_LOSS"
-                break
-            elif take_profit and b_open >= take_profit:
-                exit_price = b_open
-                exit_reason = "TAKE_PROFIT"
-                break
-            elif take_profit and b_high >= take_profit:
-                exit_price = take_profit
-                exit_reason = "TAKE_PROFIT"
-                break
-        else:  # SELL
-            if running_sl and b_open >= running_sl:
-                exit_price = b_open
-                exit_reason = "GAP_UP_STOP"
-                break
-            elif running_sl and b_high >= running_sl:
-                exit_price = running_sl
+                    running_sl_reason = "BREAKEVEN_STOP"
+            elif side == "SELL" and next_sl < running_sl:
+                running_sl = next_sl
                 if harvest_stop and running_sl == harvest_stop:
-                    exit_reason = "PROFIT_HARVEST_STOP"
+                    running_sl_reason = "PROFIT_HARVEST_STOP"
                 elif profit_lock_price and running_sl <= profit_lock_price:
-                    exit_reason = "TRAILING_STOP"
+                    running_sl_reason = "TRAILING_STOP"
                 elif breakeven_price and running_sl <= breakeven_price:
-                    exit_reason = "BREAKEVEN_STOP"
-                else:
-                    exit_reason = "STOP_LOSS"
-                break
-            elif take_profit and b_open <= take_profit:
-                exit_price = b_open
-                exit_reason = "TAKE_PROFIT"
-                break
-            elif take_profit and b_low <= take_profit:
-                exit_price = take_profit
-                exit_reason = "TAKE_PROFIT"
-                break
+                    running_sl_reason = "BREAKEVEN_STOP"
 
     if exit_price is None:
         last_b = bars[-1]
-        exit_price = Decimal(str(trade.get("realised_exit_price") or last_b.get("close_price") or last_b.get("close") or entry))
-        exit_reason = str(trade.get("exit_reason") or "EOD_CLOSE")
+        if pending_market_exit is not None:
+            exit_price = Decimal(str(last_b.get("close_price") if last_b.get("close_price") is not None else last_b.get("close", entry)))
+            exit_reason = pending_market_exit
+        else:
+            exit_price = Decimal(str(trade.get("realised_exit_price") or last_b.get("close_price") or last_b.get("close") or entry))
+            exit_reason = str(trade.get("exit_reason") or "EOD_CLOSE")
 
     # Apply fees and 2-tick slippage
     slippage_per_share = Decimal(str(tick_size)) * Decimal("2")

@@ -564,6 +564,261 @@ class TestProfitHarvestCounterfactualReplay(unittest.TestCase):
         self.assertEqual(res["total_trades"], 0)
         self.assertEqual(res["recommendation"], "INSUFFICIENT_DATA")
 
+    def test_overlapping_1m_and_5m_rows_not_double_counted(self):
+        """Single timeframe: When both 1m and 5m bars exist for upstox_v3, only 5m bars are queried."""
+        engine = create_engine("sqlite:///:memory:")
+        with engine.begin() as conn:
+            conn.execute(text("CREATE TABLE instrument_master (id INTEGER PRIMARY KEY, symbol TEXT, tick_size NUMERIC DEFAULT 0.05)"))
+            conn.execute(text("""
+                CREATE TABLE shadow_execution_audits (
+                    id INTEGER PRIMARY KEY,
+                    instrument_id INTEGER,
+                    side TEXT,
+                    quantity INTEGER,
+                    theoretical_fill_price NUMERIC,
+                    stop_loss_price NUMERIC,
+                    take_profit_price NUMERIC,
+                    signal_at TIMESTAMP,
+                    exit_at TIMESTAMP,
+                    realised_exit_price NUMERIC,
+                    exit_reason TEXT,
+                    net_pnl NUMERIC,
+                    trade_mode TEXT DEFAULT 'INTRADAY',
+                    estimated_fees NUMERIC DEFAULT 0,
+                    improvement_note TEXT
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE live_market_bars (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    instrument_id INTEGER,
+                    interval TEXT,
+                    source TEXT,
+                    bar_time TIMESTAMP,
+                    open_price NUMERIC,
+                    high_price NUMERIC,
+                    low_price NUMERIC,
+                    close_price NUMERIC,
+                    volume NUMERIC
+                )
+            """))
+            conn.execute(text("INSERT INTO instrument_master (id, symbol) VALUES (1, 'INFY')"))
+            conn.execute(text("""
+                INSERT INTO shadow_execution_audits (
+                    id, instrument_id, side, quantity, theoretical_fill_price,
+                    stop_loss_price, take_profit_price, signal_at, exit_at,
+                    realised_exit_price, exit_reason, net_pnl, estimated_fees
+                ) VALUES (
+                    1, 1, 'BUY', 10, 100.0, 90.0, 115.0,
+                    '2026-07-15 09:30:00', '2026-07-15 09:40:00',
+                    109.5, 'TAKE_PROFIT', 90.0, 5.0
+                )
+            """))
+            # Insert 5m bars
+            conn.execute(text("""
+                INSERT INTO live_market_bars (instrument_id, interval, source, bar_time, open_price, high_price, low_price, close_price, volume)
+                VALUES (1, '5minute', 'upstox_v3', '2026-07-15 09:30:00', 100.0, 105.0, 99.5, 104.0, 1000),
+                       (1, '5minute', 'upstox_v3', '2026-07-15 09:35:00', 104.0, 110.0, 103.5, 109.5, 1200)
+            """))
+            # Insert overlapping 1m bars for the same time window
+            for m in range(30, 40):
+                conn.execute(text(f"""
+                    INSERT INTO live_market_bars (instrument_id, interval, source, bar_time, open_price, high_price, low_price, close_price, volume)
+                    VALUES (1, '1minute', 'upstox_v3', '2026-07-15 09:{m:02d}:00', 100.0, 105.0, 99.5, 104.0, 200)
+                """))
+
+        res = run_profit_harvest_ab_replay(engine=engine)
+        self.assertEqual(res["total_trades"], 1)
+        self.assertEqual(res["coverage"]["trades_used"], 1)
+        self.assertEqual(res["coverage"]["trades_excluded"], 0)
+
+    def test_missing_bars_and_gapped_trades_excluded(self):
+        """Missing-bars and gapped trades are excluded and tracked in coverage without synthetic fallback."""
+        engine = create_engine("sqlite:///:memory:")
+        with engine.begin() as conn:
+            conn.execute(text("CREATE TABLE instrument_master (id INTEGER PRIMARY KEY, symbol TEXT, tick_size NUMERIC DEFAULT 0.05)"))
+            conn.execute(text("""
+                CREATE TABLE shadow_execution_audits (
+                    id INTEGER PRIMARY KEY,
+                    instrument_id INTEGER,
+                    side TEXT,
+                    quantity INTEGER,
+                    theoretical_fill_price NUMERIC,
+                    stop_loss_price NUMERIC,
+                    take_profit_price NUMERIC,
+                    signal_at TIMESTAMP,
+                    exit_at TIMESTAMP,
+                    realised_exit_price NUMERIC,
+                    exit_reason TEXT,
+                    net_pnl NUMERIC,
+                    trade_mode TEXT DEFAULT 'INTRADAY',
+                    estimated_fees NUMERIC DEFAULT 0,
+                    improvement_note TEXT
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE live_market_bars (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    instrument_id INTEGER,
+                    interval TEXT,
+                    source TEXT,
+                    bar_time TIMESTAMP,
+                    open_price NUMERIC,
+                    high_price NUMERIC,
+                    low_price NUMERIC,
+                    close_price NUMERIC,
+                    volume NUMERIC
+                )
+            """))
+            conn.execute(text("INSERT INTO instrument_master (id, symbol) VALUES (1, 'NIFTY_CE'), (2, 'BANKNIFTY_PE'), (3, 'TCS')"))
+
+            # Trade 1: Valid continuous bars
+            conn.execute(text("""
+                INSERT INTO shadow_execution_audits (
+                    id, instrument_id, side, quantity, theoretical_fill_price,
+                    stop_loss_price, take_profit_price, signal_at, exit_at,
+                    realised_exit_price, exit_reason, net_pnl, estimated_fees
+                ) VALUES (
+                    1, 1, 'BUY', 10, 100.0, 90.0, 115.0,
+                    '2026-07-15 09:30:00', '2026-07-15 09:40:00',
+                    108.0, 'TAKE_PROFIT', 75.0, 5.0
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO live_market_bars (instrument_id, interval, source, bar_time, open_price, high_price, low_price, close_price, volume)
+                VALUES (1, '5minute', 'upstox_v3', '2026-07-15 09:30:00', 100.0, 105.0, 99.0, 104.0, 1000),
+                       (1, '5minute', 'upstox_v3', '2026-07-15 09:35:00', 104.0, 109.0, 103.0, 108.0, 1000)
+            """))
+
+            # Trade 2: No bars at all (common for options)
+            conn.execute(text("""
+                INSERT INTO shadow_execution_audits (
+                    id, instrument_id, side, quantity, theoretical_fill_price,
+                    stop_loss_price, take_profit_price, signal_at, exit_at,
+                    realised_exit_price, exit_reason, net_pnl, estimated_fees
+                ) VALUES (
+                    2, 2, 'BUY', 10, 50.0, 40.0, 70.0,
+                    '2026-07-15 09:30:00', '2026-07-15 09:45:00',
+                    55.0, 'TAKE_PROFIT', 45.0, 5.0
+                )
+            """))
+
+            # Trade 3: Gap > 10m between bars (25 minute gap)
+            conn.execute(text("""
+                INSERT INTO shadow_execution_audits (
+                    id, instrument_id, side, quantity, theoretical_fill_price,
+                    stop_loss_price, take_profit_price, signal_at, exit_at,
+                    realised_exit_price, exit_reason, net_pnl, estimated_fees
+                ) VALUES (
+                    3, 3, 'BUY', 10, 100.0, 90.0, 115.0,
+                    '2026-07-15 09:30:00', '2026-07-15 10:10:00',
+                    108.0, 'TAKE_PROFIT', 75.0, 5.0
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO live_market_bars (instrument_id, interval, source, bar_time, open_price, high_price, low_price, close_price, volume)
+                VALUES (3, '5minute', 'upstox_v3', '2026-07-15 09:30:00', 100.0, 105.0, 99.0, 104.0, 1000),
+                       (3, '5minute', 'upstox_v3', '2026-07-15 09:55:00', 104.0, 109.0, 103.0, 108.0, 1000)
+            """))
+
+        res = run_profit_harvest_ab_replay(engine=engine)
+        self.assertEqual(res["coverage"]["total_trades_considered"], 3)
+        self.assertEqual(res["coverage"]["trades_used"], 1)
+        self.assertEqual(res["coverage"]["trades_excluded"], 2)
+        self.assertIn("NO_BARS", res["coverage"]["exclusion_reasons"])
+        self.assertTrue(any("GAP" in k for k in res["coverage"]["exclusion_reasons"]))
+
+    def test_in_bar_ordering_stop_and_target_preserved(self):
+        """In-bar ordering: Prior SL checked before reversal/close; TP checked before close."""
+        # Case A: Bar low penetrates prior stop (90.0), close ends at 102.0. Must exit at stop (90.0), not 102.0!
+        trade_sl = {
+            "entry": 100.0,
+            "stop_loss_price": 90.0,
+            "take_profit_price": 115.0,
+            "side": "BUY",
+            "quantity": 1,
+            "estimated_fees": 0,
+            "trade_mode": "INTRADAY",
+        }
+        bars_sl = [
+            {"bar_time": "2026-07-15 09:30:00", "open": 100.0, "high": 101.0, "low": 98.0, "close": 99.0, "volume": 1000},
+            {"bar_time": "2026-07-15 09:35:00", "open": 98.0, "high": 104.0, "low": 88.0, "close": 102.0, "volume": 2000},
+        ]
+        res_a = replay_trade_walk_forward(trade_sl, bars_sl, harvest_enabled=False)
+        self.assertEqual(res_a["exit_price"], 90.0)
+        self.assertEqual(res_a["exit_reason"], "STOP_LOSS")
+
+        # Case B: Bar high reaches target (115.0), close ends at 111.0. Must exit at TP (115.0), not 111.0!
+        trade_tp = {
+            "entry": 100.0,
+            "stop_loss_price": 90.0,
+            "take_profit_price": 115.0,
+            "side": "BUY",
+            "quantity": 1,
+            "estimated_fees": 0,
+            "trade_mode": "INTRADAY",
+        }
+        bars_tp = [
+            {"bar_time": "2026-07-15 09:30:00", "open": 100.0, "high": 108.0, "low": 99.0, "close": 107.0, "volume": 1000},
+            {"bar_time": "2026-07-15 09:35:00", "open": 107.0, "high": 116.0, "low": 106.0, "close": 111.0, "volume": 2000},
+        ]
+        res_b = replay_trade_walk_forward(trade_tp, bars_tp, harvest_enabled=False)
+        self.assertEqual(res_b["exit_price"], 115.0)
+        self.assertEqual(res_b["exit_reason"], "TAKE_PROFIT")
+
+    def test_fidelity_gate_fails_when_arm_a_diverges(self):
+        """Fidelity check: If Arm A deviates > 0.1R from recorded exit, fidelity < 80% and recommendation is REPLAY_NOT_FAITHFUL."""
+        trade = {
+            "id": 1,
+            "symbol": "SBIN",
+            "side": "BUY",
+            "entry": 100.0,
+            "initial_sl": 90.0,
+            "target_price": 115.0,
+            "realised_exit_price": 99.0,
+            "exit_reason": "MANUAL_CLOSE",
+            "trade_mode": "INTRADAY",
+            "bars": [
+                {"bar_time": "2026-07-15 09:30:00", "open": 100.0, "high": 102.0, "low": 98.0, "close": 99.0, "volume": 1000},
+                {"bar_time": "2026-07-15 09:35:00", "open": 99.0, "high": 100.0, "low": 89.0, "close": 91.0, "volume": 1000},
+            ]
+        }
+        res = run_profit_harvest_ab_replay(trades=[trade])
+        self.assertEqual(res["total_trades"], 1)
+        self.assertEqual(res["fidelity"]["fidelity_pct"], 0.0)
+        self.assertEqual(res["recommendation"], "REPLAY_NOT_FAITHFUL")
+
+    def test_minimum_sample_and_train_test_split_gate(self):
+        """Require >= 100 harvest-triggered trades, and chronological date train/test split."""
+        trades = []
+        for i in range(10):
+            day = 10 + i
+            trades.append({
+                "id": i + 1,
+                "symbol": "RELIANCE",
+                "side": "BUY",
+                "entry": 100.0,
+                "initial_sl": 90.0,
+                "target_price": 115.0,
+                "realised_exit_price": 115.0,
+                "exit_reason": "TAKE_PROFIT",
+                "trade_mode": "INTRADAY",
+                "signal_at": f"2026-07-{day:02d} 09:30:00",
+                "exit_at": f"2026-07-{day:02d} 09:40:00",
+                "bars": [
+                    {"bar_time": f"2026-07-{day:02d} 09:30:00", "open": 100.0, "high": 106.0, "low": 99.5, "close": 105.0, "volume": 1000},
+                    {"bar_time": f"2026-07-{day:02d} 09:35:00", "open": 105.0, "high": 115.5, "low": 104.0, "close": 115.0, "volume": 1000},
+                ]
+            })
+        res = run_profit_harvest_ab_replay(trades=trades)
+        self.assertEqual(res["total_trades"], 10)
+        self.assertEqual(res["fidelity"]["fidelity_pct"], 100.0)
+        self.assertEqual(res["recommendation"], "INSUFFICIENT_TRIGGERED_TRADES")
+        self.assertIn("train", res["split"])
+        self.assertIn("test", res["split"])
+        self.assertEqual(res["split"]["train"]["trades_count"], 5)
+        self.assertEqual(res["split"]["test"]["trades_count"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -384,6 +384,138 @@ def get_latest_counterfactual_summary(engine, trade_date: Optional[date] = None,
     }
 
 
+def resample_1m_to_5m(bars_1m: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Resample 1-minute bars into 5-minute OHLCV candles."""
+    if not bars_1m:
+        return []
+
+    from collections import defaultdict
+    buckets: Dict[datetime, List[Dict[str, Any]]] = defaultdict(list)
+
+    for b in bars_1m:
+        bt = b.get("bar_time")
+        if isinstance(bt, str):
+            try:
+                dt = datetime.fromisoformat(bt)
+            except Exception:
+                continue
+        elif isinstance(bt, datetime):
+            dt = bt
+        else:
+            continue
+
+        bucket_minute = (dt.minute // 5) * 5
+        bucket_dt = dt.replace(minute=bucket_minute, second=0, microsecond=0)
+        buckets[bucket_dt].append(b)
+
+    sorted_keys = sorted(buckets.keys())
+    resampled_5m = []
+
+    for k in sorted_keys:
+        group = buckets[k]
+        o = float(group[0].get("open_price") if group[0].get("open_price") is not None else group[0].get("open", 0.0))
+        h = max(float(x.get("high_price") if x.get("high_price") is not None else x.get("high", 0.0)) for x in group)
+        l = min(float(x.get("low_price") if x.get("low_price") is not None else x.get("low", 0.0)) for x in group)
+        c = float(group[-1].get("close_price") if group[-1].get("close_price") is not None else group[-1].get("close", 0.0))
+        v = sum(float(x.get("volume") or 0.0) for x in group)
+
+        resampled_5m.append({
+            "bar_time": k.isoformat() if isinstance(group[0].get("bar_time"), str) else k,
+            "open_price": o,
+            "high_price": h,
+            "low_price": l,
+            "close_price": c,
+            "volume": v,
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "interval": "5minute",
+            "source": "upstox_v3",
+        })
+
+    return resampled_5m
+
+
+def validate_bar_continuity(
+    bars: List[Dict[str, Any]],
+    signal_at: Any = None,
+    exit_at: Any = None,
+) -> tuple[bool, Optional[str]]:
+    """Validate that bars cover signal to exit with no gaps over 10 minutes.
+
+    Returns (is_valid, exclusion_reason).
+    """
+    if not bars:
+        return False, "NO_BARS"
+
+    def _to_dt(val: Any) -> Optional[datetime]:
+        if val is None:
+            return None
+        if isinstance(val, datetime):
+            return val
+        if isinstance(val, str):
+            try:
+                return datetime.fromisoformat(val)
+            except Exception:
+                return None
+        return None
+
+    first_bt = _to_dt(bars[0].get("bar_time"))
+    last_bt = _to_dt(bars[-1].get("bar_time"))
+    sig_dt = _to_dt(signal_at)
+    ex_dt = _to_dt(exit_at)
+
+    # Check gap between signal_at and first bar
+    if sig_dt and first_bt:
+        s_comp = sig_dt.replace(tzinfo=None) if sig_dt.tzinfo else sig_dt
+        f_comp = first_bt.replace(tzinfo=None) if first_bt.tzinfo else first_bt
+        if f_comp > s_comp and (f_comp - s_comp) > timedelta(minutes=10):
+            return False, f"INITIAL_BAR_GAP_OVER_10M ({round((f_comp - s_comp).total_seconds() / 60, 1)}m)"
+
+    # Check gap between last bar and exit_at
+    if ex_dt and last_bt:
+        e_comp = ex_dt.replace(tzinfo=None) if ex_dt.tzinfo else ex_dt
+        l_comp = last_bt.replace(tzinfo=None) if last_bt.tzinfo else last_bt
+        if e_comp > l_comp and (e_comp - l_comp) > timedelta(minutes=10):
+            return False, f"FINAL_BAR_GAP_OVER_10M ({round((e_comp - l_comp).total_seconds() / 60, 1)}m)"
+
+    # Check consecutive bars gap
+    for i in range(len(bars) - 1):
+        t1 = _to_dt(bars[i].get("bar_time"))
+        t2 = _to_dt(bars[i + 1].get("bar_time"))
+        if t1 and t2:
+            t1_comp = t1.replace(tzinfo=None) if t1.tzinfo else t1
+            t2_comp = t2.replace(tzinfo=None) if t2.tzinfo else t2
+            gap = t2_comp - t1_comp
+            if t1_comp.date() == t2_comp.date():
+                if gap > timedelta(minutes=10):
+                    return False, f"IN_SESSION_GAP_OVER_10M ({round(gap.total_seconds() / 60, 1)}m)"
+            else:
+                if t1_comp.time() < time(15, 20) or t2_comp.time() > time(9, 25):
+                    return False, f"INTER_SESSION_GAP_OVER_10M ({round(gap.total_seconds() / 60, 1)}m)"
+
+    return True, None
+
+
+def _bootstrap_ci(deltas: List[float], n_bootstraps: int = 1000, random_seed: int = 42) -> tuple[float, float]:
+    import random
+    if not deltas:
+        return (0.0, 0.0)
+    N = len(deltas)
+    if N == 1:
+        return (round(deltas[0], 4), round(deltas[0], 4))
+    rng = random.Random(random_seed)
+    bootstrap_means: List[float] = []
+    for _ in range(n_bootstraps):
+        sample = [deltas[rng.randint(0, N - 1)] for _ in range(N)]
+        bootstrap_means.append(sum(sample) / N)
+    bootstrap_means.sort()
+    ci_lower = bootstrap_means[int(0.025 * len(bootstrap_means))]
+    ci_upper = bootstrap_means[int(0.975 * len(bootstrap_means))]
+    return (round(ci_lower, 4), round(ci_upper, 4))
+
+
 def run_profit_harvest_ab_replay(
     engine: Optional[Any] = None,
     trades: Optional[List[Dict[str, Any]]] = None,
@@ -398,15 +530,18 @@ def run_profit_harvest_ab_replay(
 ) -> Dict[str, Any]:
     """A/B Counterfactual Replay comparing Baseline execution (Arm A) vs Profit-Harvest (Arm B).
 
-    For each trade:
-    - Arm A (Baseline): Realized R under standard PositionManager exit rules (flag OFF).
-    - Arm B (Harvest): Realized R under PositionManager exit rules with profit harvest enabled (flag ON).
-    - Replays real 1m/5m price bars from entry to exit using replay_trade_walk_forward.
-    - Computes max favorable price from price bars, not exit price.
-    - Applies fees and 2-tick slippage.
-    - Computes delta R (Arm B - Arm A) and 95% bootstrap confidence interval.
+    Phase 2c Specifications:
+    1. Single timeframe: 5-minute bars from 'upstox_v3' source only (derived from 1m if 5m missing, never mixed).
+       Bars must cover signal to exit with no gaps > 10m. Trades failing coverage are dropped with reasons tracked.
+       Fabricated three-bar fallback is completely removed.
+    2. Strict in-bar execution order: Existing stops and targets are checked first against bar open/range before
+       reversal evaluation. Reversal score is computed at bar close and takes effect from next bar's open.
+    3. Baseline Arm Fidelity: Arm A replayed exit price compared with realised_exit_price within 0.1R.
+       If fidelity is below 80%, recommendation is 'REPLAY_NOT_FAITHFUL' and no ENABLE.
+    4. Out-of-sample Gate: Requires >= 100 harvest-triggered trades and chronological 50/50 date train/test split.
+       ENABLE is awarded ONLY if the test half 95% bootstrap CI lower bound strictly excludes zero (> 0.0).
+       Per-trade-mode metrics (intraday vs swing) are reported separately.
     """
-    import random
     from backend.position_manager import replay_trade_walk_forward
 
     trade_samples: List[Dict[str, Any]] = []
@@ -448,6 +583,16 @@ def run_profit_harvest_ab_replay(
                     ORDER BY a.signal_at ASC
                 """)
                 rows = conn.execute(query, params).mappings().all()
+
+                # Check whether source column exists in live_market_bars
+                has_source_col = True
+                try:
+                    conn.execute(text("SELECT source FROM live_market_bars LIMIT 1"))
+                except Exception:
+                    has_source_col = False
+
+                source_filter = "AND source = 'upstox_v3'" if has_source_col else ""
+
                 for r in rows:
                     note = {}
                     if r.get("improvement_note"):
@@ -456,20 +601,40 @@ def run_profit_harvest_ab_replay(
                         except Exception:
                             note = {}
 
-                    trade_bars = []
+                    trade_bars: List[Dict[str, Any]] = []
                     if r.get("instrument_id") and r.get("signal_at") and r.get("exit_at"):
-                        b_rows = conn.execute(
-                            text("""
+                        # 1. Query 5m bars first from upstox_v3
+                        b_5m_rows = conn.execute(
+                            text(f"""
                                 SELECT bar_time, open_price, high_price, low_price, close_price, volume
                                 FROM live_market_bars
                                 WHERE instrument_id = :inst_id
-                                  AND interval IN ('1minute', '1m', '5minute', '5m')
+                                  AND interval IN ('5minute', '5m')
+                                  {source_filter}
                                   AND bar_time >= :sig_at AND bar_time <= :ex_at
                                 ORDER BY bar_time ASC
                             """),
                             {"inst_id": r["instrument_id"], "sig_at": r["signal_at"], "ex_at": r["exit_at"]}
                         ).mappings().all()
-                        trade_bars = [dict(b) for b in b_rows]
+
+                        if b_5m_rows:
+                            trade_bars = [dict(b) for b in b_5m_rows]
+                        else:
+                            # 2. Derive 5m bars from 1m upstox_v3 bars if 5m missing (never both together)
+                            b_1m_rows = conn.execute(
+                                text(f"""
+                                    SELECT bar_time, open_price, high_price, low_price, close_price, volume
+                                    FROM live_market_bars
+                                    WHERE instrument_id = :inst_id
+                                      AND interval IN ('1minute', '1m')
+                                      {source_filter}
+                                      AND bar_time >= :sig_at AND bar_time <= :ex_at
+                                    ORDER BY bar_time ASC
+                                """),
+                                {"inst_id": r["instrument_id"], "sig_at": r["signal_at"], "ex_at": r["exit_at"]}
+                            ).mappings().all()
+                            if b_1m_rows:
+                                trade_bars = resample_1m_to_5m([dict(b) for b in b_1m_rows])
 
                     trade_samples.append({
                         "id": r["id"],
@@ -496,7 +661,53 @@ def run_profit_harvest_ab_replay(
         except Exception as err:
             logger.warning("Failed to fetch historical shadow trades for A/B replay: %s", err)
 
-    if not trade_samples:
+    # Coverage tracking
+    trades_considered = len(trade_samples)
+    trades_excluded = 0
+    exclusion_reasons: Dict[str, int] = {}
+    valid_trades: List[Dict[str, Any]] = []
+
+    for t in trade_samples:
+        raw_bars = t.get("bars") or []
+        if not raw_bars:
+            trades_excluded += 1
+            exclusion_reasons["NO_BARS"] = exclusion_reasons.get("NO_BARS", 0) + 1
+            continue
+
+        # Single-timeframe enforcement: If mixed, prioritize 5m or resample 1m
+        has_source = any("source" in b for b in raw_bars)
+        if has_source:
+            candidate_bars = [b for b in raw_bars if b.get("source") in ("upstox_v3", None)]
+        else:
+            candidate_bars = raw_bars
+
+        bars_5m = [b for b in candidate_bars if b.get("interval") in ("5minute", "5m")]
+        bars_1m = [b for b in candidate_bars if b.get("interval") in ("1minute", "1m")]
+
+        if bars_5m:
+            chosen_bars = bars_5m
+        elif bars_1m:
+            chosen_bars = resample_1m_to_5m(bars_1m)
+        else:
+            chosen_bars = candidate_bars
+
+        # Validate continuity: coverage with no gaps > 10m
+        is_valid, exc_reason = validate_bar_continuity(
+            chosen_bars,
+            signal_at=t.get("signal_at"),
+            exit_at=t.get("exit_at"),
+        )
+        if not is_valid:
+            trades_excluded += 1
+            reason_key = exc_reason or "GAP_EXCEEDS_10M"
+            exclusion_reasons[reason_key] = exclusion_reasons.get(reason_key, 0) + 1
+            continue
+
+        t_copy = dict(t)
+        t_copy["bars"] = chosen_bars
+        valid_trades.append(t_copy)
+
+    if not valid_trades:
         return {
             "total_trades": 0,
             "trades_reaching_harvest": 0,
@@ -510,9 +721,46 @@ def run_profit_harvest_ab_replay(
             "baseline_win_rate": 0.0,
             "harvest_win_rate": 0.0,
             "recommendation": "INSUFFICIENT_DATA",
-            "trades": [],
+            "coverage": {
+                "total_trades_considered": trades_considered,
+                "trades_used": 0,
+                "trades_excluded": trades_excluded,
+                "exclusion_reasons": exclusion_reasons,
+            },
+            "fidelity": {
+                "trades_compared": 0,
+                "within_01r_count": 0,
+                "fidelity_pct": 0.0,
+                "reason_match_pct": 0.0,
+                "modelled_exits": [
+                    "STOP_LOSS",
+                    "GAP_DOWN_STOP",
+                    "GAP_UP_STOP",
+                    "BREAKEVEN_STOP",
+                    "TRAILING_STOP",
+                    "TAKE_PROFIT",
+                    "FORCE_FLAT",
+                ],
+                "unmodelled_exits": [
+                    "STALE_DATA_EXIT",
+                    "MANUAL_CLOSE",
+                    "RMS_AUTO_SQUAREOFF",
+                    "EARLY_ADVERSE_CUT",
+                    "STAGNATION_GUARD",
+                ],
+            },
+            "split": {
+                "train": {"trades_count": 0, "delta_mean_r": 0.0, "ci_95": (0.0, 0.0)},
+                "test": {"trades_count": 0, "delta_mean_r": 0.0, "ci_95": (0.0, 0.0)},
+            },
+            "by_mode": {
+                "intraday": {"total_trades": 0, "trades_reaching_harvest": 0, "baseline_mean_r": 0.0, "harvest_mean_r": 0.0, "delta_mean_r": 0.0, "ci_95": (0.0, 0.0)},
+                "swing": {"total_trades": 0, "trades_reaching_harvest": 0, "baseline_mean_r": 0.0, "harvest_mean_r": 0.0, "delta_mean_r": 0.0, "ci_95": (0.0, 0.0)},
+            },
+            "sample_evaluations": [],
         }
 
+    # Evaluate Arm A and Arm B
     baseline_rs: List[float] = []
     harvest_rs: List[float] = []
     deltas: List[float] = []
@@ -520,13 +768,17 @@ def run_profit_harvest_ab_replay(
     improved_count = 0
     hurt_count = 0
     unchanged_count = 0
+    within_01r_count = 0
+    reason_match_count = 0
     eval_records: List[Dict[str, Any]] = []
 
-    for t in trade_samples:
+    for t in valid_trades:
         entry = float(t.get("theoretical_fill_price") or t.get("entry") or 0.0)
         sl = float(t.get("stop_loss_price") or t.get("initial_sl") or 0.0)
         side = str(t.get("side") or "BUY").upper()
         target = float(t.get("take_profit_price") or t.get("target_price") or 0.0)
+        rec_exit = float(t.get("realised_exit_price") or t.get("exit_price") or entry)
+        rec_reason = t.get("exit_reason")
 
         r_points = abs(entry - sl)
         if r_points <= 1e-4:
@@ -536,20 +788,9 @@ def run_profit_harvest_ab_replay(
             target = entry + (1.5 * r_points) if side == "BUY" else entry - (1.5 * r_points)
 
         target_dist = abs(target - entry)
-        if target_dist <= 1e-4:
-            continue
+        bars = t["bars"]
 
-        bars = t.get("bars") or []
-        if not bars:
-            exit_p = float(t.get("realised_exit_price") or t.get("exit_price") or entry)
-            max_fav = float(t.get("max_favorable_price") or (exit_p if (exit_p > entry if side == "BUY" else exit_p < entry) else entry))
-            bars = [
-                {"open": entry, "high": max(entry, max_fav), "low": min(entry, max_fav), "close": entry},
-                {"open": entry, "high": max(entry, max_fav), "low": min(entry, max_fav), "close": max_fav},
-                {"open": max_fav, "high": max(entry, exit_p, max_fav), "low": min(entry, exit_p, max_fav), "close": exit_p},
-            ]
-
-        # Compute max favorable price directly from bars
+        # Compute max favorable price directly from valid bars
         if side == "BUY":
             max_favorable = max(float(b.get("high_price") if b.get("high_price") is not None else b.get("high", entry)) for b in bars)
             fav_dist = max_favorable - entry
@@ -557,11 +798,11 @@ def run_profit_harvest_ab_replay(
             max_favorable = min(float(b.get("low_price") if b.get("low_price") is not None else b.get("low", entry)) for b in bars)
             fav_dist = entry - max_favorable
 
-        max_prog = fav_dist / target_dist if target_dist > 0 else 0.0
+        max_prog = (fav_dist / target_dist) if target_dist > 0 else 0.0
         if max_prog >= harvest_trigger:
             harvest_triggered_count += 1
 
-        # Walk bars forward with REAL PositionManager exit rules
+        # Walk bars forward with strict in-bar ordering
         res_a = replay_trade_walk_forward(
             trade=t,
             bars=bars,
@@ -576,6 +817,13 @@ def run_profit_harvest_ab_replay(
             tighten_threshold=tighten_threshold,
             lock_fraction=lock_fraction,
         )
+
+        # Fidelity check against actual execution
+        diff_r = abs(res_a["exit_price"] - rec_exit) / r_points
+        if diff_r <= 0.10:
+            within_01r_count += 1
+        if res_a["exit_reason"] == rec_reason:
+            reason_match_count += 1
 
         baseline_r = res_a["realized_r"]
         harvest_r = res_b["realized_r"]
@@ -592,44 +840,100 @@ def run_profit_harvest_ab_replay(
         else:
             unchanged_count += 1
 
+        # Extract trade date for chronological split
+        sig_val = t.get("signal_at")
+        t_date = date.min
+        if isinstance(sig_val, datetime):
+            t_date = sig_val.astimezone(IST).date() if sig_val.tzinfo else sig_val.date()
+        elif isinstance(sig_val, str):
+            try:
+                dt_p = datetime.fromisoformat(sig_val)
+                t_date = dt_p.astimezone(IST).date() if dt_p.tzinfo else dt_p.date()
+            except Exception:
+                pass
+
         eval_records.append({
+            "id": t.get("id"),
             "symbol": t.get("symbol"),
             "side": side,
             "entry": round(entry, 2),
             "baseline_exit": round(res_a["exit_price"], 2),
             "harvest_exit": round(res_b["exit_price"], 2),
+            "realised_exit": round(rec_exit, 2),
             "baseline_reason": res_a["exit_reason"],
             "harvest_reason": res_b["exit_reason"],
+            "recorded_reason": rec_reason,
             "baseline_r": baseline_r,
             "harvest_r": harvest_r,
             "delta_r": delta_r,
             "progress": round(max_prog, 3),
             "max_favorable": round(max_favorable, 2),
+            "diff_r_fidelity": round(diff_r, 4),
+            "trade_mode": str(t.get("trade_mode") or "INTRADAY").upper(),
+            "trade_date": t_date,
         })
 
-    N = len(deltas)
-    rng = random.Random(random_seed)
-    bootstrap_means: List[float] = []
-    for _ in range(n_bootstraps):
-        sample = [deltas[rng.randint(0, N - 1)] for _ in range(N)]
-        bootstrap_means.append(sum(sample) / N)
-    bootstrap_means.sort()
+    N = len(valid_trades)
+    fidelity_pct = (within_01r_count / N * 100.0) if N > 0 else 0.0
+    reason_match_pct = (reason_match_count / N * 100.0) if N > 0 else 0.0
 
-    ci_lower = bootstrap_means[int(0.025 * len(bootstrap_means))]
-    ci_upper = bootstrap_means[int(0.975 * len(bootstrap_means))]
-
+    # Overall bootstrap CI
+    overall_ci = _bootstrap_ci(deltas, n_bootstraps, random_seed)
     base_mean_r = sum(baseline_rs) / N
     harv_mean_r = sum(harvest_rs) / N
     delta_mean_r = sum(deltas) / N
-
     base_wins = sum(1 for r in baseline_rs if r > 0.0)
     harv_wins = sum(1 for r in harvest_rs if r > 0.0)
     base_win_rate = (base_wins / N * 100.0) if N > 0 else 0.0
     harv_win_rate = (harv_wins / N * 100.0) if N > 0 else 0.0
 
-    if ci_lower > 0.0:
+    # Train / Test split by date (chronological 50/50)
+    unique_dates = sorted(list({rec["trade_date"] for rec in eval_records}))
+    if len(unique_dates) >= 2:
+        mid_date_idx = len(unique_dates) // 2
+        train_date_set = set(unique_dates[:mid_date_idx])
+        train_records = [rec for rec in eval_records if rec["trade_date"] in train_date_set]
+        test_records = [rec for rec in eval_records if rec["trade_date"] not in train_date_set]
+    else:
+        mid_idx = len(eval_records) // 2
+        train_records = eval_records[:mid_idx]
+        test_records = eval_records[mid_idx:]
+
+    train_deltas = [r["delta_r"] for r in train_records]
+    test_deltas = [r["delta_r"] for r in test_records]
+
+    train_delta_mean_r = (sum(train_deltas) / len(train_deltas)) if train_deltas else 0.0
+    test_delta_mean_r = (sum(test_deltas) / len(test_deltas)) if test_deltas else 0.0
+
+    train_ci_95 = _bootstrap_ci(train_deltas, n_bootstraps, random_seed)
+    test_ci_95 = _bootstrap_ci(test_deltas, n_bootstraps, random_seed)
+
+    # Per-trade-mode breakdown
+    mode_breakdown: Dict[str, Any] = {}
+    for mode_key in ("INTRADAY", "SWING"):
+        m_recs = [r for r in eval_records if r["trade_mode"] == mode_key]
+        m_deltas = [r["delta_r"] for r in m_recs]
+        m_base = [r["baseline_r"] for r in m_recs]
+        m_harv = [r["harvest_r"] for r in m_recs]
+        m_trig = sum(1 for r in m_recs if r["progress"] >= harvest_trigger)
+        m_ci = _bootstrap_ci(m_deltas, n_bootstraps, random_seed) if m_deltas else (0.0, 0.0)
+        mode_breakdown[mode_key.lower()] = {
+            "total_trades": len(m_recs),
+            "trades_reaching_harvest": m_trig,
+            "baseline_mean_r": round(sum(m_base) / len(m_base), 4) if m_base else 0.0,
+            "harvest_mean_r": round(sum(m_harv) / len(m_harv), 4) if m_harv else 0.0,
+            "delta_mean_r": round(sum(m_deltas) / len(m_deltas), 4) if m_deltas else 0.0,
+            "ci_95": (round(m_ci[0], 4), round(m_ci[1], 4)),
+        }
+
+    # Recommendation determination
+    if fidelity_pct < 80.0:
+        recommendation = "REPLAY_NOT_FAITHFUL"
+    elif harvest_triggered_count < 100:
+        recommendation = "INSUFFICIENT_TRIGGERED_TRADES"
+    elif test_ci_95[0] > 0.0:
         recommendation = "ENABLE"
-    elif ci_upper < 0.0:
+    elif test_ci_95[1] < 0.0:
         recommendation = "KEEP_OFF"
     else:
         recommendation = "NEUTRAL"
@@ -643,10 +947,51 @@ def run_profit_harvest_ab_replay(
         "baseline_mean_r": round(base_mean_r, 4),
         "harvest_mean_r": round(harv_mean_r, 4),
         "delta_mean_r": round(delta_mean_r, 4),
-        "ci_95": (round(ci_lower, 4), round(ci_upper, 4)),
+        "ci_95": (round(overall_ci[0], 4), round(overall_ci[1], 4)),
         "baseline_win_rate": round(base_win_rate, 2),
         "harvest_win_rate": round(harv_win_rate, 2),
         "recommendation": recommendation,
+        "coverage": {
+            "total_trades_considered": trades_considered,
+            "trades_used": N,
+            "trades_excluded": trades_excluded,
+            "exclusion_reasons": exclusion_reasons,
+        },
+        "fidelity": {
+            "trades_compared": N,
+            "within_01r_count": within_01r_count,
+            "fidelity_pct": round(fidelity_pct, 2),
+            "reason_match_pct": round(reason_match_pct, 2),
+            "modelled_exits": [
+                "STOP_LOSS",
+                "GAP_DOWN_STOP",
+                "GAP_UP_STOP",
+                "BREAKEVEN_STOP",
+                "TRAILING_STOP",
+                "TAKE_PROFIT",
+                "FORCE_FLAT",
+            ],
+            "unmodelled_exits": [
+                "STALE_DATA_EXIT",
+                "MANUAL_CLOSE",
+                "RMS_AUTO_SQUAREOFF",
+                "EARLY_ADVERSE_CUT",
+                "STAGNATION_GUARD",
+            ],
+        },
+        "split": {
+            "train": {
+                "trades_count": len(train_records),
+                "delta_mean_r": round(train_delta_mean_r, 4),
+                "ci_95": (round(train_ci_95[0], 4), round(train_ci_95[1], 4)),
+            },
+            "test": {
+                "trades_count": len(test_records),
+                "delta_mean_r": round(test_delta_mean_r, 4),
+                "ci_95": (round(test_ci_95[0], 4), round(test_ci_95[1], 4)),
+            },
+        },
+        "by_mode": mode_breakdown,
         "sample_evaluations": eval_records[:20],
     }
 
