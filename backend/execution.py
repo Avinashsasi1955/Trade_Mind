@@ -5,7 +5,7 @@ from typing import Dict
 
 from .config import (
     BROKER_ROUTING, KITE_API_KEY, LIVE_ELIGIBLE, LIVE_TRADING_ENABLED,
-    UPSTOX_ACCESS_TOKEN, UPSTOX_API_KEY, UPSTOX_API_SECRET,
+    UPSTOX_ACCESS_TOKEN, UPSTOX_ORDER_ACCESS_TOKEN, UPSTOX_API_KEY, UPSTOX_API_SECRET,
 )
 from .database import now_iso
 from .risk_engine import RiskEngine
@@ -60,13 +60,14 @@ def approve_intent(db,user_id:int,intent_id:int)->Dict:
 def get_broker_adapter(user_id: int):
     """Return active broker adapter (Upstox or Zerodha) based on configuration and active sessions."""
     routing = BROKER_ROUTING.lower()
+    upstox_token = UPSTOX_ORDER_ACCESS_TOKEN or UPSTOX_ACCESS_TOKEN
     if routing == "upstox":
-        return UpstoxAdapter(UPSTOX_API_KEY, UPSTOX_ACCESS_TOKEN, UPSTOX_API_SECRET)
+        return UpstoxAdapter(UPSTOX_API_KEY, upstox_token, UPSTOX_API_SECRET)
     if routing == "zerodha":
         return ZerodhaAdapter(KITE_API_KEY, access_token(user_id))
     # Auto routing:
-    if UPSTOX_ACCESS_TOKEN and not (KITE_API_KEY and access_token(user_id)):
-        return UpstoxAdapter(UPSTOX_API_KEY, UPSTOX_ACCESS_TOKEN, UPSTOX_API_SECRET)
+    if upstox_token and not (KITE_API_KEY and access_token(user_id)):
+        return UpstoxAdapter(UPSTOX_API_KEY, upstox_token, UPSTOX_API_SECRET)
     return ZerodhaAdapter(KITE_API_KEY, access_token(user_id))
 
 
@@ -132,7 +133,11 @@ def reconcile_intents(db, user_id: int) -> Dict:
     else:
         broker_positions = []
     local = {x["symbol"]: x["quantity"] for x in db.execute("SELECT symbol,quantity FROM holdings WHERE user_id=?", (user_id,)).fetchall()}
-    remote = {x.get("tradingsymbol", x.get("symbol")): int(x.get("quantity") or 0) for x in broker_positions if int(x.get("quantity") or 0) != 0 and (x.get("tradingsymbol") or x.get("symbol"))}
+    remote = {
+        (x.get("tradingsymbol") or x.get("trading_symbol") or x.get("symbol")): int(x.get("quantity") or 0)
+        for x in broker_positions
+        if int(x.get("quantity") or 0) != 0 and (x.get("tradingsymbol") or x.get("trading_symbol") or x.get("symbol"))
+    }
     discrepancies = [{"symbol": symbol, "local_quantity": local.get(symbol, 0), "broker_quantity": remote.get(symbol, 0)} for symbol in sorted(set(local) | set(remote)) if local.get(symbol, 0) != remote.get(symbol, 0)]
     db.commit()
     return {"checked": len(rows), "updated": updated, "position_discrepancies": discrepancies, "reason": "Reconciled" if not discrepancies else "Order states reconciled; position discrepancies require operator review"}
@@ -148,7 +153,7 @@ def emergency_cancel_open_orders(db, user_id: int) -> Dict:
     candidates = [
         x for x in all_orders
         if str(x.get("status", "")).upper() in {"OPEN", "TRIGGER PENDING"}
-        and (x.get("tag") in {"NIVESH_AI", "TradeMind"} or not x.get("tag"))
+        and x.get("tag") in {"NIVESH_AI", "TradeMind"}
     ]
     cancelled = 0
     errors = []

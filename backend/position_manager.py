@@ -68,7 +68,27 @@ class PositionManager:
         self.stagnation_scratch_seconds = 900.0  # 15 minutes (intraday)
         self.stagnation_min_expansion_r = Decimal("0.25")
         
-        self.force_flat_time = os.getenv("NIVESH_SHADOW_FORCE_FLAT_IST", "15:20")
+        self.force_flat_time = os.getenv("NIVESH_SHADOW_FORCE_FLAT_IST", "15:15")
+
+    def execute_exit(
+        self,
+        audit_id: int,
+        exit_price: Decimal,
+        exit_reason: str,
+        exit_at: Optional[datetime] = None,
+        is_synthetic: bool = False,
+    ) -> bool:
+        """Atomic exit writer: executes exit through the single exit authority."""
+        exit_time = exit_at or datetime.now(timezone.utc)
+        record_shadow_exit(
+            self.engine,
+            int(audit_id),
+            exit_price,
+            exit_reason,
+            exit_at=exit_time,
+            is_synthetic=is_synthetic,
+        )
+        return True
 
     def is_force_flat_time(self, current_dt: datetime) -> bool:
         """Returns True if current time is at or past 15:15 IST (avoiding Zerodha RMS penalty)."""

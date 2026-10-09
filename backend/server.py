@@ -412,7 +412,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, result)
         if path == "/api/memory/matches" and method == "GET":
             parsed_q = parse_qs(urlparse(self.path).query)
-            symbol = parsed_q.get("symbol", ["TATAMOTORS"])[0]
+            symbol = parsed_q.get("symbol", ["RELIANCE"])[0]
             from .trade_memory import find_matching_golden_trade
             candidate = {"symbol": symbol, "confidence": 85.0, "price_change": 2.2, "volume_ratio": 2.1, "action": "BUY"}
             match = find_matching_golden_trade(candidate)

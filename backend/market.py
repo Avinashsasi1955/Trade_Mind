@@ -18,7 +18,7 @@ BASE_MARKET = [
     ("TCS", "Tata Consultancy Services", 3982.70, 0.74, 55, 1.2, 0.6, 0.5),
     ("BHARTIARTL", "Bharti Airtel", 1484.20, 1.66, 64, 1.7, 1.5, 1.0),
     ("AXISBANK", "Axis Bank", 1260.15, -0.24, 46, 1.0, -0.1, -0.2),
-    ("TATAMOTORS", "Tata Motors", 1024.50, 2.12, 72, 2.0, 1.8, 1.2),
+    ("BAJFINANCE", "Bajaj Finance", 6850.00, 1.82, 68, 1.9, 1.6, 1.1),
 ]
 
 INDICES = [

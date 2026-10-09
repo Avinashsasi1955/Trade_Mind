@@ -23,9 +23,9 @@ class TestCleanCloneSecurityMaster(unittest.TestCase):
                 self.assertIsNotNone(infy)
                 self.assertEqual(infy["symbol"], "INFY")
 
-                tata = resolve_security("TATAMOTORS")
-                self.assertIsNotNone(tata)
-                self.assertEqual(tata["symbol"], "TATAMOTORS")
+                baj = resolve_security("BAJFINANCE")
+                self.assertIsNotNone(baj)
+                self.assertEqual(baj["symbol"], "BAJFINANCE")
 
         # Clear cache again so normal file loading is restored
         load_security_master.cache_clear()

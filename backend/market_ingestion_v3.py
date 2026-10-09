@@ -1,7 +1,7 @@
 import logging
 import os
 import time as time_module
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, Iterable, Tuple
 from zoneinfo import ZoneInfo
@@ -86,7 +86,7 @@ class PostgresBarAggregator:
         self.sanitizer = TickSanitizer()
         self.open_trades_cache = {}
         self.last_open_trades_sync = 0.0
-        self.prev_cumulative_volume: Dict[int, int] = {}
+        self.prev_cumulative_volume: Dict[int, Tuple[date, int]] = {}
         self.last_completed_bar_time: Dict[Tuple[int, str], datetime] = {}
         self.refresh_tokens()
 
@@ -151,8 +151,9 @@ class PostgresBarAggregator:
 
             if exit_reason:
                 try:
-                    from .ml.validation_engine import record_shadow_exit
-                    record_shadow_exit(self.engine, int(trade["id"]), price, exit_reason, observed)
+                    from .position_manager import PositionManager
+                    pm = PositionManager(database_url=str(self.engine.url))
+                    pm.execute_exit(int(trade["id"]), price, exit_reason, exit_at=observed)
                 except Exception as exc:
                     logger.error("Failed to record instant exit breach for trade %s: %s", trade.get("id"), exc, exc_info=True)
             else:
@@ -223,19 +224,30 @@ class PostgresBarAggregator:
                     # Do not evict current bar; drop out-of-order tick.
                     continue
 
+                ist_date = observed.astimezone(IST).date()
                 if state is not None and state["bar_time"] != bucket:
                     # Rollover: previous bar complete
                     baseline = int(state.get("baseline_volume") if state.get("baseline_volume") is not None else state.get("first_volume", 0))
                     state["volume"] = max(0, int(state.get("last_volume") or 0) - baseline)
                     completed.append(state)
                     self.last_completed_bar_time[key] = state["bar_time"]
-                    self.prev_cumulative_volume[instrument] = int(state.get("last_volume") or 0)
+                    bar_date = state["bar_time"].astimezone(IST).date()
+                    self.prev_cumulative_volume[instrument] = (bar_date, int(state.get("last_volume") or 0))
                     state = None
 
                 if state is None:
-                    prev_cum = self.prev_cumulative_volume.get(instrument)
-                    baseline = prev_cum if prev_cum is not None else raw_vol
-                    self.prev_cumulative_volume[instrument] = max(self.prev_cumulative_volume.get(instrument, 0), raw_vol)
+                    prev_entry = self.prev_cumulative_volume.get(instrument)
+                    if prev_entry is not None:
+                        cached_date, cached_vol = prev_entry
+                        if ist_date != cached_date or raw_vol < cached_vol:
+                            # New session or exchange counter reset: baseline resets to raw_vol
+                            baseline = raw_vol
+                        else:
+                            baseline = cached_vol
+                    else:
+                        baseline = raw_vol
+                    cur_vol_record = max(cached_vol if (prev_entry and ist_date == prev_entry[0] and raw_vol >= prev_entry[1]) else 0, raw_vol)
+                    self.prev_cumulative_volume[instrument] = (ist_date, cur_vol_record)
                     state = {
                         "instrument_id": instrument,
                         "interval": label,
@@ -260,7 +272,8 @@ class PostgresBarAggregator:
                     state["last_volume"] = max(int(state.get("last_volume") or 0), raw_vol)
                     baseline = int(state.get("baseline_volume") if state.get("baseline_volume") is not None else state.get("first_volume", 0))
                     state["volume"] = max(0, int(state["last_volume"]) - baseline)
-                    self.prev_cumulative_volume[instrument] = max(self.prev_cumulative_volume.get(instrument, 0), raw_vol)
+                    prev_val = self.prev_cumulative_volume.get(instrument, (ist_date, 0))[1]
+                    self.prev_cumulative_volume[instrument] = (ist_date, max(prev_val, raw_vol))
                     state["last_oi"] = int(tick.get("oi") or state.get("last_oi") or 0)
                     state["exchange_timestamp"] = observed
 
@@ -285,9 +298,12 @@ class PostgresBarAggregator:
                 state["volume"] = max(0, int(state.get("last_volume") or 0) - baseline)
                 completed.append(state)
                 self.last_completed_bar_time[key] = state["bar_time"]
-                self.prev_cumulative_volume[state["instrument_id"]] = max(
-                    self.prev_cumulative_volume.get(state["instrument_id"], 0),
-                    int(state.get("last_volume") or 0),
+                bar_date = state["bar_time"].astimezone(IST).date()
+                prev_entry = self.prev_cumulative_volume.get(state["instrument_id"], (bar_date, 0))
+                prev_vol = prev_entry[1] if isinstance(prev_entry, tuple) else prev_entry
+                self.prev_cumulative_volume[state["instrument_id"]] = (
+                    bar_date,
+                    max(prev_vol, int(state.get("last_volume") or 0)),
                 )
                 self.states.pop(key, None)
         if completed:

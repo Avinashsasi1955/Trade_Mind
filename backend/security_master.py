@@ -1,4 +1,5 @@
 import json
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict
@@ -21,7 +22,7 @@ CORE_EQUITY_SECURITIES = [
     {"exchange": "NSE", "symbol": "INFY", "code": "INFY", "name": "Infosys Limited", "series": "EQ", "isin": "INE009A01021", "lot": 1, "status": "Active"},
     {"exchange": "NSE", "symbol": "HDFCBANK", "code": "HDFCBANK", "name": "HDFC Bank Limited", "series": "EQ", "isin": "INE040A01034", "lot": 1, "status": "Active"},
     {"exchange": "NSE", "symbol": "ICICIBANK", "code": "ICICIBANK", "name": "ICICI Bank Limited", "series": "EQ", "isin": "INE090A01021", "lot": 1, "status": "Active"},
-    {"exchange": "NSE", "symbol": "TATAMOTORS", "code": "TATAMOTORS", "name": "Tata Motors Limited", "series": "EQ", "isin": "INE155A01022", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "BAJFINANCE", "code": "BAJFINANCE", "name": "Bajaj Finance Limited", "series": "EQ", "isin": "INE296A01024", "lot": 1, "status": "Active"},
     {"exchange": "NSE", "symbol": "SBIN", "code": "SBIN", "name": "State Bank of India", "series": "EQ", "isin": "INE062A01020", "lot": 1, "status": "Active"},
     {"exchange": "NSE", "symbol": "BHARTIARTL", "code": "BHARTIARTL", "name": "Bharti Airtel Limited", "series": "EQ", "isin": "INE397D01024", "lot": 1, "status": "Active"},
     {"exchange": "NSE", "symbol": "LT", "code": "LT", "name": "Larsen & Toubro Limited", "series": "EQ", "isin": "INE018A01030", "lot": 1, "status": "Active"},
@@ -38,6 +39,12 @@ CORE_EQUITY_SECURITIES = [
 @lru_cache(maxsize=1)
 def load_security_master() -> Dict:
     if not MASTER_PATH.is_file():
+        env = os.getenv("ENVIRONMENT", os.getenv("NIVESH_ENV", "development")).lower()
+        if env in {"production", "staging"}:
+            raise RuntimeError(
+                f"Production/staging security master missing at {MASTER_PATH}. "
+                "Fail-closed invariant triggered: execute 'python3 scripts/sync_security_master.py' before launching."
+            )
         bootstrap = {
             "as_of": "BOOTSTRAP",
             "sources": {"NSE": "Builtin Core Equities Fallback", "BSE": "Builtin Core Equities Fallback"},

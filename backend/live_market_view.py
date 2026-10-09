@@ -14,9 +14,10 @@ def snapshot(database_url: str,limit: int = 500) -> Optional[Dict]:
     if not database_url: return None
     cache_key=(database_url,limit); cached=_CACHE.get(cache_key); now=time.monotonic()
     if cached and now-cached[0]<_CACHE_SECONDS: return cached[1]
-    engine=create_engine(database_url,pool_pre_ping=True,future=True)
-    with engine.connect() as connection:
-        rows=connection.execute(text("""
+    try:
+        engine=create_engine(database_url,pool_pre_ping=True,future=True)
+        with engine.connect() as connection:
+            rows=connection.execute(text("""
             WITH latest_bar AS (
               SELECT DISTINCT ON (b.instrument_id) b.instrument_id,b.bar_time,b.close_price
               FROM live_market_bars b JOIN instrument_master i ON i.id=b.instrument_id
@@ -40,7 +41,7 @@ def snapshot(database_url: str,limit: int = 500) -> Optional[Dict]:
             ) previous ON TRUE
             ORDER BY b.bar_time DESC,i.exchange,i.symbol LIMIT :limit
         """),{"limit":max(1,min(9000,limit)),"sources":list(LIVE_BAR_SOURCES)}).mappings().all()
-        indices=connection.execute(text("""
+            indices=connection.execute(text("""
             WITH latest AS (
               SELECT DISTINCT ON (b.instrument_id) b.instrument_id,b.bar_time,b.close_price
               FROM live_market_bars b JOIN instrument_master i ON i.id=b.instrument_id
@@ -69,33 +70,54 @@ def snapshot(database_url: str,limit: int = 500) -> Optional[Dict]:
             ORDER BY CASE WHEN REPLACE(i.symbol,' ','')='INDIAVIX' THEN 4 WHEN i.symbol ILIKE '%BANK%' THEN 3
                 WHEN i.symbol ILIKE '%SENSEX%' THEN 2 ELSE 1 END LIMIT 4
         """),{"sources":list(LIVE_BAR_SOURCES)}).mappings().all()
-    engine.dispose()
-    if not rows:
-        _CACHE[cache_key]=(now,None); return None
-    quotes=[]
-    for row in rows:
-        features=row["features"] if isinstance(row["features"],dict) else {}
-        price=float(row["close_price"]); previous=float(row["previous_close"] or price)
-        quotes.append({"exchange":row["exchange"],"symbol":row["symbol"],"name":row["symbol"],"price":round(price,2),
-            "change_pct":round((price/previous-1)*100,2) if previous else 0.0,
-            "rsi":round(float(features.get("rsi_14",0))*50+50,1),
-            "volume_ratio":round(max(0,float(features.get("volume_z20",0))+1),2),
-            "breakout_pct":round(float(features.get("sma20_gap",0))*100,2),"vwap_pct":0.0,
-            "volatility":round(float(features.get("volatility_20d",0))*100,2),"source_timestamp":row["bar_time"].isoformat()})
-    index_values=[]
-    for row in indices:
-        price=float(row["close_price"]); previous=float(row["previous_close"] or price)
-        index_values.append({"symbol":row["symbol"],"price":round(price,2),
-            "change_pct":round((price/previous-1)*100,2) if previous else 0.0,"source_timestamp":row["bar_time"].isoformat()})
-    advancing=sum(item["change_pct"]>0 for item in quotes)
-    latest=max(row["bar_time"] for row in rows); age=max(0,(datetime.now(timezone.utc)-latest).total_seconds())
-    result={"indices":index_values,"quotes":quotes,"breadth":{"advancing":advancing,"declining":len(quotes)-advancing,
-            "ratio":round(advancing/max(1,len(quotes)),2)},"updated_at":datetime.now(timezone.utc).isoformat(),
-            "source_timestamp":latest.isoformat(),"data_mode":"provider_live_completed_bars" if age<=900 else "provider_stale_completed_bars",
-            "is_fresh":age<=900,"age_seconds":round(age,1),"orders_allowed":False}
-    _CACHE[cache_key]=(now,result); return result
+        engine.dispose()
+        if not rows:
+            _CACHE[cache_key]=(now,None); return None
+        quotes=[]
+        for row in rows:
+            features=row["features"] if isinstance(row["features"],dict) else {}
+            price=float(row["close_price"]); previous=float(row["previous_close"] or price)
+            quotes.append({"exchange":row["exchange"],"symbol":row["symbol"],"name":row["symbol"],"price":round(price,2),
+                "change_pct":round((price/previous-1)*100,2) if previous else 0.0,
+                "rsi":round(float(features.get("rsi_14",0))*50+50,1),
+                "volume_ratio":round(max(0,float(features.get("volume_z20",0))+1),2),
+                "breakout_pct":round(float(features.get("sma20_gap",0))*100,2),"vwap_pct":0.0,
+                "volatility":round(float(features.get("volatility_20d",0))*100,2),"source_timestamp":row["bar_time"].isoformat()})
+        index_values=[]
+        for row in indices:
+            price=float(row["close_price"]); previous=float(row["previous_close"] or price)
+            index_values.append({"symbol":row["symbol"],"price":round(price,2),
+                "change_pct":round((price/previous-1)*100,2) if previous else 0.0,"source_timestamp":row["bar_time"].isoformat()})
+        advancing=sum(item["change_pct"]>0 for item in quotes)
+        latest=max(row["bar_time"] for row in rows); age=max(0,(datetime.now(timezone.utc)-latest).total_seconds())
+        result={"indices":index_values,"quotes":quotes,"breadth":{"advancing":advancing,"declining":len(quotes)-advancing,
+                "ratio":round(advancing/max(1,len(quotes)),2)},"updated_at":datetime.now(timezone.utc).isoformat(),
+                "source_timestamp":latest.isoformat(),"data_mode":"provider_live_completed_bars" if age<=900 else "provider_stale_completed_bars",
+                "is_fresh":age<=900,"age_seconds":round(age,1),"orders_allowed":False}
+        _CACHE[cache_key]=(now,result)
+        return result
+    except Exception as exc:
+        import os
+        env = os.getenv("ENVIRONMENT", os.getenv("NIVESH_ENV", "development")).lower()
+        if env in {"production", "staging"}:
+            return {
+                "status": "degraded",
+                "error": f"PostgreSQL live feed unreachable: {str(exc)[:150]}",
+                "indices": [],
+                "quotes": [],
+                "breadth": {"advancing": 0, "declining": 0, "ratio": 0.0},
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "source_timestamp": None,
+                "data_mode": "database_unavailable",
+                "is_fresh": False,
+                "age_seconds": 999999.0,
+                "orders_allowed": False,
+            }
+        return None
 
 
 def price_map(database_url: str) -> Dict[str,float]:
     result=snapshot(database_url,9000)
-    return {item["symbol"]:item["price"] for item in result["quotes"]} if result else {}
+    if result and result.get("status") != "degraded":
+        return {item["symbol"]:item["price"] for item in result.get("quotes", [])}
+    return {}

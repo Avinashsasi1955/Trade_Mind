@@ -77,7 +77,7 @@ class LiveStreamService:
                         WHEN REPLACE(i.symbol,' ','') IN ('NIFTY','NIFTY50','NIFTYBANK','BANKNIFTY','SENSEX','BSESENSEX','INDIAVIX','VIX') THEN 0
                         WHEN i.exchange='NSE' AND i.instrument_type='EQ' AND i.symbol IN (
                             'RELIANCE','TCS','HDFCBANK','ICICIBANK','INFY','SBIN','LT','ITC','BHARTIARTL','AXISBANK',
-                            'KOTAKBANK','HINDUNILVR','BAJFINANCE','MARUTI','SUNPHARMA','TATAMOTORS','NTPC','ONGC',
+                            'KOTAKBANK','HINDUNILVR','BAJFINANCE','MARUTI','SUNPHARMA','TRENT','NTPC','ONGC',
                             'POWERGRID','ULTRACEMCO','TITAN','ADANIENT','ADANIPORTS','WIPRO','TECHM','JSWSTEEL',
                             'TATASTEEL','COALINDIA','HCLTECH','BEL') THEN 1
                         WHEN i.instrument_type IN ('CE','PE') AND i.underlying_symbol IN ('NIFTY','BANKNIFTY','SENSEX')
