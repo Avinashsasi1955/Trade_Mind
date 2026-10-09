@@ -34,6 +34,16 @@ from .config import (
     PRICE_MAX_AGE_SECONDS,
     PRICE_MAX_AGE_SWING_SECONDS,
     STALE_DATA_EXIT_MINUTES,
+    PROFIT_HARVEST_ENABLED,
+    HARVEST_TRIGGER,
+    HARVEST_EXIT_THRESHOLD,
+    HARVEST_TIGHTEN_THRESHOLD,
+    HARVEST_LOCK_FRACTION,
+)
+from .profit_harvest import (
+    calculate_progress,
+    calculate_harvest_stop,
+    compute_reversal_score,
 )
 from .ml.validation_engine import record_shadow_exit
 
@@ -226,6 +236,130 @@ class PositionManager:
         self.stale_data_exit_minutes = int(os.getenv("NIVESH_STALE_DATA_EXIT_MINUTES", str(STALE_DATA_EXIT_MINUTES)))
         self.stale_open_grace_seconds = int(os.getenv("NIVESH_STALE_OPEN_GRACE_SECONDS", "120"))
         self.stale_positions_tracker: Dict[int, datetime] = {}
+
+        # Profit-Harvest Layer (Phase 2): Target 1.5R, Reached 1.25R (0.83), Chart Reverses
+        self.profit_harvest_enabled = os.getenv("NIVESH_PROFIT_HARVEST_ENABLED", "1" if PROFIT_HARVEST_ENABLED else "0") == "1"
+        self.harvest_trigger = float(os.getenv("NIVESH_HARVEST_TRIGGER", str(HARVEST_TRIGGER)))
+        self.harvest_exit_threshold = float(os.getenv("NIVESH_HARVEST_EXIT_THRESHOLD", str(HARVEST_EXIT_THRESHOLD)))
+        self.harvest_tighten_threshold = float(os.getenv("NIVESH_HARVEST_TIGHTEN_THRESHOLD", str(HARVEST_TIGHTEN_THRESHOLD)))
+        self.harvest_lock_fraction = float(os.getenv("NIVESH_HARVEST_LOCK_FRACTION", str(HARVEST_LOCK_FRACTION)))
+
+    def _get_recent_5m_bars(self, instrument_id: int, watermark: datetime, limit: int = 20) -> List[Dict[str, Any]]:
+        """Fetch or derive recent 5m bars for instrument up to watermark."""
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text("""
+                        SELECT open_price, high_price, low_price, close_price, volume, bar_time
+                        FROM live_market_bars
+                        WHERE instrument_id = :inst_id
+                          AND interval IN ('5minute', '5m')
+                          AND bar_time <= :wm
+                        ORDER BY bar_time DESC
+                        LIMIT :limit
+                    """),
+                    {"inst_id": instrument_id, "wm": watermark, "limit": limit}
+                ).mappings().all()
+                if rows and len(rows) >= 3:
+                    return [
+                        {
+                            "open": float(r["open_price"]),
+                            "high": float(r["high_price"]),
+                            "low": float(r["low_price"]),
+                            "close": float(r["close_price"]),
+                            "volume": float(r["volume"] or 0),
+                            "bar_time": r["bar_time"],
+                        }
+                        for r in reversed(rows)
+                    ]
+
+                # Derive 5m bars from 1m bars if 5m bars not directly written
+                m1_rows = conn.execute(
+                    text("""
+                        SELECT open_price, high_price, low_price, close_price, volume, bar_time
+                        FROM live_market_bars
+                        WHERE instrument_id = :inst_id
+                          AND interval IN ('1minute', '1m')
+                          AND bar_time <= :wm
+                        ORDER BY bar_time DESC
+                        LIMIT :limit
+                    """),
+                    {"inst_id": instrument_id, "wm": watermark, "limit": limit * 5}
+                ).mappings().all()
+                if m1_rows:
+                    bars_1m = [
+                        {
+                            "open": float(r["open_price"]),
+                            "high": float(r["high_price"]),
+                            "low": float(r["low_price"]),
+                            "close": float(r["close_price"]),
+                            "volume": float(r["volume"] or 0),
+                            "bar_time": r["bar_time"],
+                        }
+                        for r in reversed(m1_rows)
+                    ]
+                    bars_5m = []
+                    current_bucket = None
+                    for b in bars_1m:
+                        b_time = b["bar_time"]
+                        bucket_time = b_time.replace(minute=(b_time.minute // 5) * 5, second=0, microsecond=0)
+                        if not current_bucket or current_bucket["bar_time"] != bucket_time:
+                            if current_bucket:
+                                bars_5m.append(current_bucket)
+                            current_bucket = {
+                                "open": b["open"],
+                                "high": b["high"],
+                                "low": b["low"],
+                                "close": b["close"],
+                                "volume": b["volume"],
+                                "bar_time": bucket_time,
+                            }
+                        else:
+                            current_bucket["high"] = max(current_bucket["high"], b["high"])
+                            current_bucket["low"] = min(current_bucket["low"], b["low"])
+                            current_bucket["close"] = b["close"]
+                            current_bucket["volume"] += b["volume"]
+                    if current_bucket:
+                        bars_5m.append(current_bucket)
+                    return bars_5m[-limit:]
+        except Exception as e:
+            logger.debug(f"Failed to fetch 5m bars for instrument #{instrument_id}: {e}")
+        return []
+
+    def _get_recent_underlying_bars(self, symbol: str, watermark: datetime, limit: int = 20) -> List[Dict[str, Any]]:
+        """Fetch underlying equity bars for an option contract."""
+        try:
+            with self.engine.connect() as conn:
+                und_sym = symbol.split()[0] if " " in symbol else symbol
+                rows = conn.execute(
+                    text("""
+                        SELECT b.open_price, b.high_price, b.low_price, b.close_price, b.volume, b.bar_time
+                        FROM live_market_bars b
+                        JOIN instrument_master i ON i.id = b.instrument_id
+                        WHERE (i.symbol = :sym OR i.underlying_symbol = :sym)
+                          AND i.instrument_type IN ('EQ', 'INDEX')
+                          AND b.interval IN ('5minute', '5m', '1minute', '1m')
+                          AND b.bar_time <= :wm
+                        ORDER BY b.bar_time DESC
+                        LIMIT :limit
+                    """),
+                    {"sym": und_sym, "wm": watermark, "limit": limit}
+                ).mappings().all()
+                if rows:
+                    return [
+                        {
+                            "open": float(r["open_price"]),
+                            "high": float(r["high_price"]),
+                            "low": float(r["low_price"]),
+                            "close": float(r["close_price"]),
+                            "volume": float(r["volume"] or 0),
+                            "bar_time": r["bar_time"],
+                        }
+                        for r in reversed(rows)
+                    ]
+        except Exception as e:
+            logger.debug(f"Failed to fetch underlying bars for {symbol}: {e}")
+        return []
 
     def execute_exit(
         self,
@@ -983,6 +1117,48 @@ class PositionManager:
                 if favorable_r >= self.breakeven_trigger_r:
                     breakeven_price = (entry + fee_buffer_per_share) if side == "BUY" else (entry - fee_buffer_per_share)
 
+                # Profit-Harvest Layer (Phase 2): Target 1.5R, Progress >= 0.83, Reversal Analysis
+                harvest_stop_price = None
+                harvest_exit_requested = False
+                if take_profit is not None:
+                    target_progress = calculate_progress(side, entry, latest_price, take_profit)
+                    if target_progress >= 0.50 and breakeven_price is None:
+                        breakeven_price = (entry + fee_buffer_per_share) if side == "BUY" else (entry - fee_buffer_per_share)
+
+                    if target_progress >= self.harvest_trigger:
+                        bars_5m = self._get_recent_5m_bars(pos["instrument_id"], watermark, limit=20)
+                        is_option = str(pos.get("option_type") or "").upper() in ("CE", "PE", "CALL", "PUT") or (" " in str(pos.get("symbol", "")))
+                        und_bars = self._get_recent_underlying_bars(pos["symbol"], watermark, limit=20) if is_option else None
+
+                        harvest_res = compute_reversal_score(
+                            bars_5m=bars_5m,
+                            side=side,
+                            vwap=float(pos.get("vwap") or 0.0) if pos.get("vwap") else None,
+                            is_option=is_option,
+                            underlying_bars=und_bars,
+                            exit_threshold=self.harvest_exit_threshold,
+                            tighten_threshold=self.harvest_tighten_threshold,
+                        )
+                        note_dict["profit_harvest"] = {
+                            "progress": round(target_progress, 4),
+                            "reversal_score": harvest_res["reversal_score"],
+                            "action": harvest_res["action"],
+                            "reasons": harvest_res["reasons"],
+                            "enabled": self.profit_harvest_enabled,
+                        }
+
+                        if self.profit_harvest_enabled:
+                            if harvest_res["action"] == "EXIT":
+                                harvest_exit_requested = True
+                            elif harvest_res["action"] == "TIGHTEN":
+                                harvest_stop_price = calculate_harvest_stop(
+                                    side=side,
+                                    entry_price=entry,
+                                    latest_price=latest_price,
+                                    current_sl=running_sl,
+                                    lock_fraction=self.harvest_lock_fraction,
+                                )
+
                 trailing_stop_price = None
                 if favorable_r >= self.trailing_trigger_r:
                     if side == "BUY":
@@ -993,11 +1169,11 @@ class PositionManager:
                 # Trailing Stop & Profit Lock Level Update & Database Persistence
                 trailed_sl = running_sl
                 if side == "BUY":
-                    candidates = [p for p in (running_sl, profit_lock_price, breakeven_price, trailing_stop_price) if p is not None]
+                    candidates = [p for p in (running_sl, profit_lock_price, breakeven_price, trailing_stop_price, harvest_stop_price) if p is not None]
                     if candidates:
                         trailed_sl = max(candidates)
                 else:
-                    candidates = [p for p in (running_sl, profit_lock_price, breakeven_price, trailing_stop_price) if p is not None]
+                    candidates = [p for p in (running_sl, profit_lock_price, breakeven_price, trailing_stop_price, harvest_stop_price) if p is not None]
                     if candidates:
                         trailed_sl = min(candidates)
 
@@ -1018,7 +1194,13 @@ class PositionManager:
                     old_sl_flt = round(float(orig_trailed), 4) if orig_trailed else (round(float(initial_sl), 4) if initial_sl else sl_flt)
                     note_dict["trailed_stop_price"] = sl_flt
                     note_dict["initial_stop_loss_price"] = round(float(initial_sl), 4) if initial_sl else None
-                    reason_tag = "PROFIT_TRAILING_LOCK" if (trailed_sl > entry if side == "BUY" else trailed_sl < entry) else "TRAILING_STOP_ACTIVE"
+                    if harvest_stop_price is not None and trailed_sl == harvest_stop_price:
+                        reason_tag = "PROFIT_HARVEST_STOP"
+                    elif (trailed_sl > entry if side == "BUY" else trailed_sl < entry):
+                        reason_tag = "PROFIT_TRAILING_LOCK"
+                    else:
+                        reason_tag = "TRAILING_STOP_ACTIVE"
+
                     note_dict["risk_manager"] = {
                         "old_sl": old_sl_flt,
                         "new_sl": sl_flt,
@@ -1041,6 +1223,7 @@ class PositionManager:
                                     "spread_basket_id": spread_basket_id,
                                     "paired_primary_audit_id": paired_primary_audit_id,
                                     "risk_manager": note_dict["risk_manager"],
+                                    "profit_harvest": note_dict.get("profit_harvest"),
                                 }
                                 conn.execute(
                                     text("UPDATE shadow_execution_audits SET stop_loss_price = :sl, improvement_note = :note WHERE id = :id AND net_pnl IS NULL"),
@@ -1057,8 +1240,14 @@ class PositionManager:
 
                 # Evaluate Stops & Targets Against Current Live Price
                 if not exit_reason:
-                    if side == "BUY":
-                        if trailing_stop_price and latest_price <= trailing_stop_price:
+                    if harvest_exit_requested:
+                        exit_price = latest_price
+                        exit_reason = "PROFIT_HARVEST_REVERSAL_EXIT"
+                    elif side == "BUY":
+                        if harvest_stop_price and latest_price <= harvest_stop_price:
+                            exit_price = min(harvest_stop_price, latest_price)
+                            exit_reason = "PROFIT_HARVEST_STOP"
+                        elif trailing_stop_price and latest_price <= trailing_stop_price:
                             stop_level = max(trailing_stop_price, profit_lock_price or breakeven_price or trailing_stop_price)
                             exit_price = min(stop_level, latest_price)
                             exit_reason = "TRAILING_STOP"
@@ -1080,7 +1269,10 @@ class PositionManager:
                             exit_price = take_profit
                             exit_reason = "TAKE_PROFIT"
                     else:
-                        if trailing_stop_price and latest_price >= trailing_stop_price:
+                        if harvest_stop_price and latest_price >= harvest_stop_price:
+                            exit_price = max(harvest_stop_price, latest_price)
+                            exit_reason = "PROFIT_HARVEST_STOP"
+                        elif trailing_stop_price and latest_price >= trailing_stop_price:
                             stop_level = min(trailing_stop_price, profit_lock_price or breakeven_price or trailing_stop_price)
                             exit_price = max(stop_level, latest_price)
                             exit_reason = "TRAILING_STOP"
@@ -1221,6 +1413,7 @@ class PositionManager:
             "exit_reason": exit_reason,
             "exit_price": float(exit_price) if exit_price else None,
             "stale_price": is_stale_price,
+            "profit_harvest": note_dict.get("profit_harvest"),
             "updated_at": watermark.isoformat(),
         }
 

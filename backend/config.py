@@ -90,6 +90,11 @@ HELD_CONTRACT_STALE_TICK_MINUTES = int(os.getenv("NIVESH_HELD_CONTRACT_STALE_TIC
 STALE_OPEN_GRACE_SECONDS = int(os.getenv("NIVESH_STALE_OPEN_GRACE_SECONDS", "120"))
 SWING_MAX_STOP_ATR = float(os.getenv("NIVESH_SWING_MAX_STOP_ATR", "3.0"))
 SWING_MAX_POSITION_PCT = float(os.getenv("NIVESH_SWING_MAX_POSITION_PCT", "0.20"))
+PROFIT_HARVEST_ENABLED = os.getenv("NIVESH_PROFIT_HARVEST_ENABLED", "0") == "1"
+HARVEST_TRIGGER = float(os.getenv("NIVESH_HARVEST_TRIGGER", "0.83"))
+HARVEST_EXIT_THRESHOLD = float(os.getenv("NIVESH_HARVEST_EXIT_THRESHOLD", "70.0"))
+HARVEST_TIGHTEN_THRESHOLD = float(os.getenv("NIVESH_HARVEST_TIGHTEN_THRESHOLD", "40.0"))
+HARVEST_LOCK_FRACTION = float(os.getenv("NIVESH_HARVEST_LOCK_FRACTION", "0.65"))
 UPSTOX_REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", f"http://{HOST}:{PORT}/api/broker/upstox/callback")
 UPSTOX_AUTHORIZE_URL = os.getenv("UPSTOX_AUTHORIZE_URL", "https://api.upstox.com/v3/feed/market-data-feed/authorize")
 UPSTOX_INSTRUMENTS_URL = os.getenv("UPSTOX_INSTRUMENTS_URL", "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz")

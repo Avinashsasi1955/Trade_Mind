@@ -382,3 +382,252 @@ def get_latest_counterfactual_summary(engine, trade_date: Optional[date] = None,
         "details": {},
         "status": "pending_post_market_eval",
     }
+
+
+def run_profit_harvest_ab_replay(
+    engine: Optional[Any] = None,
+    trades: Optional[List[Dict[str, Any]]] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    harvest_trigger: float = 0.83,
+    exit_threshold: float = 70.0,
+    tighten_threshold: float = 40.0,
+    lock_fraction: float = 0.65,
+    n_bootstraps: int = 1000,
+    random_seed: int = 42,
+) -> Dict[str, Any]:
+    """A/B Counterfactual Replay comparing Baseline execution (Arm A) vs Profit-Harvest (Arm B).
+
+    For each trade:
+    - Arm A (Baseline): Realized R under standard exit rules (SL, TP, trailing, EOD).
+    - Arm B (Harvest): Counterfactual execution with Profit-Harvest enabled:
+        - When favorable progress >= harvest_trigger (default 0.83, i.e. 1.25R of 1.5R):
+            - If reversal_score >= exit_threshold (70.0): market exit at reversal candle.
+            - If reversal_score >= tighten_threshold (40.0): tighten stop to lock lock_fraction (0.65) of open profit.
+            - Else: continue baseline trailing.
+
+    Computes delta R (Arm B - Arm A) and 95% bootstrap confidence interval.
+    """
+    import random
+    from backend.profit_harvest import (
+        calculate_progress,
+        calculate_harvest_stop,
+        compute_reversal_score,
+    )
+
+    trade_samples: List[Dict[str, Any]] = []
+
+    if trades is not None:
+        trade_samples = list(trades)
+    elif engine is not None:
+        try:
+            with engine.connect() as conn:
+                params: Dict[str, Any] = {}
+                date_filter = ""
+                if start_date:
+                    date_filter += " AND (a.signal_at AT TIME ZONE 'Asia/Kolkata')::date >= :start_d"
+                    params["start_d"] = start_date
+                if end_date:
+                    date_filter += " AND (a.signal_at AT TIME ZONE 'Asia/Kolkata')::date <= :end_d"
+                    params["end_d"] = end_date
+
+                query = text(f"""
+                    SELECT a.id, a.instrument_id, a.side, a.signal_at, a.closed_at,
+                           a.stop_loss_price, a.take_profit_price,
+                           a.theoretical_fill_price, a.theoretical_exit_price,
+                           a.exit_reason, a.improvement_note, i.symbol
+                    FROM shadow_execution_audits a
+                    JOIN instrument_master i ON i.id = a.instrument_id
+                    WHERE a.net_pnl IS NOT NULL
+                      AND a.theoretical_fill_price IS NOT NULL
+                      AND a.theoretical_exit_price IS NOT NULL
+                      {date_filter}
+                    ORDER BY a.signal_at ASC
+                """)
+                rows = conn.execute(query, params).mappings().all()
+                for r in rows:
+                    note = {}
+                    if r.get("improvement_note"):
+                        try:
+                            note = json.loads(r["improvement_note"]) if isinstance(r["improvement_note"], str) else r["improvement_note"]
+                        except Exception:
+                            note = {}
+                    trade_samples.append({
+                        "id": r["id"],
+                        "symbol": r["symbol"],
+                        "side": r["side"],
+                        "entry": float(r["theoretical_fill_price"]),
+                        "initial_sl": float(r["stop_loss_price"] or 0.0),
+                        "target_price": float(r["take_profit_price"] or 0.0),
+                        "exit_price": float(r["theoretical_exit_price"]),
+                        "exit_reason": r.get("exit_reason"),
+                        "instrument_id": r.get("instrument_id"),
+                        "signal_at": r.get("signal_at"),
+                        "closed_at": r.get("closed_at"),
+                        "note": note,
+                    })
+        except Exception as err:
+            logger.warning("Failed to fetch historical shadow trades for A/B replay: %s", err)
+
+    if not trade_samples:
+        return {
+            "total_trades": 0,
+            "trades_reaching_harvest": 0,
+            "trades_improved": 0,
+            "trades_hurt": 0,
+            "trades_unchanged": 0,
+            "baseline_mean_r": 0.0,
+            "harvest_mean_r": 0.0,
+            "delta_mean_r": 0.0,
+            "ci_95": (0.0, 0.0),
+            "baseline_win_rate": 0.0,
+            "harvest_win_rate": 0.0,
+            "recommendation": "INSUFFICIENT_DATA",
+            "trades": [],
+        }
+
+    baseline_rs: List[float] = []
+    harvest_rs: List[float] = []
+    deltas: List[float] = []
+    harvest_triggered_count = 0
+    improved_count = 0
+    hurt_count = 0
+    unchanged_count = 0
+    eval_records: List[Dict[str, Any]] = []
+
+    for t in trade_samples:
+        entry = float(t.get("entry") or 0.0)
+        sl = float(t.get("initial_sl") or 0.0)
+        side = str(t.get("side") or "BUY").upper()
+        baseline_exit = float(t.get("exit_price") or entry)
+
+        r_points = abs(entry - sl)
+        if r_points <= 1e-4:
+            # Fallback 1% risk if missing stop
+            r_points = max(1.0, entry * 0.01)
+
+        target = float(t.get("target_price") or 0.0)
+        if target <= 0.0:
+            target = entry + (1.5 * r_points) if side == "BUY" else entry - (1.5 * r_points)
+
+        target_dist = abs(target - entry)
+        if target_dist <= 1e-4:
+            continue
+
+        baseline_r = (baseline_exit - entry) / r_points if side == "BUY" else (entry - baseline_exit) / r_points
+
+        # Determine favorable move achieved
+        max_favorable = float(t.get("max_favorable_price") or (
+            baseline_exit if (baseline_exit > entry if side == "BUY" else baseline_exit < entry) else entry
+        ))
+        favorable_dist = (max_favorable - entry) if side == "BUY" else (entry - max_favorable)
+        max_progress = favorable_dist / target_dist if target_dist > 0 else 0.0
+
+        # Evaluate Harvest arm
+        harvest_r = baseline_r
+        harvest_action = "NONE"
+        harvest_exit_price = baseline_exit
+
+        bars = t.get("bars")
+        rev_score = float(t.get("reversal_score") or 0.0)
+
+        if max_progress >= harvest_trigger:
+            harvest_triggered_count += 1
+
+            # If explicit bars provided, compute reversal score
+            if bars and len(bars) >= 3 and rev_score == 0.0:
+                rev_res = compute_reversal_score(
+                    bars_5m=bars,
+                    side=side,
+                    exit_threshold=exit_threshold,
+                    tighten_threshold=tighten_threshold,
+                )
+                rev_score = rev_res["reversal_score"]
+
+            if rev_score >= exit_threshold:
+                harvest_action = "EXIT"
+                harvest_exit_price = float(t.get("reversal_price") or max_favorable)
+                harvest_r = (harvest_exit_price - entry) / r_points if side == "BUY" else (entry - harvest_exit_price) / r_points
+            elif rev_score >= tighten_threshold:
+                harvest_action = "TIGHTEN"
+                tightened_sl = entry + (lock_fraction * (max_favorable - entry)) if side == "BUY" else entry - (lock_fraction * (entry - max_favorable))
+                # Check if baseline pulled back below tightened stop
+                pulled_back = baseline_exit < tightened_sl if side == "BUY" else baseline_exit > tightened_sl
+                if pulled_back:
+                    harvest_exit_price = tightened_sl
+                    harvest_r = (tightened_sl - entry) / r_points if side == "BUY" else (entry - tightened_sl) / r_points
+                else:
+                    harvest_r = baseline_r
+            else:
+                harvest_action = "HOLD"
+                harvest_r = baseline_r
+
+        delta_r = harvest_r - baseline_r
+        baseline_rs.append(baseline_r)
+        harvest_rs.append(harvest_r)
+        deltas.append(delta_r)
+
+        if delta_r > 0.005:
+            improved_count += 1
+        elif delta_r < -0.005:
+            hurt_count += 1
+        else:
+            unchanged_count += 1
+
+        eval_records.append({
+            "symbol": t.get("symbol"),
+            "side": side,
+            "entry": round(entry, 2),
+            "baseline_exit": round(baseline_exit, 2),
+            "harvest_exit": round(harvest_exit_price, 2),
+            "baseline_r": round(baseline_r, 3),
+            "harvest_r": round(harvest_r, 3),
+            "delta_r": round(delta_r, 3),
+            "progress": round(max_progress, 3),
+            "reversal_score": round(rev_score, 1),
+            "harvest_action": harvest_action,
+        })
+
+    N = len(deltas)
+    rng = random.Random(random_seed)
+    bootstrap_means: List[float] = []
+    for _ in range(n_bootstraps):
+        sample = [deltas[rng.randint(0, N - 1)] for _ in range(N)]
+        bootstrap_means.append(sum(sample) / N)
+    bootstrap_means.sort()
+
+    ci_lower = bootstrap_means[int(0.025 * len(bootstrap_means))]
+    ci_upper = bootstrap_means[int(0.975 * len(bootstrap_means))]
+
+    base_mean_r = sum(baseline_rs) / N
+    harv_mean_r = sum(harvest_rs) / N
+    delta_mean_r = sum(deltas) / N
+
+    base_wins = sum(1 for r in baseline_rs if r > 0.0)
+    harv_wins = sum(1 for r in harvest_rs if r > 0.0)
+    base_win_rate = (base_wins / N * 100.0) if N > 0 else 0.0
+    harv_win_rate = (harv_wins / N * 100.0) if N > 0 else 0.0
+
+    if ci_lower > 0.0:
+        recommendation = "ENABLE"
+    elif ci_upper < 0.0:
+        recommendation = "KEEP_OFF"
+    else:
+        recommendation = "NEUTRAL"
+
+    return {
+        "total_trades": N,
+        "trades_reaching_harvest": harvest_triggered_count,
+        "trades_improved": improved_count,
+        "trades_hurt": hurt_count,
+        "trades_unchanged": unchanged_count,
+        "baseline_mean_r": round(base_mean_r, 4),
+        "harvest_mean_r": round(harv_mean_r, 4),
+        "delta_mean_r": round(delta_mean_r, 4),
+        "ci_95": (round(ci_lower, 4), round(ci_upper, 4)),
+        "baseline_win_rate": round(base_win_rate, 2),
+        "harvest_win_rate": round(harv_win_rate, 2),
+        "recommendation": recommendation,
+        "sample_evaluations": eval_records[:20],
+    }
+
