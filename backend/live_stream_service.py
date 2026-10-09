@@ -330,21 +330,25 @@ class LiveStreamService:
 
                 age_seconds = (now_utc - last_bt).total_seconds() if last_bt else float("inf")
                 if age_seconds > stale_threshold_seconds and self.market_open():
-                    self.record("WARNING", f"Held contract {symbol} has no ticks for > {self.held_contract_stale_minutes} minutes", {
+                    self.record("CRITICAL", f"Held contract {symbol} has no ticks for > {self.held_contract_stale_minutes} minutes", {
                         "instrument_id": inst_id,
                         "symbol": symbol,
                         "age_seconds": round(age_seconds, 1),
                     })
+                    logger.critical(
+                        f"CRITICAL: Held contract {symbol} (id={inst_id}) has no ticks for {age_seconds:.1f}s "
+                        f"(> {self.held_contract_stale_minutes}m)"
+                    )
 
                 # REST quote fallback
                 try:
+                    ltp = None
                     if self.provider == "zerodha" and h.get("instrument_token"):
                         adapter = ZerodhaAdapter(self.api_key, self.access_token)
                         q_data = adapter.quotes([f"{h.get('exchange', 'NSE')}:{symbol}"])
                         quote_entry = q_data.get(f"{h.get('exchange', 'NSE')}:{symbol}") or q_data.get(symbol)
                         if quote_entry and quote_entry.get("last_price"):
-                            ltp = quote_entry["last_price"]
-                            self.redis.hset("nivesh:ticks:latest", str(inst_id), str(ltp))
+                            ltp = float(quote_entry["last_price"])
                     elif self.provider == "upstox":
                         with self.engine.connect() as k_conn:
                             pkey = k_conn.execute(text("""
@@ -352,11 +356,43 @@ class LiveStreamService:
                                 WHERE instrument_id = :id AND provider = 'upstox_v3' AND is_active LIMIT 1
                             """), {"id": inst_id}).scalar_one_or_none()
                         if pkey:
-                            pass
+                            from urllib.parse import quote as url_quote
+                            from urllib.request import Request, urlopen
+                            req = Request(
+                                f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={url_quote(str(pkey))}",
+                                headers={
+                                    "Accept": "application/json",
+                                    "Authorization": f"Bearer {self.upstox_token}",
+                                },
+                                method="GET",
+                            )
+                            with urlopen(req, timeout=10) as resp:
+                                q_res = json.loads(resp.read().decode("utf-8"))
+                            if isinstance(q_res, dict) and q_res.get("status") in ("success", "ok") and "data" in q_res:
+                                d_map = q_res["data"]
+                                entry_val = d_map.get(pkey) or d_map.get(str(pkey).replace("|", ":")) or (next(iter(d_map.values())) if d_map else None)
+                                if isinstance(entry_val, dict) and entry_val.get("last_price"):
+                                    ltp = float(entry_val["last_price"])
+
+                    if ltp is not None and ltp > 0:
+                        if self.redis:
+                            self.redis.hset("nivesh:ticks:latest", str(inst_id), str(ltp))
+                        src = "upstox_v3" if self.provider == "upstox" else "zerodha_kite"
+                        with self.engine.begin() as b_conn:
+                            b_conn.execute(
+                                text("""
+                                    INSERT INTO live_market_bars (
+                                        instrument_id, interval, bar_time, open_price, high_price, low_price, close_price, volume, source
+                                    ) VALUES (
+                                        :id, '1minute', :bt, :p, :p, :p, :p, 0, :src
+                                    )
+                                """),
+                                {"id": inst_id, "bt": now_utc, "p": ltp, "src": src}
+                            )
                 except Exception as q_err:
-                    logger.debug(f"REST quote fallback for held instrument {inst_id} failed: {q_err}")
+                    logger.warning(f"REST quote fallback for held instrument {inst_id} ({symbol}) failed: {q_err}")
         except Exception as exc:
-            logger.debug(f"poll_held_positions_quote loop error: {exc}")
+            logger.warning(f"poll_held_positions_quote loop error: {exc}")
 
     def run(self):
         self.purge_post_close_bars()

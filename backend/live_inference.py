@@ -3478,6 +3478,9 @@ class LivePaperInference:
                             ).mappings().all()
                             und_daily_candles = [dict(r) for r in und_rows]
 
+                    greeks = target.get("greeks") or {}
+                    opt_delta = greeks.get("delta")
+                    lot_sz = int(target.get("lot_size") or 1)
                     swing_res = compute_swing_risk_parameters(
                         symbol=str(item.get("symbol") or ""),
                         side=target["side"],
@@ -3486,14 +3489,20 @@ class LivePaperInference:
                         is_option=bool(str(target.get("kind") or "").upper() in ("CE", "PE")),
                         underlying_daily_candles=und_daily_candles,
                         option_type=target.get("kind"),
+                        delta=opt_delta,
+                        lot_size=lot_sz,
                     )
                     if swing_res:
                         risk_levels["stop_loss"] = Decimal(str(swing_res["stop_loss_price"]))
                         risk_levels["take_profit"] = Decimal(str(swing_res["take_profit_price"]))
                         quantity = max(1, swing_res["quantity"])
                         underlying_invalidation_level = swing_res.get("underlying_invalidation_level")
+                    else:
+                        logger.warning(f"Swing setup rejected for {item.get('symbol')}; keeping trade INTRADAY")
+                        agent_eval["trade_mode"] = "INTRADAY"
                 except Exception as sw_exc:
-                    logger.warning(f"Swing risk computation failed, fallback to standard: {sw_exc}")
+                    logger.warning(f"Swing risk computation failed, fallback to standard INTRADAY: {sw_exc}")
+                    agent_eval["trade_mode"] = "INTRADAY"
 
             if str(target.get("kind", "")).upper() in {"CE", "PE"}:
                 lot = int(target.get("lot_size") or 1)

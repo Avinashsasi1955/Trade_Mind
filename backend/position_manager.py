@@ -51,17 +51,82 @@ class PriceResult(tuple):
         return inst
 
 
-def is_market_hours(dt: Optional[datetime] = None) -> bool:
-    """Return True if given datetime (or now) falls in regular NSE market hours (Mon-Fri 09:15-15:30 IST)."""
+from datetime import time as dt_time
+
+
+def _parse_time(val: Any) -> Optional[dt_time]:
+    if val is None:
+        return None
+    if isinstance(val, dt_time):
+        return val
+    if isinstance(val, str):
+        val = val.strip()
+        parts = val.split(":")
+        if len(parts) >= 2:
+            return dt_time(int(parts[0]), int(parts[1]), int(parts[2].split(".")[0]) if len(parts) > 2 else 0)
+    return None
+
+
+def is_market_hours(dt: Optional[datetime] = None, engine: Any = None) -> bool:
+    """Return True if given datetime falls in regular NSE market hours using exchange_trading_calendar.
+
+    Falls back to weekday plus 09:15-15:30 IST only if no calendar row exists, logging a warning.
+    """
     target = dt or datetime.now(timezone.utc)
     target_ist = target.astimezone(IST) if getattr(target, "tzinfo", None) else target.replace(tzinfo=timezone.utc).astimezone(IST)
+    target_date = target_ist.date()
+    cur_time = target_ist.time()
+
+    session_row = None
+    if engine is not None:
+        try:
+            with engine.connect() as conn:
+                session_row = conn.execute(
+                    text("""
+                        SELECT session_status, opens_at, closes_at
+                        FROM exchange_trading_calendar
+                        WHERE exchange = 'NSE' AND session_date = :day
+                    """),
+                    {"day": target_date}
+                ).mappings().one_or_none()
+        except Exception as e:
+            logger.debug(f"exchange_trading_calendar lookup failed for {target_date}: {e}")
+
+    if session_row is not None:
+        status = str(session_row.get("session_status") or "").upper()
+        if status == "CLOSED":
+            return False
+        opens = _parse_time(session_row.get("opens_at")) or dt_time(9, 15)
+        closes = _parse_time(session_row.get("closes_at")) or dt_time(15, 30)
+        return opens <= cur_time <= closes
+
+    # Fallback to weekday check with warning
+    logger.warning(
+        f"No exchange_trading_calendar row for NSE on {target_date}; "
+        f"falling back to weekday 09:15-15:30 IST"
+    )
     if target_ist.weekday() >= 5:  # Saturday = 5, Sunday = 6
         return False
-    from datetime import time as dt_time
-    m_open = dt_time(9, 15)
-    m_close = dt_time(15, 30)
-    cur_time = target_ist.time()
-    return m_open <= cur_time <= m_close
+    return dt_time(9, 15) <= cur_time <= dt_time(15, 30)
+
+
+def get_market_open_time(dt: datetime, engine: Any = None) -> dt_time:
+    """Get NSE market open time for date of given datetime, checking calendar."""
+    target_ist = dt.astimezone(IST) if getattr(dt, "tzinfo", None) else dt.replace(tzinfo=timezone.utc).astimezone(IST)
+    if engine is not None:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT opens_at FROM exchange_trading_calendar WHERE exchange = 'NSE' AND session_date = :day"),
+                    {"day": target_ist.date()}
+                ).scalar_one_or_none()
+                if row:
+                    t = _parse_time(row)
+                    if t:
+                        return t
+        except Exception:
+            pass
+    return dt_time(9, 15)
 
 
 
@@ -94,7 +159,7 @@ def execute_exit(
 
 
 class PositionManager:
-    def __init__(self, database_url: Optional[str] = None, redis_url: Optional[str] = None):
+    def __init__(self, database_url: Optional[str] = None, redis_url: Optional[str] = None, redis_client=None):
         self.database_url = database_url or DATABASE_URL or os.getenv("DATABASE_URL", "")
         self.redis_url = redis_url or REDIS_URL or os.getenv("REDIS_URL", "")
         
@@ -104,11 +169,14 @@ class PositionManager:
             engine_kwargs["pool_size"] = 3
             engine_kwargs["max_overflow"] = 2
         self.engine = create_engine(self.database_url, **engine_kwargs)
-        self.redis = (
-            redis.Redis.from_url(self.redis_url, decode_responses=True, socket_timeout=3)
-            if self.redis_url
-            else None
-        )
+        if redis_client is not None:
+            self.redis = redis_client
+        else:
+            self.redis = (
+                redis.Redis.from_url(self.redis_url, decode_responses=True, socket_timeout=3)
+                if self.redis_url
+                else None
+            )
 
         # Risk parameters
         self.breakeven_trigger_r = Decimal(os.getenv("NIVESH_SHADOW_BREAKEVEN_TRIGGER_R", "1.10"))
@@ -128,6 +196,7 @@ class PositionManager:
         self.price_max_age_seconds = int(os.getenv("NIVESH_PRICE_MAX_AGE_SECONDS", str(PRICE_MAX_AGE_SECONDS)))
         self.price_max_age_swing_seconds = int(os.getenv("NIVESH_PRICE_MAX_AGE_SWING_SECONDS", str(PRICE_MAX_AGE_SWING_SECONDS)))
         self.stale_data_exit_minutes = int(os.getenv("NIVESH_STALE_DATA_EXIT_MINUTES", str(STALE_DATA_EXIT_MINUTES)))
+        self.stale_open_grace_seconds = int(os.getenv("NIVESH_STALE_OPEN_GRACE_SECONDS", "120"))
         self.stale_positions_tracker: Dict[int, datetime] = {}
 
     def execute_exit(
@@ -482,24 +551,40 @@ class PositionManager:
         price_bar_time = getattr(price_res, "bar_time", None)
         max_age = self.price_max_age_swing_seconds if is_multi_day else self.price_max_age_seconds
         is_stale_price = False
-        if is_market_hours(watermark) and price_bar_time is not None:
-            price_age = max(0.0, (watermark - price_bar_time).total_seconds())
-            if price_age > max_age:
-                is_stale_price = True
-                logger.critical(
-                    f"CRITICAL: STALE_PRICE detected for audit #{pos['id']} ({pos.get('symbol')}): "
-                    f"price age {price_age:.1f}s exceeds max {max_age}s"
-                )
-                if pos["id"] not in self.stale_positions_tracker:
-                    self.stale_positions_tracker[pos["id"]] = watermark
-                stale_duration = (watermark - self.stale_positions_tracker[pos["id"]]).total_seconds()
-                if stale_duration >= self.stale_data_exit_minutes * 60.0:
-                    exit_price = latest_price
-                    exit_reason = "STALE_DATA_EXIT"
-                    exit_bar_time = watermark
+
+        market_open_now = is_market_hours(watermark, engine=self.engine)
+        if market_open_now and price_bar_time is not None:
+            wm_ist = watermark.astimezone(IST) if watermark.tzinfo else watermark.replace(tzinfo=timezone.utc).astimezone(IST)
+            open_time = get_market_open_time(watermark, engine=self.engine)
+            session_open_dt = datetime.combine(wm_ist.date(), open_time, tzinfo=IST)
+            seconds_since_open = (wm_ist - session_open_dt).total_seconds()
+
+            if seconds_since_open >= self.stale_open_grace_seconds:
+                price_age = max(0.0, (watermark - price_bar_time).total_seconds())
+                if price_age > max_age:
+                    is_stale_price = True
+                    logger.critical(
+                        f"CRITICAL: STALE_PRICE detected for audit #{pos['id']} ({pos.get('symbol')}): "
+                        f"price age {price_age:.1f}s exceeds max {max_age}s"
+                    )
+                    if pos["id"] not in self.stale_positions_tracker:
+                        self.stale_positions_tracker[pos["id"]] = watermark
+                    stale_duration = (watermark - self.stale_positions_tracker[pos["id"]]).total_seconds()
+                    if stale_duration >= self.stale_data_exit_minutes * 60.0:
+                        exit_price = latest_price
+                        exit_reason = "STALE_DATA_EXIT"
+                        exit_bar_time = watermark
+                else:
+                    if pos["id"] in self.stale_positions_tracker:
+                        del self.stale_positions_tracker[pos["id"]]
             else:
+                # Within open grace period: suppress staleness check
                 if pos["id"] in self.stale_positions_tracker:
                     del self.stale_positions_tracker[pos["id"]]
+        else:
+            # Outside market hours or exchange holiday: suppress staleness check and clear tracker
+            if pos["id"] in self.stale_positions_tracker:
+                del self.stale_positions_tracker[pos["id"]]
 
         elapsed_seconds = max(0.0, (watermark - signal_at).total_seconds())
 

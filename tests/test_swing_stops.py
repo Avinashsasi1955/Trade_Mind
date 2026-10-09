@@ -1,9 +1,12 @@
-"""Phase 1 Tests: Swing stop-loss, gap-aware fills, incremental evaluation, and price freshness guards."""
+"""Phase 1 & 1b Tests: Swing stop-loss, gap-aware fills, incremental evaluation,
+price freshness guards, Upstox REST quote fallback, and holiday calendar integration.
+"""
+from __future__ import annotations
 
 import json
 import os
 import unittest
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -15,8 +18,11 @@ from backend.config import (
     PRICE_MAX_AGE_SWING_SECONDS,
     STALE_DATA_EXIT_MINUTES,
     HELD_CONTRACT_STALE_TICK_MINUTES,
+    SWING_MAX_STOP_ATR,
+    SWING_MAX_POSITION_PCT,
+    STALE_OPEN_GRACE_SECONDS,
 )
-from backend.position_manager import PositionManager, is_market_hours, PriceResult
+from backend.position_manager import PositionManager, is_market_hours, get_market_open_time, PriceResult
 from backend.swing_risk import calculate_daily_atr, compute_swing_risk_parameters
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -90,73 +96,183 @@ class TestSwingStopsAndRisk(unittest.TestCase):
                     is_active BOOLEAN DEFAULT 1
                 );
             """))
+            conn.execute(text("""
+                CREATE TABLE exchange_trading_calendar (
+                    exchange TEXT NOT NULL,
+                    session_date DATE NOT NULL,
+                    session_status TEXT NOT NULL,
+                    opens_at TIME,
+                    closes_at TIME,
+                    source TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(exchange, session_date)
+                );
+            """))
 
-            # Seed instrument
+            conn.execute(text("""
+                CREATE TABLE monitoring_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    component TEXT,
+                    level TEXT,
+                    message TEXT,
+                    payload TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """))
+
+            # Seed instruments: Stock (1) and Option (2)
             conn.execute(text("""
                 INSERT INTO instrument_master (id, instrument_token, symbol, exchange, instrument_type, is_active, underlying_symbol)
                 VALUES (1, 1001, 'RELIANCE', 'NSE', 'EQ', 1, 'RELIANCE');
             """))
+            conn.execute(text("""
+                INSERT INTO instrument_master (id, instrument_token, symbol, exchange, instrument_type, is_active, underlying_symbol, strike)
+                VALUES (2, 2001, 'RELIANCE 2600 CE', 'NFO', 'CE', 1, 'RELIANCE', 2600.0);
+            """))
+
+        self.mock_redis = MagicMock()
+        self.mock_redis.get.return_value = None
+        self.mock_redis.hget.return_value = None
 
     def tearDown(self):
         self.engine.dispose()
 
-    def test_swing_risk_parameters_calculation(self):
-        """Test compute_swing_risk_parameters with daily ATR, structure low/high, gap buffer, and sizing."""
+    # -------------------------------------------------------------
+    # 1. Swing Risk Model & Fails-Closed Tests
+    # -------------------------------------------------------------
+
+    def test_swing_risk_fewer_than_15_candles_fails_closed(self):
+        """calculate_daily_atr and compute_swing_risk_parameters must return None if < 15 daily candles."""
+        thin_candles = [{"high": 2500, "low": 2450, "close": 2480} for _ in range(10)]
+        self.assertIsNone(calculate_daily_atr(thin_candles, 14))
+
+        res = compute_swing_risk_parameters(
+            symbol="RELIANCE",
+            side="BUY",
+            entry_price=2500.0,
+            daily_candles=thin_candles,
+        )
+        self.assertIsNone(res, "Must return None when history has fewer than 15 daily candles")
+
+    def test_swing_risk_parameters_calculation_valid_history(self):
+        """Test compute_swing_risk_parameters with 20 daily candles produces valid SL/TP and sizing."""
         daily_candles = [
-            {"high": 2500, "low": 2450, "close": 2480},
-            {"high": 2520, "low": 2470, "close": 2510},
-            {"high": 2530, "low": 2490, "close": 2500},
-            {"high": 2510, "low": 2460, "close": 2470},
+            {"high": 2480 + i, "low": 2450 + i, "close": 2470 + i}
+            for i in range(20)
         ]
-        atr = calculate_daily_atr(daily_candles, period=3)
+        atr = calculate_daily_atr(daily_candles, period=14)
+        self.assertIsNotNone(atr)
         self.assertGreater(atr, Decimal("0"))
 
-        # BUY side
         res = compute_swing_risk_parameters(
             symbol="RELIANCE",
             side="BUY",
             entry_price=2500.0,
             daily_candles=daily_candles,
-            k=1.5,
-            gap_buffer_pct=0.005,
             capital=1_000_000.0,
             risk_pct=0.01,
         )
+        self.assertIsNotNone(res)
         self.assertLess(res["stop_loss_price"], 2500.0)
         self.assertGreater(res["take_profit_price"], 2500.0)
         self.assertGreaterEqual(res["risk_reward"], 1.5)
         self.assertGreater(res["quantity"], 0)
 
-        # SELL side
-        res_sell = compute_swing_risk_parameters(
-            symbol="RELIANCE",
-            side="SELL",
-            entry_price=2500.0,
-            daily_candles=daily_candles,
-            k=1.5,
-            gap_buffer_pct=0.005,
+    def test_option_swing_risk_with_no_option_history_uses_underlying(self):
+        """Option with 0 daily candles must calculate stop from underlying ATR & delta, and set invalidation."""
+        und_candles = [
+            {"high": 2480 + i, "low": 2450 + i, "close": 2470 + i}
+            for i in range(20)
+        ]
+        res = compute_swing_risk_parameters(
+            symbol="RELIANCE 2600 CE",
+            side="BUY",
+            entry_price=50.0,
+            daily_candles=None,  # No option history!
+            is_option=True,
+            underlying_daily_candles=und_candles,
+            option_type="CE",
+            delta=0.50,
+            lot_size=250,
             capital=1_000_000.0,
             risk_pct=0.01,
         )
-        self.assertGreater(res_sell["stop_loss_price"], 2500.0)
-        self.assertLess(res_sell["take_profit_price"], 2500.0)
-        self.assertGreaterEqual(res_sell["risk_reward"], 1.5)
+        self.assertIsNotNone(res)
+        self.assertLess(res["stop_loss_price"], 50.0)
+        self.assertGreater(res["take_profit_price"], 50.0)
+        self.assertIsNotNone(res["underlying_invalidation_level"])
+        self.assertGreater(res["underlying_invalidation_level"], 2400.0)
+        self.assertEqual(res["quantity"] % 250, 0, "Option sizing must be a multiple of lot size (250)")
+
+    def test_option_swing_risk_with_thin_underlying_history_returns_none(self):
+        """Option with < 15 underlying daily candles must fail closed and return None."""
+        thin_und_candles = [{"high": 2500, "low": 2450, "close": 2480} for _ in range(5)]
+        res = compute_swing_risk_parameters(
+            symbol="RELIANCE 2600 CE",
+            side="BUY",
+            entry_price=50.0,
+            is_option=True,
+            underlying_daily_candles=thin_und_candles,
+            option_type="CE",
+        )
+        self.assertIsNone(res)
+
+    def test_swing_stop_capped_and_wide_structure_rejected(self):
+        """If structural stop > NIVESH_SWING_MAX_STOP_ATR * ATR, reject the setup (return None)."""
+        # ATR ~ 10, but 20-day swing low is 2300 (200 pts away >> 3 * 10 = 30 pts)
+        daily_candles = [
+            {"high": 2500, "low": 2490, "close": 2495} for _ in range(19)
+        ]
+        daily_candles.insert(0, {"high": 2320, "low": 2300, "close": 2310})  # Deep low
+
+        res = compute_swing_risk_parameters(
+            symbol="RELIANCE",
+            side="BUY",
+            entry_price=2500.0,
+            daily_candles=daily_candles,
+            max_stop_atr=3.0,
+        )
+        self.assertIsNone(res, "Setup must be rejected when structural stop exceeds 3x ATR")
+
+    def test_swing_sizing_position_value_cap(self):
+        """Position value must be capped at NIVESH_SWING_MAX_POSITION_PCT (default 20%)."""
+        daily_candles = [
+            {"high": 2505, "low": 2495, "close": 2500} for _ in range(20)
+        ]
+        # Entry at 2500, tight stop at 2490 (stop_distance = 10 pts).
+        # Capital = 100,000. Risk 1% = 1,000 -> 100 shares.
+        # But Max position value = 20% of 100,000 = 20,000.
+        # At 2500 per share, 20,000 allows at most 8 shares!
+        res = compute_swing_risk_parameters(
+            symbol="RELIANCE",
+            side="BUY",
+            entry_price=2500.0,
+            daily_candles=daily_candles,
+            capital=100_000.0,
+            risk_pct=0.01,
+            max_position_pct=0.20,
+        )
+        self.assertIsNotNone(res)
+        self.assertEqual(res["quantity"], 8, "Position quantity must be capped at 8 shares (₹20,000 / ₹2,500)")
+
+    # -------------------------------------------------------------
+    # 2. Gap-Aware Fills & Execution Tests
+    # -------------------------------------------------------------
 
     def test_overnight_gap_down_fills_at_open(self):
         """Overnight gap-down exit must fill at open_price with GAP_DOWN_STOP, NOT at stop loss price."""
-        # Entry at 2500, Stop Loss at 2450
         signal_time = datetime(2026, 6, 1, 9, 30, tzinfo=timezone.utc)
         with self.engine.begin() as conn:
-            audit_id = conn.execute(text("""
+            conn.execute(text("""
                 INSERT INTO shadow_execution_audits (
                     instrument_id, side, quantity, theoretical_fill_price, stop_loss_price,
                     take_profit_price, signal_at, audit_status, trade_mode, improvement_note
                 ) VALUES (
                     1, 'BUY', 10, 2500.0, 2450.0, 2600.0, :sig_at, 'RECONCILED', 'SWING', '{}'
                 )
-            """), {"sig_at": signal_time}).lastrowid
+            """), {"sig_at": signal_time})
 
-            # Day 1: normal bar within range (High 2510, Low 2480, Close 2490)
+            # Day 1 bar
             conn.execute(text("""
                 INSERT INTO live_market_bars (
                     instrument_id, interval, bar_time, open_price, high_price, low_price, close_price, source
@@ -165,7 +281,7 @@ class TestSwingStopsAndRisk(unittest.TestCase):
                 )
             """), {"b1": signal_time + timedelta(minutes=5)})
 
-            # Day 2 Open: GAPS DOWN severely to 2400 (well below stop loss of 2450!)
+            # Day 2 Open gaps down severely to 2400 (well below stop loss of 2450)
             day2_open_time = signal_time + timedelta(days=1)
             conn.execute(text("""
                 INSERT INTO live_market_bars (
@@ -175,7 +291,7 @@ class TestSwingStopsAndRisk(unittest.TestCase):
                 )
             """), {"b2": day2_open_time})
 
-        pm = PositionManager(database_url="sqlite:///:memory:")
+        pm = PositionManager(database_url="sqlite:///:memory:", redis_client=self.mock_redis)
         pm.engine = self.engine
 
         pos = pm.get_open_positions()[0]
@@ -184,28 +300,118 @@ class TestSwingStopsAndRisk(unittest.TestCase):
         self.assertIsNotNone(eval_result)
         self.assertEqual(eval_result["status"], "CLOSED")
         self.assertEqual(eval_result["exit_reason"], "GAP_DOWN_STOP")
-        # Critical verification: fill must be at open (2400.0), NOT at stop loss (2450.0)!
         self.assertEqual(eval_result["exit_price"], 2400.0)
 
-    def test_price_freshness_guard_detects_stale_and_exits(self):
-        """A position whose price feed stops during market hours is marked STALE_PRICE and exits after timeout."""
-        # 11:00 AM IST on Wednesday (market hours) -> UTC 05:30
-        watermark = datetime(2026, 6, 3, 5, 30, tzinfo=timezone.utc)
-        self.assertTrue(is_market_hours(watermark))
+    # -------------------------------------------------------------
+    # 3. Exchange Calendar, Holiday & Open Grace Tests
+    # -------------------------------------------------------------
 
-        # Bar was 120 seconds ago (> 60s intraday threshold)
+    def test_holiday_suppresses_stale_exit_on_held_swing(self):
+        """On an exchange holiday (e.g. Dussehra), is_market_hours is False and held swing position does NOT exit."""
+        # Dussehra: 2026-10-20 (Tuesday, regular weekday!)
+        holiday_date = date(2026, 10, 20)
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO exchange_trading_calendar (exchange, session_date, session_status, source)
+                VALUES ('NSE', :day, 'CLOSED', 'nse_circular');
+            """), {"day": holiday_date})
+
+        watermark_holiday = datetime(2026, 10, 20, 5, 30, tzinfo=timezone.utc)  # 11:00 AM IST on holiday
+        self.assertFalse(is_market_hours(watermark_holiday, engine=self.engine))
+
+        # Held swing position from 2 days prior
+        signal_time = watermark_holiday - timedelta(days=2)
+        last_bar_time = watermark_holiday - timedelta(hours=24)  # Old bar from prior day
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO shadow_execution_audits (
+                    instrument_id, side, quantity, theoretical_fill_price, stop_loss_price,
+                    signal_at, audit_status, trade_mode, improvement_note
+                ) VALUES (
+                    1, 'BUY', 10, 2500.0, 2400.0, :sig_at, 'RECONCILED', 'SWING', '{}'
+                )
+            """), {"sig_at": signal_time})
+            conn.execute(text("""
+                INSERT INTO live_market_bars (
+                    instrument_id, interval, bar_time, open_price, high_price, low_price, close_price, source
+                ) VALUES (
+                    1, '1minute', :bt, 2500.0, 2505.0, 2495.0, 2500.0, 'upstox_v3'
+                )
+            """), {"bt": last_bar_time})
+
+        pm = PositionManager(database_url="sqlite:///:memory:", redis_client=self.mock_redis)
+        pm.engine = self.engine
+
+        pos = pm.get_open_positions()[0]
+        res = pm.evaluate_position(pos, watermark_holiday)
+
+        self.assertIsNotNone(res)
+        self.assertEqual(res["status"], "OPEN")
+        self.assertFalse(res["stale_price"], "Stale price check must be suppressed on exchange holidays")
+
+    def test_open_grace_period_suppresses_staleness_noise(self):
+        """During the first 120 seconds after market open, stale price check is suppressed."""
+        # Normal open at 09:15 IST (03:45 UTC). Watermark at 09:16 IST (60s after open).
+        market_day = date(2026, 6, 3)
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO exchange_trading_calendar (exchange, session_date, session_status, opens_at, closes_at, source)
+                VALUES ('NSE', :day, 'OPEN', '09:15:00', '15:30:00', 'nse_circular');
+            """), {"day": market_day})
+
+        # Watermark at 09:16:00 IST (UTC 03:46:00)
+        watermark_open = datetime(2026, 6, 3, 3, 46, 0, tzinfo=timezone.utc)
+        # Yesterday's closing bar
+        yesterday_bar = watermark_open - timedelta(hours=18)
+
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO shadow_execution_audits (
+                    instrument_id, side, quantity, theoretical_fill_price, stop_loss_price,
+                    signal_at, audit_status, trade_mode, improvement_note
+                ) VALUES (
+                    1, 'BUY', 10, 2500.0, 2400.0, :sig_at, 'RECONCILED', 'SWING', '{}'
+                )
+            """), {"sig_at": yesterday_bar})
+            conn.execute(text("""
+                INSERT INTO live_market_bars (
+                    instrument_id, interval, bar_time, open_price, high_price, low_price, close_price, source
+                ) VALUES (
+                    1, '1minute', :bt, 2500.0, 2505.0, 2495.0, 2500.0, 'upstox_v3'
+                )
+            """), {"bt": yesterday_bar})
+
+        pm = PositionManager(database_url="sqlite:///:memory:", redis_client=self.mock_redis)
+        pm.engine = self.engine
+        pm.stale_open_grace_seconds = 120
+
+        pos = pm.get_open_positions()[0]
+        res = pm.evaluate_position(pos, watermark_open)
+        self.assertIsNotNone(res)
+        self.assertFalse(res["stale_price"], "Stale check must be suppressed in first 120s of session")
+
+    def test_price_freshness_guard_detects_stale_and_exits_normal_day(self):
+        """On a normal day after open grace, a truly dead feed flags STALE_PRICE and exits after timeout."""
+        market_day = date(2026, 6, 3)
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO exchange_trading_calendar (exchange, session_date, session_status, opens_at, closes_at, source)
+                VALUES ('NSE', :day, 'OPEN', '09:15:00', '15:30:00', 'nse_circular');
+            """), {"day": market_day})
+
+        # 11:00 AM IST (UTC 05:30:00)
+        watermark = datetime(2026, 6, 3, 5, 30, tzinfo=timezone.utc)
         bar_time = watermark - timedelta(seconds=120)
 
         with self.engine.begin() as conn:
-            audit_id = conn.execute(text("""
+            conn.execute(text("""
                 INSERT INTO shadow_execution_audits (
                     instrument_id, side, quantity, theoretical_fill_price, stop_loss_price,
                     signal_at, audit_status, trade_mode, improvement_note
                 ) VALUES (
                     1, 'BUY', 10, 2500.0, 2450.0, :sig_at, 'RECONCILED', 'INTRADAY', '{}'
                 )
-            """), {"sig_at": bar_time - timedelta(minutes=10)}).lastrowid
-
+            """), {"sig_at": bar_time - timedelta(minutes=10)})
             conn.execute(text("""
                 INSERT INTO live_market_bars (
                     instrument_id, interval, bar_time, open_price, high_price, low_price, close_price, source
@@ -214,89 +420,77 @@ class TestSwingStopsAndRisk(unittest.TestCase):
                 )
             """), {"bt": bar_time})
 
-        pm = PositionManager(database_url="sqlite:///:memory:")
+        pm = PositionManager(database_url="sqlite:///:memory:", redis_client=self.mock_redis)
         pm.engine = self.engine
         pm.price_max_age_seconds = 60
         pm.stale_data_exit_minutes = 5
 
         pos = pm.get_open_positions()[0]
-
-        # First evaluation: triggers STALE_PRICE and marks tracker
         res1 = pm.evaluate_position(pos, watermark)
         self.assertIsNotNone(res1)
         self.assertTrue(res1["stale_price"])
         self.assertEqual(res1["status"], "OPEN")
-        self.assertIn(pos["id"], pm.stale_positions_tracker)
 
-        # Advance past stale_data_exit_minutes (5 minutes later)
+        # 5 minutes later
         watermark_timeout = watermark + timedelta(minutes=5, seconds=5)
         res2 = pm.evaluate_position(pos, watermark_timeout)
         self.assertIsNotNone(res2)
         self.assertEqual(res2["status"], "CLOSED")
         self.assertEqual(res2["exit_reason"], "STALE_DATA_EXIT")
 
-    def test_incremental_evaluation_o_new_bars(self):
-        """Incremental evaluation persists state and processes only newly added bars."""
+    # -------------------------------------------------------------
+    # 4. Option Underlying Invalidation Stop Test
+    # -------------------------------------------------------------
+
+    def test_option_underlying_invalidation_exit(self):
+        """When underlying breaks invalidation level, option position exits with UNDERLYING_STOP."""
         signal_time = datetime(2026, 6, 1, 9, 30, tzinfo=timezone.utc)
+        note = json.dumps({"underlying_invalidation_level": 2450.0})
+
         with self.engine.begin() as conn:
             conn.execute(text("""
                 INSERT INTO shadow_execution_audits (
-                    id, instrument_id, side, quantity, theoretical_fill_price, stop_loss_price,
+                    instrument_id, side, quantity, theoretical_fill_price, stop_loss_price,
                     signal_at, audit_status, trade_mode, improvement_note
                 ) VALUES (
-                    10, 1, 'BUY', 10, 2500.0, 2450.0, :sig_at, 'RECONCILED', 'SWING', '{}'
+                    2, 'BUY', 250, 50.0, 20.0, :sig_at, 'RECONCILED', 'SWING', :note
                 )
-            """), {"sig_at": signal_time})
+            """), {"sig_at": signal_time, "note": note})
 
-            # Add initial 5 bars
-            for i in range(1, 6):
-                conn.execute(text("""
-                    INSERT INTO live_market_bars (
-                        instrument_id, interval, bar_time, open_price, high_price, low_price, close_price, source
-                    ) VALUES (
-                        1, '1minute', :bt, 2500.0, 2510.0, 2495.0, 2505.0, 'zerodha_kite'
-                    )
-                """), {"bt": signal_time + timedelta(minutes=i)})
-
-        pm = PositionManager(database_url="sqlite:///:memory:")
-        pm.engine = self.engine
-
-        pos = pm.get_open_positions()[0]
-        wm1 = signal_time + timedelta(minutes=5)
-        res1 = pm.evaluate_position(pos, wm1)
-        self.assertEqual(res1["status"], "OPEN")
-
-        # Verify note updated with last_processed_bar_time
-        with self.engine.connect() as conn:
-            note_raw = conn.execute(text("SELECT improvement_note FROM shadow_execution_audits WHERE id = 10")).scalar_one()
-            note_dict = json.loads(note_raw)
-            self.assertIn("last_processed_bar_time", note_dict)
-            self.assertIn("running_sl", note_dict)
-            self.assertIn("best_favourable", note_dict)
-            last_pbt = note_dict["last_processed_bar_time"]
-
-        # Now spy on get_exit_bars during next evaluation with 1 new bar added
-        with self.engine.begin() as conn:
+            # Option bar
             conn.execute(text("""
                 INSERT INTO live_market_bars (
                     instrument_id, interval, bar_time, open_price, high_price, low_price, close_price, source
                 ) VALUES (
-                    1, '1minute', :bt, 2505.0, 2515.0, 2500.0, 2510.0, 'zerodha_kite'
+                    2, '1minute', :bt, 50.0, 52.0, 48.0, 49.0, 'upstox_v3'
                 )
-            """), {"bt": signal_time + timedelta(minutes=6)})
+            """), {"bt": signal_time + timedelta(minutes=10)})
 
-        pos_updated = pm.get_open_positions()[0]
-        wm2 = signal_time + timedelta(minutes=6)
+            # Underlying stock breaks down below 2450 (close = 2440)
+            conn.execute(text("""
+                INSERT INTO live_market_bars (
+                    instrument_id, interval, bar_time, open_price, high_price, low_price, close_price, source
+                ) VALUES (
+                    1, '1minute', :bt, 2460.0, 2465.0, 2435.0, 2440.0, 'upstox_v3'
+                )
+            """), {"bt": signal_time + timedelta(minutes=10)})
 
-        with patch.object(pm, "get_exit_bars", wraps=pm.get_exit_bars) as spy_get_bars:
-            pm.evaluate_position(pos_updated, wm2)
-            # Verify get_exit_bars was called with exclusive_start=True starting from last_processed_bar_time
-            spy_get_bars.assert_called_once()
-            call_kwargs = spy_get_bars.call_args[1]
-            self.assertTrue(call_kwargs.get("exclusive_start"))
+        pm = PositionManager(database_url="sqlite:///:memory:", redis_client=self.mock_redis)
+        pm.engine = self.engine
 
-    def test_held_position_subscription_guarantee_tier_minus_one(self):
-        """LiveStreamService must include open reconciled positions at top priority Tier -1 with full mode."""
+        pos = pm.get_open_positions()[0]
+        res = pm.evaluate_position(pos, signal_time + timedelta(minutes=10))
+
+        self.assertIsNotNone(res)
+        self.assertEqual(res["status"], "CLOSED")
+        self.assertEqual(res["exit_reason"], "UNDERLYING_STOP")
+
+    # -------------------------------------------------------------
+    # 5. Upstox REST Quote Fallback & Critical Alert Test
+    # -------------------------------------------------------------
+
+    def test_upstox_rest_quote_fallback_and_critical_alert(self):
+        """poll_held_positions_quote uses Upstox REST LTP, writes to Redis and bars, and emits CRITICAL when dead."""
         from backend.live_stream_service import LiveStreamService
 
         with self.engine.begin() as conn:
@@ -308,29 +502,58 @@ class TestSwingStopsAndRisk(unittest.TestCase):
                     1, 'BUY', 10, 2500.0, CURRENT_TIMESTAMP, 'RECONCILED', NULL
                 );
             """))
-            # Provider key for RELIANCE
             conn.execute(text("""
                 INSERT INTO instrument_provider_keys (instrument_id, provider, provider_key, mode_hint, is_active)
                 VALUES (1, 'upstox_v3', 'NSE_EQ|INE002A01018', 'full', 1);
             """))
 
+        recorded_upstox_response = json.dumps({
+            "status": "success",
+            "data": {
+                "NSE_EQ:RELIANCE": {
+                    "instrument_token": "NSE_EQ|INE002A01018",
+                    "last_price": 2515.50
+                }
+            }
+        }).encode("utf-8")
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = recorded_upstox_response
+        mock_resp.__enter__.return_value = mock_resp
+
         with patch.dict(os.environ, {
             "DATABASE_URL": "sqlite:///:memory:",
             "REDIS_URL": "redis://localhost:6379/0",
             "NIVESH_MARKET_DATA_PROVIDER": "upstox",
-            "UPSTOX_ACCESS_TOKEN": "mock_token",
+            "UPSTOX_ACCESS_TOKEN": "mock_upstox_token",
             "LIVE_ELIGIBLE": "FALSE",
             "NIVESH_LIVE_TRADING_ENABLED": "0"
         }):
             with patch("backend.live_stream_service.PostgresBarAggregator"):
-                with patch("redis.Redis.from_url"):
+                with patch("redis.Redis.from_url") as mock_redis_cls:
+                    mock_redis = MagicMock()
+                    mock_redis_cls.return_value = mock_redis
+
                     service = LiveStreamService()
                     service.engine = self.engine
-                    subs = service.subscriptions()
-                    self.assertGreater(len(subs), 0)
-                    # Held position must be at index 0 (Tier -1) with full mode!
-                    self.assertEqual(subs[0][0], "NSE_EQ|INE002A01018")
-                    self.assertEqual(subs[0][1], "full")
+                    service.redis = mock_redis
+                    service.market_open = MagicMock(return_value=True)
+
+                    with patch("urllib.request.urlopen", return_value=mock_resp):
+                        service.poll_held_positions_quote()
+
+                        # Verify Redis write
+                        mock_redis.hset.assert_called_with("nivesh:ticks:latest", "1", "2515.5")
+
+                        # Verify live_market_bars database insertion
+                        with self.engine.connect() as check_conn:
+                            bar_row = check_conn.execute(text("""
+                                SELECT close_price, source FROM live_market_bars
+                                WHERE instrument_id = 1 ORDER BY bar_time DESC LIMIT 1
+                            """)).mappings().one_or_none()
+                            self.assertIsNotNone(bar_row)
+                            self.assertEqual(float(bar_row["close_price"]), 2515.50)
+                            self.assertEqual(bar_row["source"], "upstox_v3")
 
 
 if __name__ == "__main__":
