@@ -52,6 +52,15 @@ IST = ZoneInfo("Asia/Kolkata")
 TRADE_BAR_SOURCES = ("zerodha_kite", "kite_gap_backfill", "upstox_v3", "upstox_rest_5m")
 
 
+ADVERSE_CUT_WINDOW_SECONDS: float = 90.0
+ADVERSE_CUT_THRESHOLD_R: Decimal = Decimal("0.40")
+STAGNATION_TIGHTEN_SECONDS: float = 300.0
+STAGNATION_TIGHTEN_R: Decimal = Decimal("0.35")
+STAGNATION_SCRATCH_SECONDS: float = 900.0
+STAGNATION_MIN_EXPANSION_R: Decimal = Decimal("0.25")
+FORCE_FLAT_TIME: str = "15:15"
+
+
 class PriceResult(tuple):
     """2-tuple (price, source) with an optional bar_time attribute for staleness checking."""
 
@@ -223,14 +232,14 @@ class PositionManager:
         self.trailing_trigger_r = Decimal(os.getenv("NIVESH_SHADOW_TRAILING_TRIGGER_R", "1.50"))
         self.trailing_giveback_r = Decimal(os.getenv("NIVESH_SHADOW_TRAILING_GIVEBACK_R", "0.40"))
         
-        self.adverse_cut_window_seconds = 90.0
-        self.adverse_cut_threshold_r = Decimal("0.40")
+        self.adverse_cut_window_seconds = ADVERSE_CUT_WINDOW_SECONDS
+        self.adverse_cut_threshold_r = ADVERSE_CUT_THRESHOLD_R
         
-        self.stagnation_tighten_seconds = 300.0  # 5 minutes
-        self.stagnation_tighten_r = Decimal("0.35")
-        self.stagnation_scratch_seconds = 900.0  # 15 minutes (intraday)
-        self.stagnation_min_expansion_r = Decimal("0.25")
-        self.force_flat_time = os.getenv("NIVESH_SHADOW_FORCE_FLAT_IST", "15:15")
+        self.stagnation_tighten_seconds = STAGNATION_TIGHTEN_SECONDS
+        self.stagnation_tighten_r = STAGNATION_TIGHTEN_R
+        self.stagnation_scratch_seconds = STAGNATION_SCRATCH_SECONDS
+        self.stagnation_min_expansion_r = STAGNATION_MIN_EXPANSION_R
+        self.force_flat_time = os.getenv("NIVESH_SHADOW_FORCE_FLAT_IST", FORCE_FLAT_TIME)
         self.price_max_age_seconds = int(os.getenv("NIVESH_PRICE_MAX_AGE_SECONDS", str(PRICE_MAX_AGE_SECONDS)))
         self.price_max_age_swing_seconds = int(os.getenv("NIVESH_PRICE_MAX_AGE_SWING_SECONDS", str(PRICE_MAX_AGE_SWING_SECONDS)))
         self.stale_data_exit_minutes = int(os.getenv("NIVESH_STALE_DATA_EXIT_MINUTES", str(STALE_DATA_EXIT_MINUTES)))
@@ -1781,28 +1790,30 @@ class PositionManager:
 def replay_trade_walk_forward(
     trade: Dict[str, Any],
     bars: List[Dict[str, Any]],
+    *,
     harvest_enabled: bool = False,
     harvest_trigger: float = 0.83,
     exit_threshold: float = 70.0,
     tighten_threshold: float = 40.0,
     lock_fraction: float = 0.65,
+    tick_size: float = 0.05,
     breakeven_trigger_r: float = 1.10,
     profit_lock_trigger_r: float = 1.60,
     profit_lock_guaranteed_r: float = 1.00,
     trailing_trigger_r: float = 1.50,
     trailing_giveback_r: float = 0.40,
-    tick_size: float = 0.05,
     bars_15m: Optional[List[Dict[str, Any]]] = None,
     vwap: Optional[float] = None,
     index_regime_against: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """Pure walk-forward replay executing real PositionManager exit rules across bar series.
+    """Walk a historical shadow trade forward across price bars with PositionManager exit logic.
 
-    Applies:
-    - Real PositionManager trailing stops, profit locks, breakeven stops, take profits, and stop losses.
-    - If harvest_enabled=True: 50% target progress breakeven, harvest trigger reversal evaluation (exit/tighten).
-    - If harvest_enabled=False: byte-for-byte baseline exit logic (no 50% breakeven, no harvest stops).
-    - Real fees and slippage (2 ticks).
+    Phase 2d Specifications:
+    - Exits evaluated on 1-minute bars (or 1s if present).
+    - Reversal score evaluated ONLY on CLOSED 5-minute bars built from 1m bars (excluding partial edge buckets).
+    - Models stagnation scratch (900s), adverse cut (90s / 0.40R), stagnation tighten (300s), and force-flat (15:15 IST).
+    - If no exit is triggered by the end of the walk, returns exit_reason = 'FELL_THROUGH_TO_RECORDED'.
+    - Protects running_sl is None safely against all type errors.
     """
     if not bars:
         entry_val = float(trade.get("theoretical_fill_price") or trade.get("entry") or 0.0)
@@ -1813,7 +1824,7 @@ def replay_trade_walk_forward(
         rel_r = (exit_val - entry_val) / r_dist if side_u == "BUY" else (entry_val - exit_val) / r_dist
         return {
             "exit_price": exit_val,
-            "exit_reason": trade.get("exit_reason") or "NO_BARS",
+            "exit_reason": "NO_BARS",
             "net_pnl": 0.0,
             "realized_r": round(rel_r, 4),
             "max_favorable": exit_val,
@@ -1833,14 +1844,15 @@ def replay_trade_walk_forward(
     fallback_risk = max(Decimal("0.50"), entry * Decimal("0.006"))
     if side == "BUY":
         r_points = (entry - initial_sl) if (initial_sl and entry > initial_sl) else fallback_risk
+        running_sl = initial_sl if initial_sl is not None else (entry - fallback_risk)
     else:
         r_points = (initial_sl - entry) if (initial_sl and initial_sl > entry) else fallback_risk
+        running_sl = initial_sl if initial_sl is not None else (entry + fallback_risk)
     r_points = max(Decimal("0.05"), r_points)
 
     target_dist = abs(take_profit - entry) if take_profit else (r_points * Decimal("1.5"))
     fee_buffer = ((fees * Decimal("2.5")) + (Decimal("2") * Decimal(str(tick_size)) * quantity)) / max(Decimal("1"), quantity)
 
-    running_sl = initial_sl
     running_sl_reason = "STOP_LOSS"
     pending_market_exit: Optional[str] = None
     best_favourable = entry
@@ -1848,8 +1860,46 @@ def replay_trade_walk_forward(
     exit_reason: Optional[str] = None
     harvest_stop: Optional[Decimal] = None
 
-    # Track 5m closed candles for reversal analysis
+    # Determine start timestamp for elapsed seconds
+    start_time: Optional[datetime] = None
+    sig_val = trade.get("signal_at")
+    if sig_val:
+        try:
+            start_time = datetime.fromisoformat(sig_val) if isinstance(sig_val, str) else sig_val
+            if start_time and getattr(start_time, "tzinfo", None) is None:
+                start_time = start_time.replace(tzinfo=IST)
+            elif start_time and getattr(start_time, "tzinfo", None) is not None:
+                start_time = start_time.astimezone(IST)
+        except Exception:
+            start_time = None
+    if start_time is None and bars and bars[0].get("bar_time"):
+        try:
+            b0_t = bars[0]["bar_time"]
+            start_time = datetime.fromisoformat(b0_t) if isinstance(b0_t, str) else b0_t
+            if start_time and getattr(start_time, "tzinfo", None) is None:
+                start_time = start_time.replace(tzinfo=IST)
+            elif start_time and getattr(start_time, "tzinfo", None) is not None:
+                start_time = start_time.astimezone(IST)
+        except Exception:
+            start_time = None
+
+    # Track 5m closed candles and bucket aggregation
     closed_5m_bars: List[Dict[str, Any]] = []
+    current_5m_bucket_bars: List[Dict[str, Any]] = []
+    current_bucket_min: Optional[int] = None
+    is_5m_input = False
+    if bars and any(b.get("interval") in ("5minute", "5m") for b in bars[:2]):
+        is_5m_input = True
+    elif len(bars) >= 2 and bars[0].get("bar_time") and bars[1].get("bar_time"):
+        try:
+            t0 = datetime.fromisoformat(bars[0]["bar_time"]) if isinstance(bars[0]["bar_time"], str) else bars[0]["bar_time"]
+            t1 = datetime.fromisoformat(bars[1]["bar_time"]) if isinstance(bars[1]["bar_time"], str) else bars[1]["bar_time"]
+            if abs((t1 - t0).total_seconds()) >= 240:
+                is_5m_input = True
+        except Exception:
+            pass
+
+    trade_mode = str(trade.get("trade_mode") or "INTRADAY").upper()
 
     for i, b in enumerate(bars):
         b_open = Decimal(str(b.get("open_price") if b.get("open_price") is not None else b.get("open", entry)))
@@ -1858,6 +1908,19 @@ def replay_trade_walk_forward(
         b_close = Decimal(str(b.get("close_price") if b.get("close_price") is not None else b.get("close", entry)))
         b_vol = float(b.get("volume") or 0)
         b_time = b.get("bar_time")
+
+        b_dt: Optional[datetime] = None
+        if b_time:
+            try:
+                b_dt = datetime.fromisoformat(b_time) if isinstance(b_time, str) else b_time
+                if b_dt and getattr(b_dt, "tzinfo", None) is None:
+                    b_dt = b_dt.replace(tzinfo=IST)
+                elif b_dt and getattr(b_dt, "tzinfo", None) is not None:
+                    b_dt = b_dt.astimezone(IST)
+            except Exception:
+                b_dt = None
+
+        elapsed_seconds = (b_dt - start_time).total_seconds() if (b_dt and start_time) else (i * 60.0)
 
         # -------------------------------------------------------------
         # STEP 1: IN-BAR CHECK OF PRIOR STOPS & TARGETS (BEFORE THIS BAR)
@@ -1869,11 +1932,11 @@ def replay_trade_walk_forward(
 
         # Check existing stop loss and take profit against current bar's range
         if side == "BUY":
-            if running_sl and b_open <= running_sl:
+            if running_sl is not None and b_open <= running_sl:
                 exit_price = b_open
                 exit_reason = "GAP_DOWN_STOP"
                 break
-            elif running_sl and b_low <= running_sl:
+            elif running_sl is not None and b_low <= running_sl:
                 exit_price = running_sl
                 exit_reason = running_sl_reason
                 break
@@ -1886,11 +1949,11 @@ def replay_trade_walk_forward(
                 exit_reason = "TAKE_PROFIT"
                 break
         else:  # SELL
-            if running_sl and b_open >= running_sl:
+            if running_sl is not None and b_open >= running_sl:
                 exit_price = b_open
                 exit_reason = "GAP_UP_STOP"
                 break
-            elif running_sl and b_high >= running_sl:
+            elif running_sl is not None and b_high >= running_sl:
                 exit_price = running_sl
                 exit_reason = running_sl_reason
                 break
@@ -1903,31 +1966,35 @@ def replay_trade_walk_forward(
                 exit_reason = "TAKE_PROFIT"
                 break
 
-        # Check modeled intraday force-flat exit at 15:15 IST
-        trade_mode = str(trade.get("trade_mode") or "INTRADAY").upper()
-        if trade_mode not in ("SWING", "POSITIONAL") and b_time:
-            try:
-                b_dt = datetime.fromisoformat(b_time) if isinstance(b_time, str) else b_time
-                ist_dt = b_dt.astimezone(IST) if getattr(b_dt, "tzinfo", None) else b_dt.replace(tzinfo=IST)
-                if ist_dt.hour > 15 or (ist_dt.hour == 15 and ist_dt.minute >= 15):
+        # Check modeled intraday exits (adverse cut, stagnation scratch, force-flat)
+        if trade_mode not in ("SWING", "POSITIONAL"):
+            current_r = ((b_close - entry) / r_points) if side == "BUY" else ((entry - b_close) / r_points)
+            favorable_r_now = ((best_favourable - entry) / r_points) if side == "BUY" else ((entry - best_favourable) / r_points)
+
+            # RULE 1: Immediate Adverse Cut (0 to 90 seconds)
+            if elapsed_seconds <= ADVERSE_CUT_WINDOW_SECONDS:
+                if current_r <= -ADVERSE_CUT_THRESHOLD_R and favorable_r_now <= Decimal("0.10"):
+                    exit_price = b_close
+                    exit_reason = "EARLY_ADVERSE_CUT"
+                    break
+
+            # RULE 2: 15-Minute STAGNATION_GUARD (900 seconds)
+            if elapsed_seconds >= STAGNATION_SCRATCH_SECONDS:
+                if favorable_r_now < STAGNATION_MIN_EXPANSION_R:
+                    exit_price = b_close
+                    exit_reason = "STAGNATION_GUARD"
+                    break
+
+            # Modeled Intraday Force-Flat Exit at 15:15 IST
+            if b_dt:
+                if b_dt.hour > 15 or (b_dt.hour == 15 and b_dt.minute >= 15):
                     exit_price = b_close
                     exit_reason = "FORCE_FLAT"
                     break
-            except Exception:
-                pass
 
         # -------------------------------------------------------------
         # STEP 2: BAR SURVIVED -> COMPUTE EXCURSION & RATCHETS AT CLOSE FOR NEXT BAR
         # -------------------------------------------------------------
-        closed_5m_bars.append({
-            "open": float(b_open),
-            "high": float(b_high),
-            "low": float(b_low),
-            "close": float(b_close),
-            "volume": b_vol,
-            "bar_time": b_time,
-        })
-
         if side == "BUY":
             best_favourable = max(best_favourable, b_high)
             favorable_r = (best_favourable - entry) / r_points
@@ -1947,8 +2014,56 @@ def replay_trade_walk_forward(
         if favorable_r >= Decimal(str(trailing_trigger_r)):
             trailing_stop_price = (best_favourable - Decimal(str(trailing_giveback_r)) * r_points) if side == "BUY" else (best_favourable + Decimal(str(trailing_giveback_r)) * r_points)
 
-        # Profit-Harvest Layer (Only active when harvest_enabled is True)
-        if harvest_enabled and take_profit is not None:
+        # 5-minute Stagnation Tighten (300 seconds)
+        if trade_mode not in ("SWING", "POSITIONAL") and elapsed_seconds >= STAGNATION_TIGHTEN_SECONDS and favorable_r < Decimal("0.20"):
+            stag_sl = (entry - STAGNATION_TIGHTEN_R * r_points) if side == "BUY" else (entry + STAGNATION_TIGHTEN_R * r_points)
+            if side == "BUY" and (running_sl is None or stag_sl > running_sl):
+                running_sl = stag_sl
+                running_sl_reason = "STAGNATION_TIGHTEN"
+            elif side == "SELL" and (running_sl is None or stag_sl < running_sl):
+                running_sl = stag_sl
+                running_sl_reason = "STAGNATION_TIGHTEN"
+
+        # Accumulate closed 5-minute candles
+        new_closed_5m = False
+        if is_5m_input:
+            closed_5m_bars.append({
+                "open": float(b_open),
+                "high": float(b_high),
+                "low": float(b_low),
+                "close": float(b_close),
+                "volume": b_vol,
+                "bar_time": b_time,
+            })
+            new_closed_5m = True
+        else:
+            b_min = b_dt.minute if b_dt else (i % 60)
+            bucket_idx = (b_min // 5) * 5
+            if current_bucket_min is not None and bucket_idx != current_bucket_min:
+                if len(current_5m_bucket_bars) >= 5:
+                    closed_5m_bars.append({
+                        "open": float(current_5m_bucket_bars[0]["open"]),
+                        "high": float(max(x["high"] for x in current_5m_bucket_bars)),
+                        "low": float(min(x["low"] for x in current_5m_bucket_bars)),
+                        "close": float(current_5m_bucket_bars[-1]["close"]),
+                        "volume": float(sum(x["volume"] for x in current_5m_bucket_bars)),
+                        "bar_time": current_5m_bucket_bars[-1]["bar_time"],
+                    })
+                    new_closed_5m = True
+                current_5m_bucket_bars = []
+
+            current_bucket_min = bucket_idx
+            current_5m_bucket_bars.append({
+                "open": b_open,
+                "high": b_high,
+                "low": b_low,
+                "close": b_close,
+                "volume": b_vol,
+                "bar_time": b_time,
+            })
+
+        # Profit-Harvest Layer: evaluated strictly at 5-minute candle close
+        if new_closed_5m and harvest_enabled and take_profit is not None:
             prog = float((b_close - entry) / target_dist) if side == "BUY" else float((entry - b_close) / target_dist)
             best_prog = float((best_favourable - entry) / target_dist) if side == "BUY" else float((entry - best_favourable) / target_dist)
 
@@ -1973,7 +2088,6 @@ def replay_trade_walk_forward(
                         tighten_threshold=tighten_threshold,
                     )
                     if rev_res["action"] == "EXIT":
-                        # Takes effect at NEXT bar's open
                         pending_market_exit = "PROFIT_HARVEST_REVERSAL_EXIT"
                     elif rev_res["action"] == "TIGHTEN":
                         harvest_stop = calculate_harvest_stop(
@@ -1988,7 +2102,7 @@ def replay_trade_walk_forward(
         candidates = [p for p in (running_sl, profit_lock_price, breakeven_price, trailing_stop_price, harvest_stop if harvest_enabled else None) if p is not None]
         if candidates:
             next_sl = max(candidates) if side == "BUY" else min(candidates)
-            if side == "BUY" and next_sl > running_sl:
+            if side == "BUY" and (running_sl is None or next_sl > running_sl):
                 running_sl = next_sl
                 if harvest_stop and running_sl == harvest_stop:
                     running_sl_reason = "PROFIT_HARVEST_STOP"
@@ -1996,7 +2110,7 @@ def replay_trade_walk_forward(
                     running_sl_reason = "TRAILING_STOP"
                 elif breakeven_price and running_sl >= breakeven_price:
                     running_sl_reason = "BREAKEVEN_STOP"
-            elif side == "SELL" and next_sl < running_sl:
+            elif side == "SELL" and (running_sl is None or next_sl < running_sl):
                 running_sl = next_sl
                 if harvest_stop and running_sl == harvest_stop:
                     running_sl_reason = "PROFIT_HARVEST_STOP"
@@ -2012,7 +2126,7 @@ def replay_trade_walk_forward(
             exit_reason = pending_market_exit
         else:
             exit_price = Decimal(str(trade.get("realised_exit_price") or last_b.get("close_price") or last_b.get("close") or entry))
-            exit_reason = str(trade.get("exit_reason") or "EOD_CLOSE")
+            exit_reason = "FELL_THROUGH_TO_RECORDED"
 
     # Apply fees and 2-tick slippage
     slippage_per_share = Decimal(str(tick_size)) * Decimal("2")
@@ -2028,3 +2142,4 @@ def replay_trade_walk_forward(
         "realized_r": round(realized_r, 4),
         "max_favorable": float(best_favourable),
     }
+

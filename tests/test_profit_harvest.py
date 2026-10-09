@@ -819,6 +819,144 @@ class TestProfitHarvestCounterfactualReplay(unittest.TestCase):
         self.assertEqual(res["split"]["train"]["trades_count"], 5)
         self.assertEqual(res["split"]["test"]["trades_count"], 5)
 
+    def test_recorded_stagnation_exit_not_faithful_when_replay_differs(self):
+        """A trade recorded as stagnation exit must not count as faithful when replay falls through."""
+        trade = {
+            "id": 1,
+            "symbol": "INFY",
+            "side": "BUY",
+            "entry": 100.0,
+            "initial_sl": 90.0,
+            "target_price": 115.0,
+            "realised_exit_price": 100.2,
+            "exit_reason": "STAGNATION_GUARD",
+            "trade_mode": "SWING",  # SWING skips stagnation guard in replay walk
+            "signal_at": "2026-07-15 09:30:00",
+            "exit_at": "2026-07-15 09:35:00",
+            "bars": [
+                {"bar_time": "2026-07-15 09:30:00", "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.2, "volume": 1000},
+                {"bar_time": "2026-07-15 09:35:00", "open": 100.2, "high": 101.5, "low": 99.8, "close": 100.4, "volume": 1000},
+            ]
+        }
+        res = run_profit_harvest_ab_replay(trades=[trade])
+        self.assertEqual(res["total_trades"], 1)
+        self.assertEqual(res["fidelity"]["fell_through_count"], 1)
+        self.assertEqual(res["fidelity"]["fidelity_all_pct"], 0.0)
+        self.assertEqual(res["recommendation"], "REPLAY_NOT_FAITHFUL")
+
+    def test_fidelity_drops_when_replay_lacks_model_for_unmodelled_exit(self):
+        """Fidelity must drop when recorded exit is an unmodelled exit like RMS_AUTO_SQUAREOFF."""
+        trade = {
+            "id": 1,
+            "symbol": "TCS",
+            "side": "BUY",
+            "entry": 100.0,
+            "initial_sl": 90.0,
+            "target_price": 115.0,
+            "realised_exit_price": 99.5,
+            "exit_reason": "RMS_AUTO_SQUAREOFF",
+            "trade_mode": "INTRADAY",
+            "signal_at": "2026-07-15 09:30:00",
+            "exit_at": "2026-07-15 09:40:00",
+            "bars": [
+                {"bar_time": "2026-07-15 09:30:00", "open": 100.0, "high": 102.0, "low": 99.0, "close": 101.0, "volume": 1000},
+                {"bar_time": "2026-07-15 09:35:00", "open": 101.0, "high": 102.5, "low": 99.2, "close": 99.5, "volume": 1000},
+            ]
+        }
+        res = run_profit_harvest_ab_replay(trades=[trade])
+        self.assertEqual(res["fidelity"]["fell_through_count"], 1)
+        self.assertEqual(res["fidelity"]["fidelity_all_pct"], 0.0)
+        self.assertEqual(res["recommendation"], "REPLAY_NOT_FAITHFUL")
+
+    def test_100_plus_triggered_trades_helps_both_halves_returns_enable(self):
+        """With 100+ triggered trades in test half where harvest helps in both halves, returns ENABLE."""
+        trades = []
+        for d in range(1, 21):
+            day_str = f"2026-07-{d:02d}"
+            for k in range(10):
+                t_id = (d - 1) * 10 + k + 1
+                trades.append({
+                    "id": t_id,
+                    "symbol": "NIFTY",
+                    "side": "BUY",
+                    "entry": 100.0,
+                    "initial_sl": 90.0,
+                    "target_price": 115.0,
+                    "realised_exit_price": 100.1,  # Baseline Arm A hit breakeven stop
+                    "exit_reason": "BREAKEVEN_STOP",
+                    "trade_mode": "INTRADAY",
+                    "signal_at": f"{day_str} 09:30:00",
+                    "exit_at": f"{day_str} 10:00:00",
+                    "bars": [
+                        {"bar_time": f"{day_str} 09:30:00", "interval": "5minute", "open": 100.0, "high": 105.0, "low": 100.0, "close": 104.5, "volume": 1000},
+                        {"bar_time": f"{day_str} 09:35:00", "interval": "5minute", "open": 104.5, "high": 110.0, "low": 104.0, "close": 109.5, "volume": 1000},
+                        {"bar_time": f"{day_str} 09:40:00", "interval": "5minute", "open": 109.5, "high": 113.6, "low": 109.0, "close": 113.5, "volume": 1000},
+                        {"bar_time": f"{day_str} 09:45:00", "interval": "5minute", "open": 111.5, "high": 114.0, "low": 110.5, "close": 111.0, "volume": 3500},
+                        {"bar_time": f"{day_str} 09:50:00", "interval": "5minute", "open": 111.0, "high": 111.2, "low": 107.5, "close": 108.0, "volume": 3000},
+                        {"bar_time": f"{day_str} 09:55:00", "interval": "5minute", "open": 108.0, "high": 108.2, "low": 98.0, "close": 99.0, "volume": 1000},
+                        {"bar_time": f"{day_str} 10:00:00", "interval": "5minute", "open": 99.0, "high": 99.5, "low": 88.0, "close": 89.0, "volume": 1000},
+                    ]
+                })
+
+        res = run_profit_harvest_ab_replay(trades=trades, exit_threshold=60.0)
+        self.assertEqual(res["total_trades"], 200)
+        self.assertGreaterEqual(res["split"]["test"]["triggered_count"], 100)
+        self.assertGreater(res["split"]["test"]["ci_95"][0], 0.0)
+        self.assertEqual(res["recommendation"], "ENABLE")
+
+    def test_100_plus_triggered_trades_helps_only_train_returns_neutral(self):
+        """With 100+ triggered trades in test half where harvest helps only in train half, returns NEUTRAL."""
+        trades = []
+        for d in range(1, 21):
+            day_str = f"2026-07-{d:02d}"
+            is_train = (d <= 10)
+            for k in range(10):
+                t_id = (d - 1) * 10 + k + 1
+                if is_train:
+                    bars = [
+                        {"bar_time": f"{day_str} 09:30:00", "interval": "5minute", "open": 100.0, "high": 105.0, "low": 100.0, "close": 104.5, "volume": 1000},
+                        {"bar_time": f"{day_str} 09:35:00", "interval": "5minute", "open": 104.5, "high": 110.0, "low": 104.0, "close": 109.5, "volume": 1000},
+                        {"bar_time": f"{day_str} 09:40:00", "interval": "5minute", "open": 109.5, "high": 113.6, "low": 109.0, "close": 113.5, "volume": 1000},
+                        {"bar_time": f"{day_str} 09:45:00", "interval": "5minute", "open": 111.5, "high": 114.0, "low": 110.5, "close": 111.0, "volume": 3500},
+                        {"bar_time": f"{day_str} 09:50:00", "interval": "5minute", "open": 111.0, "high": 111.2, "low": 107.5, "close": 108.0, "volume": 3000},
+                        {"bar_time": f"{day_str} 09:55:00", "interval": "5minute", "open": 108.0, "high": 108.2, "low": 98.0, "close": 99.0, "volume": 1000},
+                        {"bar_time": f"{day_str} 10:00:00", "interval": "5minute", "open": 99.0, "high": 99.5, "low": 88.0, "close": 89.0, "volume": 1000},
+                    ]
+                    rec_exit = 100.1
+                    rec_reason = "BREAKEVEN_STOP"
+                    ex_at = f"{day_str} 10:00:00"
+                else:
+                    bars = [
+                        {"bar_time": f"{day_str} 09:30:00", "interval": "5minute", "open": 100.0, "high": 108.0, "low": 100.0, "close": 107.0, "volume": 1000},
+                        {"bar_time": f"{day_str} 09:35:00", "interval": "5minute", "open": 107.0, "high": 112.8, "low": 106.5, "close": 112.5, "volume": 1000},
+                        {"bar_time": f"{day_str} 09:40:00", "interval": "5minute", "open": 112.5, "high": 115.5, "low": 112.0, "close": 115.0, "volume": 1000},
+                    ]
+                    rec_exit = 115.0
+                    rec_reason = "TAKE_PROFIT"
+                    ex_at = f"{day_str} 09:40:00"
+
+                trades.append({
+                    "id": t_id,
+                    "symbol": "NIFTY",
+                    "side": "BUY",
+                    "entry": 100.0,
+                    "initial_sl": 90.0,
+                    "target_price": 115.0,
+                    "realised_exit_price": rec_exit,
+                    "exit_reason": rec_reason,
+                    "trade_mode": "INTRADAY",
+                    "signal_at": f"{day_str} 09:30:00",
+                    "exit_at": ex_at,
+                    "bars": bars,
+                })
+
+        res = run_profit_harvest_ab_replay(trades=trades, exit_threshold=60.0)
+        self.assertEqual(res["total_trades"], 200)
+        self.assertGreaterEqual(res["split"]["test"]["triggered_count"], 100)
+        self.assertGreater(res["split"]["train"]["delta_mean_r"], 0.10)
+        self.assertAlmostEqual(res["split"]["test"]["delta_mean_r"], 0.0, places=2)
+        self.assertEqual(res["recommendation"], "NEUTRAL")
+
 
 if __name__ == "__main__":
     unittest.main()

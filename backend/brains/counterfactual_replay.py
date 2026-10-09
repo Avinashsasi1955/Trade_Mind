@@ -384,8 +384,19 @@ def get_latest_counterfactual_summary(engine, trade_date: Optional[date] = None,
     }
 
 
+from backend.position_manager import (
+    ADVERSE_CUT_WINDOW_SECONDS,
+    ADVERSE_CUT_THRESHOLD_R,
+    STAGNATION_SCRATCH_SECONDS,
+    STAGNATION_MIN_EXPANSION_R,
+    STAGNATION_TIGHTEN_SECONDS,
+    STAGNATION_TIGHTEN_R,
+    FORCE_FLAT_TIME,
+)
+
+
 def resample_1m_to_5m(bars_1m: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Resample 1-minute bars into 5-minute OHLCV candles."""
+    """Resample 1-minute bars into 5-minute OHLCV candles, excluding partial edge buckets."""
     if not bars_1m:
         return []
 
@@ -411,8 +422,12 @@ def resample_1m_to_5m(bars_1m: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     sorted_keys = sorted(buckets.keys())
     resampled_5m = []
 
-    for k in sorted_keys:
+    for i, k in enumerate(sorted_keys):
         group = buckets[k]
+        # Exclude partial edge buckets (less than 5 1-minute bars at start or end)
+        if len(group) < 5 and (i == 0 or i == len(sorted_keys) - 1):
+            continue
+
         o = float(group[0].get("open_price") if group[0].get("open_price") is not None else group[0].get("open", 0.0))
         h = max(float(x.get("high_price") if x.get("high_price") is not None else x.get("high", 0.0)) for x in group)
         l = min(float(x.get("low_price") if x.get("low_price") is not None else x.get("low", 0.0)) for x in group)
@@ -498,21 +513,41 @@ def validate_bar_continuity(
     return True, None
 
 
-def _bootstrap_ci(deltas: List[float], n_bootstraps: int = 1000, random_seed: int = 42) -> tuple[float, float]:
-    import random
-    if not deltas:
+def _block_bootstrap_by_day(
+    records: List[Dict[str, Any]],
+    n_bootstraps: int = 1000,
+    random_seed: int = 42,
+) -> tuple[float, float]:
+    """Resample trades by trading day (block bootstrap) to account for cross-sectional clustering."""
+    if not records:
         return (0.0, 0.0)
-    N = len(deltas)
-    if N == 1:
-        return (round(deltas[0], 4), round(deltas[0], 4))
+    import random
+    from collections import defaultdict
+    day_groups: Dict[date, List[float]] = defaultdict(list)
+    for r in records:
+        day_groups[r["trade_date"]].append(r["delta_r"])
+    days = list(day_groups.keys())
+    if not days:
+        return (0.0, 0.0)
+    if len(days) == 1:
+        vals = day_groups[days[0]]
+        m_val = sum(vals) / len(vals)
+        return (round(m_val, 4), round(m_val, 4))
+
     rng = random.Random(random_seed)
-    bootstrap_means: List[float] = []
+    means: List[float] = []
+    n_days = len(days)
     for _ in range(n_bootstraps):
-        sample = [deltas[rng.randint(0, N - 1)] for _ in range(N)]
-        bootstrap_means.append(sum(sample) / N)
-    bootstrap_means.sort()
-    ci_lower = bootstrap_means[int(0.025 * len(bootstrap_means))]
-    ci_upper = bootstrap_means[int(0.975 * len(bootstrap_means))]
+        sampled_days = [days[rng.randint(0, n_days - 1)] for _ in range(n_days)]
+        sampled_deltas = [d for d_day in sampled_days for d in day_groups[d_day]]
+        if sampled_deltas:
+            means.append(sum(sampled_deltas) / len(sampled_deltas))
+
+    if not means:
+        return (0.0, 0.0)
+    means.sort()
+    ci_lower = means[int(0.025 * len(means))]
+    ci_upper = means[int(0.975 * len(means))]
     return (round(ci_lower, 4), round(ci_upper, 4))
 
 
@@ -530,17 +565,14 @@ def run_profit_harvest_ab_replay(
 ) -> Dict[str, Any]:
     """A/B Counterfactual Replay comparing Baseline execution (Arm A) vs Profit-Harvest (Arm B).
 
-    Phase 2c Specifications:
-    1. Single timeframe: 5-minute bars from 'upstox_v3' source only (derived from 1m if 5m missing, never mixed).
-       Bars must cover signal to exit with no gaps > 10m. Trades failing coverage are dropped with reasons tracked.
-       Fabricated three-bar fallback is completely removed.
-    2. Strict in-bar execution order: Existing stops and targets are checked first against bar open/range before
-       reversal evaluation. Reversal score is computed at bar close and takes effect from next bar's open.
-    3. Baseline Arm Fidelity: Arm A replayed exit price compared with realised_exit_price within 0.1R.
-       If fidelity is below 80%, recommendation is 'REPLAY_NOT_FAITHFUL' and no ENABLE.
-    4. Out-of-sample Gate: Requires >= 100 harvest-triggered trades and chronological 50/50 date train/test split.
-       ENABLE is awarded ONLY if the test half 95% bootstrap CI lower bound strictly excludes zero (> 0.0).
-       Per-trade-mode metrics (intraday vs swing) are reported separately.
+    Phase 2d Specifications:
+    1. Walk exits on 1-minute upstox_v3 bars (or 1-second where present).
+    2. Reversal score evaluated ONLY from CLOSED 5-minute bars built from 1m bars, excluding partial edge buckets.
+    3. Non-circular fidelity check: When walk reaches no exit and falls through to recorded exit, returns
+       exit_reason = 'FELL_THROUGH_TO_RECORDED' and counts as NOT matched. Reports fell_through_count.
+       Computes fidelity on all trades, and separately on modelled subset.
+    4. Out-of-sample Gate: Requires >= 100 harvest-triggered trades in the TEST half. Computes test CI on triggered
+       trades only, resampled by trading day (block bootstrap). ENABLE only if test CI excludes zero.
     """
     from backend.position_manager import replay_trade_walk_forward
 
@@ -584,7 +616,6 @@ def run_profit_harvest_ab_replay(
                 """)
                 rows = conn.execute(query, params).mappings().all()
 
-                # Check whether source column exists in live_market_bars
                 has_source_col = True
                 try:
                     conn.execute(text("SELECT source FROM live_market_bars LIMIT 1"))
@@ -603,13 +634,13 @@ def run_profit_harvest_ab_replay(
 
                     trade_bars: List[Dict[str, Any]] = []
                     if r.get("instrument_id") and r.get("signal_at") and r.get("exit_at"):
-                        # 1. Query 5m bars first from upstox_v3
-                        b_5m_rows = conn.execute(
+                        # Walk exits on 1-minute upstox_v3 bars
+                        b_1m_rows = conn.execute(
                             text(f"""
-                                SELECT bar_time, open_price, high_price, low_price, close_price, volume
+                                SELECT bar_time, open_price, high_price, low_price, close_price, volume, interval
                                 FROM live_market_bars
                                 WHERE instrument_id = :inst_id
-                                  AND interval IN ('5minute', '5m')
+                                  AND interval IN ('1minute', '1m')
                                   {source_filter}
                                   AND bar_time >= :sig_at AND bar_time <= :ex_at
                                 ORDER BY bar_time ASC
@@ -617,24 +648,24 @@ def run_profit_harvest_ab_replay(
                             {"inst_id": r["instrument_id"], "sig_at": r["signal_at"], "ex_at": r["exit_at"]}
                         ).mappings().all()
 
-                        if b_5m_rows:
-                            trade_bars = [dict(b) for b in b_5m_rows]
+                        if b_1m_rows:
+                            trade_bars = [dict(b) for b in b_1m_rows]
                         else:
-                            # 2. Derive 5m bars from 1m upstox_v3 bars if 5m missing (never both together)
-                            b_1m_rows = conn.execute(
+                            # Fallback to 5m if 1m not available
+                            b_5m_rows = conn.execute(
                                 text(f"""
-                                    SELECT bar_time, open_price, high_price, low_price, close_price, volume
+                                    SELECT bar_time, open_price, high_price, low_price, close_price, volume, interval
                                     FROM live_market_bars
                                     WHERE instrument_id = :inst_id
-                                      AND interval IN ('1minute', '1m')
+                                      AND interval IN ('5minute', '5m')
                                       {source_filter}
                                       AND bar_time >= :sig_at AND bar_time <= :ex_at
                                     ORDER BY bar_time ASC
                                 """),
                                 {"inst_id": r["instrument_id"], "sig_at": r["signal_at"], "ex_at": r["exit_at"]}
                             ).mappings().all()
-                            if b_1m_rows:
-                                trade_bars = resample_1m_to_5m([dict(b) for b in b_1m_rows])
+                            if b_5m_rows:
+                                trade_bars = [dict(b) for b in b_5m_rows]
 
                     trade_samples.append({
                         "id": r["id"],
@@ -674,20 +705,20 @@ def run_profit_harvest_ab_replay(
             exclusion_reasons["NO_BARS"] = exclusion_reasons.get("NO_BARS", 0) + 1
             continue
 
-        # Single-timeframe enforcement: If mixed, prioritize 5m or resample 1m
         has_source = any("source" in b for b in raw_bars)
         if has_source:
             candidate_bars = [b for b in raw_bars if b.get("source") in ("upstox_v3", None)]
         else:
             candidate_bars = raw_bars
 
-        bars_5m = [b for b in candidate_bars if b.get("interval") in ("5minute", "5m")]
+        # Walk on 1-minute bars if present; else 5m (never mixed)
         bars_1m = [b for b in candidate_bars if b.get("interval") in ("1minute", "1m")]
+        bars_5m = [b for b in candidate_bars if b.get("interval") in ("5minute", "5m")]
 
-        if bars_5m:
+        if bars_1m:
+            chosen_bars = bars_1m
+        elif bars_5m:
             chosen_bars = bars_5m
-        elif bars_1m:
-            chosen_bars = resample_1m_to_5m(bars_1m)
         else:
             chosen_bars = candidate_bars
 
@@ -729,29 +760,24 @@ def run_profit_harvest_ab_replay(
             },
             "fidelity": {
                 "trades_compared": 0,
+                "fell_through_count": 0,
                 "within_01r_count": 0,
+                "fidelity_all_pct": 0.0,
+                "fidelity_modelled_pct": 0.0,
                 "fidelity_pct": 0.0,
                 "reason_match_pct": 0.0,
+                "unmodelled_trades_count": 0,
                 "modelled_exits": [
-                    "STOP_LOSS",
-                    "GAP_DOWN_STOP",
-                    "GAP_UP_STOP",
-                    "BREAKEVEN_STOP",
-                    "TRAILING_STOP",
-                    "TAKE_PROFIT",
-                    "FORCE_FLAT",
+                    "STOP_LOSS", "GAP_DOWN_STOP", "GAP_UP_STOP", "BREAKEVEN_STOP",
+                    "TRAILING_STOP", "TAKE_PROFIT", "FORCE_FLAT", "EARLY_ADVERSE_CUT", "STAGNATION_GUARD"
                 ],
                 "unmodelled_exits": [
-                    "STALE_DATA_EXIT",
-                    "MANUAL_CLOSE",
-                    "RMS_AUTO_SQUAREOFF",
-                    "EARLY_ADVERSE_CUT",
-                    "STAGNATION_GUARD",
+                    "STALE_DATA_EXIT", "MANUAL_CLOSE", "RMS_AUTO_SQUAREOFF"
                 ],
             },
             "split": {
-                "train": {"trades_count": 0, "delta_mean_r": 0.0, "ci_95": (0.0, 0.0)},
-                "test": {"trades_count": 0, "delta_mean_r": 0.0, "ci_95": (0.0, 0.0)},
+                "train": {"trades_count": 0, "triggered_count": 0, "delta_mean_r": 0.0, "ci_95": (0.0, 0.0)},
+                "test": {"trades_count": 0, "triggered_count": 0, "delta_mean_r": 0.0, "ci_95": (0.0, 0.0)},
             },
             "by_mode": {
                 "intraday": {"total_trades": 0, "trades_reaching_harvest": 0, "baseline_mean_r": 0.0, "harvest_mean_r": 0.0, "delta_mean_r": 0.0, "ci_95": (0.0, 0.0)},
@@ -760,7 +786,12 @@ def run_profit_harvest_ab_replay(
             "sample_evaluations": [],
         }
 
-    # Evaluate Arm A and Arm B
+    MODELLED_CORE_EXITS = {
+        "STOP_LOSS", "GAP_DOWN_STOP", "GAP_UP_STOP", "BREAKEVEN_STOP",
+        "TRAILING_STOP", "TAKE_PROFIT", "FORCE_FLAT", "EARLY_ADVERSE_CUT", "STAGNATION_GUARD"
+    }
+    UNMODELLED_EXITS = {"STALE_DATA_EXIT", "MANUAL_CLOSE", "RMS_AUTO_SQUAREOFF"}
+
     baseline_rs: List[float] = []
     harvest_rs: List[float] = []
     deltas: List[float] = []
@@ -768,8 +799,7 @@ def run_profit_harvest_ab_replay(
     improved_count = 0
     hurt_count = 0
     unchanged_count = 0
-    within_01r_count = 0
-    reason_match_count = 0
+    fell_through_count = 0
     eval_records: List[Dict[str, Any]] = []
 
     for t in valid_trades:
@@ -778,7 +808,7 @@ def run_profit_harvest_ab_replay(
         side = str(t.get("side") or "BUY").upper()
         target = float(t.get("take_profit_price") or t.get("target_price") or 0.0)
         rec_exit = float(t.get("realised_exit_price") or t.get("exit_price") or entry)
-        rec_reason = t.get("exit_reason")
+        rec_reason = str(t.get("exit_reason") or "")
 
         r_points = abs(entry - sl)
         if r_points <= 1e-4:
@@ -799,10 +829,11 @@ def run_profit_harvest_ab_replay(
             fav_dist = entry - max_favorable
 
         max_prog = (fav_dist / target_dist) if target_dist > 0 else 0.0
-        if max_prog >= harvest_trigger:
+        is_triggered = (max_prog >= harvest_trigger)
+        if is_triggered:
             harvest_triggered_count += 1
 
-        # Walk bars forward with strict in-bar ordering
+        # Walk bars forward
         res_a = replay_trade_walk_forward(
             trade=t,
             bars=bars,
@@ -818,12 +849,17 @@ def run_profit_harvest_ab_replay(
             lock_fraction=lock_fraction,
         )
 
-        # Fidelity check against actual execution
-        diff_r = abs(res_a["exit_price"] - rec_exit) / r_points
-        if diff_r <= 0.10:
-            within_01r_count += 1
-        if res_a["exit_reason"] == rec_reason:
-            reason_match_count += 1
+        # Non-circular fidelity check
+        fell_through = (res_a["exit_reason"] == "FELL_THROUGH_TO_RECORDED")
+        if fell_through:
+            fell_through_count += 1
+            diff_r_match = False
+            reason_match = False
+            diff_r = 999.0
+        else:
+            diff_r = abs(res_a["exit_price"] - rec_exit) / r_points
+            diff_r_match = (diff_r <= 0.10)
+            reason_match = (res_a["exit_reason"] == rec_reason)
 
         baseline_r = res_a["realized_r"]
         harvest_r = res_b["realized_r"]
@@ -869,25 +905,28 @@ def run_profit_harvest_ab_replay(
             "progress": round(max_prog, 3),
             "max_favorable": round(max_favorable, 2),
             "diff_r_fidelity": round(diff_r, 4),
+            "diff_r_match": diff_r_match,
+            "reason_match": reason_match,
+            "fell_through": fell_through,
+            "is_core": (rec_reason in MODELLED_CORE_EXITS),
+            "is_unmodelled": (rec_reason in UNMODELLED_EXITS),
+            "is_triggered": is_triggered,
             "trade_mode": str(t.get("trade_mode") or "INTRADAY").upper(),
             "trade_date": t_date,
         })
 
     N = len(valid_trades)
-    fidelity_pct = (within_01r_count / N * 100.0) if N > 0 else 0.0
-    reason_match_pct = (reason_match_count / N * 100.0) if N > 0 else 0.0
+    within_01r_count = sum(1 for r in eval_records if r["diff_r_match"])
+    fidelity_all_pct = (within_01r_count / N * 100.0) if N > 0 else 0.0
+    reason_match_pct = (sum(1 for r in eval_records if r["reason_match"]) / N * 100.0) if N > 0 else 0.0
 
-    # Overall bootstrap CI
-    overall_ci = _bootstrap_ci(deltas, n_bootstraps, random_seed)
-    base_mean_r = sum(baseline_rs) / N
-    harv_mean_r = sum(harvest_rs) / N
-    delta_mean_r = sum(deltas) / N
-    base_wins = sum(1 for r in baseline_rs if r > 0.0)
-    harv_wins = sum(1 for r in harvest_rs if r > 0.0)
-    base_win_rate = (base_wins / N * 100.0) if N > 0 else 0.0
-    harv_win_rate = (harv_wins / N * 100.0) if N > 0 else 0.0
+    core_trades = [r for r in eval_records if r["is_core"]]
+    core_matched = sum(1 for r in core_trades if r["diff_r_match"])
+    fidelity_core_pct = (core_matched / len(core_trades) * 100.0) if core_trades else 100.0
 
-    # Train / Test split by date (chronological 50/50)
+    unmodelled_count = sum(1 for r in eval_records if r["is_unmodelled"])
+
+    # Chronological date train/test split (50/50)
     unique_dates = sorted(list({rec["trade_date"] for rec in eval_records}))
     if len(unique_dates) >= 2:
         mid_date_idx = len(unique_dates) // 2
@@ -899,37 +938,52 @@ def run_profit_harvest_ab_replay(
         train_records = eval_records[:mid_idx]
         test_records = eval_records[mid_idx:]
 
-    train_deltas = [r["delta_r"] for r in train_records]
-    test_deltas = [r["delta_r"] for r in test_records]
+    test_triggered = [r for r in test_records if r["is_triggered"]]
+    train_triggered = [r for r in train_records if r["is_triggered"]]
+    test_triggered_count = len(test_triggered)
+    train_triggered_count = len(train_triggered)
 
+    # Compute test CI on triggered trades only, block bootstrapped by trading day
+    test_ci_95 = _block_bootstrap_by_day(test_triggered, n_bootstraps, random_seed)
+    train_ci_95 = _block_bootstrap_by_day(train_triggered, n_bootstraps, random_seed)
+    overall_ci = _block_bootstrap_by_day([r for r in eval_records if r["is_triggered"]], n_bootstraps, random_seed)
+
+    base_mean_r = sum(baseline_rs) / N
+    harv_mean_r = sum(harvest_rs) / N
+    delta_mean_r = sum(deltas) / N
+    base_win_rate = (sum(1 for r in baseline_rs if r > 0.0) / N * 100.0) if N > 0 else 0.0
+    harv_win_rate = (sum(1 for r in harvest_rs if r > 0.0) / N * 100.0) if N > 0 else 0.0
+
+    train_deltas = [r["delta_r"] for r in train_triggered]
+    test_deltas = [r["delta_r"] for r in test_triggered]
     train_delta_mean_r = (sum(train_deltas) / len(train_deltas)) if train_deltas else 0.0
     test_delta_mean_r = (sum(test_deltas) / len(test_deltas)) if test_deltas else 0.0
-
-    train_ci_95 = _bootstrap_ci(train_deltas, n_bootstraps, random_seed)
-    test_ci_95 = _bootstrap_ci(test_deltas, n_bootstraps, random_seed)
 
     # Per-trade-mode breakdown
     mode_breakdown: Dict[str, Any] = {}
     for mode_key in ("INTRADAY", "SWING"):
         m_recs = [r for r in eval_records if r["trade_mode"] == mode_key]
-        m_deltas = [r["delta_r"] for r in m_recs]
+        m_trig = [r for r in m_recs if r["is_triggered"]]
+        m_deltas = [r["delta_r"] for r in m_trig]
         m_base = [r["baseline_r"] for r in m_recs]
         m_harv = [r["harvest_r"] for r in m_recs]
-        m_trig = sum(1 for r in m_recs if r["progress"] >= harvest_trigger)
-        m_ci = _bootstrap_ci(m_deltas, n_bootstraps, random_seed) if m_deltas else (0.0, 0.0)
+        m_ci = _block_bootstrap_by_day(m_trig, n_bootstraps, random_seed) if m_trig else (0.0, 0.0)
         mode_breakdown[mode_key.lower()] = {
             "total_trades": len(m_recs),
-            "trades_reaching_harvest": m_trig,
+            "trades_reaching_harvest": len(m_trig),
             "baseline_mean_r": round(sum(m_base) / len(m_base), 4) if m_base else 0.0,
             "harvest_mean_r": round(sum(m_harv) / len(m_harv), 4) if m_harv else 0.0,
             "delta_mean_r": round(sum(m_deltas) / len(m_deltas), 4) if m_deltas else 0.0,
             "ci_95": (round(m_ci[0], 4), round(m_ci[1], 4)),
         }
 
-    # Recommendation determination
-    if fidelity_pct < 80.0:
+    # Recommendation determination (Phase 2d):
+    # 1. Fidelity gate: >= 80% on both overall and modelled subset
+    # 2. Triggered gate: >= 100 triggered trades in the TEST half
+    # 3. Test CI: strictly excludes zero (> 0.0) for ENABLE
+    if fidelity_all_pct < 80.0 or fidelity_core_pct < 80.0:
         recommendation = "REPLAY_NOT_FAITHFUL"
-    elif harvest_triggered_count < 100:
+    elif test_triggered_count < 100:
         recommendation = "INSUFFICIENT_TRIGGERED_TRADES"
     elif test_ci_95[0] > 0.0:
         recommendation = "ENABLE"
@@ -959,34 +1013,27 @@ def run_profit_harvest_ab_replay(
         },
         "fidelity": {
             "trades_compared": N,
+            "fell_through_count": fell_through_count,
             "within_01r_count": within_01r_count,
-            "fidelity_pct": round(fidelity_pct, 2),
+            "fidelity_all_pct": round(fidelity_all_pct, 2),
+            "fidelity_modelled_pct": round(fidelity_core_pct, 2),
+            "modelled_trades_compared": len(core_trades),
+            "fidelity_pct": round(fidelity_all_pct, 2),
             "reason_match_pct": round(reason_match_pct, 2),
-            "modelled_exits": [
-                "STOP_LOSS",
-                "GAP_DOWN_STOP",
-                "GAP_UP_STOP",
-                "BREAKEVEN_STOP",
-                "TRAILING_STOP",
-                "TAKE_PROFIT",
-                "FORCE_FLAT",
-            ],
-            "unmodelled_exits": [
-                "STALE_DATA_EXIT",
-                "MANUAL_CLOSE",
-                "RMS_AUTO_SQUAREOFF",
-                "EARLY_ADVERSE_CUT",
-                "STAGNATION_GUARD",
-            ],
+            "unmodelled_trades_count": unmodelled_count,
+            "modelled_exits": list(MODELLED_CORE_EXITS),
+            "unmodelled_exits": list(UNMODELLED_EXITS),
         },
         "split": {
             "train": {
                 "trades_count": len(train_records),
+                "triggered_count": train_triggered_count,
                 "delta_mean_r": round(train_delta_mean_r, 4),
                 "ci_95": (round(train_ci_95[0], 4), round(train_ci_95[1], 4)),
             },
             "test": {
                 "trades_count": len(test_records),
+                "triggered_count": test_triggered_count,
                 "delta_mean_r": round(test_delta_mean_r, 4),
                 "ci_95": (round(test_ci_95[0], 4), round(test_ci_95[1], 4)),
             },
