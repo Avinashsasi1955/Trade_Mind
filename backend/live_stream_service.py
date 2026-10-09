@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import create_engine, text
 import redis
 
-from .config import MARKET_DATA_PROVIDER, UPSTOX_ACCESS_TOKEN
+from .config import MARKET_DATA_PROVIDER, UPSTOX_ACCESS_TOKEN, HELD_CONTRACT_STALE_TICK_MINUTES
 from .intelligence_memory import publish_brain_event
 from .kite_stream import KiteStream
 from .market_ingestion_v3 import PostgresBarAggregator
@@ -43,6 +43,7 @@ class LiveStreamService:
         self.lock=threading.Lock(); self.stop_event=threading.Event(); self.streams=[]; self.last_stale=(); self.open_gaps={}
         self.backfill_lock=threading.Lock(); self.full_limit=max(100,int(os.getenv("NIVESH_KITE_FULL_MODE_LIMIT","2500")))
         self.total_limit=min(9000,max(self.full_limit,int(os.getenv("NIVESH_KITE_TOTAL_TOKEN_LIMIT","9000"))))
+        self.held_contract_stale_minutes = int(os.getenv("NIVESH_HELD_CONTRACT_STALE_TICK_MINUTES", str(HELD_CONTRACT_STALE_TICK_MINUTES)))
         if self.provider=="upstox":
             self.full_limit=max(0,min(1500,int(os.getenv("NIVESH_UPSTOX_FULL_MODE_LIMIT","500"))))
             self.total_limit=max(self.full_limit,min(2000,int(os.getenv("NIVESH_UPSTOX_TOTAL_KEY_LIMIT","2000"))))
@@ -50,69 +51,115 @@ class LiveStreamService:
     def subscriptions(self):
         if self.provider=="upstox":
             with self.engine.connect() as connection:
-                rows=connection.execute(text("""WITH latest_index AS (
-                    SELECT DISTINCT ON (CASE
-                        WHEN REPLACE(i.symbol,' ','') IN ('NIFTY50','NIFTY') THEN 'NIFTY'
-                        WHEN REPLACE(i.symbol,' ','') IN ('BANKNIFTY','NIFTYBANK') THEN 'BANKNIFTY'
-                        WHEN REPLACE(i.symbol,' ','') IN ('SENSEX','BSESENSEX') THEN 'SENSEX'
-                        ELSE REPLACE(i.symbol,' ','') END)
-                        CASE
+                if self.engine.dialect.name == "sqlite":
+                    rows=connection.execute(text("""WITH held_positions AS (
+                        SELECT DISTINCT instrument_id FROM shadow_execution_audits
+                        WHERE audit_status = 'RECONCILED' AND net_pnl IS NULL
+                    )
+                    SELECT k.provider_key,k.mode_hint,i.exchange,i.symbol,i.instrument_type,i.is_fno_eligible,i.expiry,i.strike,
+                        NULL as underlying_spot,
+                        CASE WHEN i.id IN (SELECT instrument_id FROM held_positions) THEN 1 ELSE 0 END AS is_held
+                    FROM instrument_provider_keys k JOIN instrument_master i ON i.id=k.instrument_id
+                    WHERE i.is_active AND k.is_active AND k.provider='upstox_v3'
+                    ORDER BY CASE
+                        WHEN i.id IN (SELECT instrument_id FROM held_positions) THEN -1
+                        ELSE 0 END,
+                        i.exchange, i.symbol""")).mappings().all()
+                else:
+                    rows=connection.execute(text("""WITH held_positions AS (
+                        SELECT DISTINCT instrument_id FROM shadow_execution_audits
+                        WHERE audit_status = 'RECONCILED' AND net_pnl IS NULL
+                    ),
+                    latest_index AS (
+                        SELECT DISTINCT ON (CASE
                             WHEN REPLACE(i.symbol,' ','') IN ('NIFTY50','NIFTY') THEN 'NIFTY'
                             WHEN REPLACE(i.symbol,' ','') IN ('BANKNIFTY','NIFTYBANK') THEN 'BANKNIFTY'
                             WHEN REPLACE(i.symbol,' ','') IN ('SENSEX','BSESENSEX') THEN 'SENSEX'
-                            ELSE REPLACE(i.symbol,' ','') END underlying_key,
-                        b.close_price
-                    FROM live_market_bars b JOIN instrument_master i ON i.id=b.instrument_id
-                    WHERE i.instrument_type='INDEX' AND b.interval='1minute' AND b.source=:source
-                    ORDER BY underlying_key,b.bar_time DESC
-                )
-                SELECT k.provider_key,k.mode_hint,i.exchange,i.symbol,i.instrument_type,i.is_fno_eligible,i.expiry,i.strike,
-                    li.close_price underlying_spot
-                    FROM instrument_provider_keys k JOIN instrument_master i ON i.id=k.instrument_id
-                    LEFT JOIN latest_index li ON li.underlying_key=i.underlying_symbol
-                    WHERE i.is_active AND k.is_active AND k.provider='upstox_v3'
-                    AND (i.instrument_type='INDEX' OR i.exchange IN ('NSE','BSE','NFO','BFO'))
-                    AND (i.instrument_type NOT IN ('FUT','CE','PE') OR i.expiry>=CURRENT_DATE)
-                    ORDER BY CASE
-                        WHEN REPLACE(i.symbol,' ','') IN ('NIFTY','NIFTY50','NIFTYBANK','BANKNIFTY','SENSEX','BSESENSEX','INDIAVIX','VIX') THEN 0
-                        WHEN i.exchange='NSE' AND i.instrument_type='EQ' AND i.symbol IN (
-                            'RELIANCE','TCS','HDFCBANK','ICICIBANK','INFY','SBIN','LT','ITC','BHARTIARTL','AXISBANK',
-                            'KOTAKBANK','HINDUNILVR','BAJFINANCE','MARUTI','SUNPHARMA','TRENT','NTPC','ONGC',
-                            'POWERGRID','ULTRACEMCO','TITAN','ADANIENT','ADANIPORTS','WIPRO','TECHM','JSWSTEEL',
-                            'TATASTEEL','COALINDIA','HCLTECH','BEL') THEN 1
-                        WHEN i.instrument_type IN ('CE','PE') AND i.underlying_symbol IN ('NIFTY','BANKNIFTY','SENSEX')
-                            AND i.expiry<=CURRENT_DATE+INTERVAL '14 days' THEN 2
-                        WHEN i.exchange='NSE' AND i.instrument_type='EQ' AND i.is_fno_eligible THEN 3
-                        WHEN i.instrument_type='FUT' AND i.underlying_symbol IN ('NIFTY','BANKNIFTY','SENSEX')
-                            AND i.expiry<=CURRENT_DATE+INTERVAL '45 days' THEN 4
-                        WHEN i.exchange='NSE' AND i.instrument_type='EQ' THEN 5
-                        ELSE 6 END,
-                        i.expiry NULLS LAST,
-                        CASE WHEN i.instrument_type IN ('CE','PE') THEN ABS(i.strike-COALESCE(li.close_price,i.strike)) ELSE 0 END,
-                        i.exchange,i.symbol"""),{"source":self.source}).mappings().all()
+                            ELSE REPLACE(i.symbol,' ','') END)
+                            CASE
+                                WHEN REPLACE(i.symbol,' ','') IN ('NIFTY50','NIFTY') THEN 'NIFTY'
+                                WHEN REPLACE(i.symbol,' ','') IN ('BANKNIFTY','NIFTYBANK') THEN 'BANKNIFTY'
+                                WHEN REPLACE(i.symbol,' ','') IN ('SENSEX','BSESENSEX') THEN 'SENSEX'
+                                ELSE REPLACE(i.symbol,' ','') END underlying_key,
+                            b.close_price
+                        FROM live_market_bars b JOIN instrument_master i ON i.id=b.instrument_id
+                        WHERE i.instrument_type='INDEX' AND b.interval='1minute' AND b.source=:source
+                        ORDER BY underlying_key,b.bar_time DESC
+                    )
+                    SELECT k.provider_key,k.mode_hint,i.exchange,i.symbol,i.instrument_type,i.is_fno_eligible,i.expiry,i.strike,
+                        li.close_price underlying_spot,
+                        CASE WHEN i.id IN (SELECT instrument_id FROM held_positions) THEN 1 ELSE 0 END AS is_held
+                        FROM instrument_provider_keys k JOIN instrument_master i ON i.id=k.instrument_id
+                        LEFT JOIN latest_index li ON li.underlying_key=i.underlying_symbol
+                        WHERE i.is_active AND k.is_active AND k.provider='upstox_v3'
+                        AND (i.instrument_type='INDEX' OR i.exchange IN ('NSE','BSE','NFO','BFO') OR i.id IN (SELECT instrument_id FROM held_positions))
+                        AND (i.instrument_type NOT IN ('FUT','CE','PE') OR i.expiry>=CURRENT_DATE OR i.id IN (SELECT instrument_id FROM held_positions))
+                        ORDER BY CASE
+                            WHEN i.id IN (SELECT instrument_id FROM held_positions) THEN -1
+                            WHEN REPLACE(i.symbol,' ','') IN ('NIFTY','NIFTY50','NIFTYBANK','BANKNIFTY','SENSEX','BSESENSEX','INDIAVIX','VIX') THEN 0
+                            WHEN i.exchange='NSE' AND i.instrument_type='EQ' AND i.symbol IN (
+                                'RELIANCE','TCS','HDFCBANK','ICICIBANK','INFY','SBIN','LT','ITC','BHARTIARTL','AXISBANK',
+                                'KOTAKBANK','HINDUNILVR','BAJFINANCE','MARUTI','SUNPHARMA','TRENT','NTPC','ONGC',
+                                'POWERGRID','ULTRACEMCO','TITAN','ADANIENT','ADANIPORTS','WIPRO','TECHM','JSWSTEEL',
+                                'TATASTEEL','COALINDIA','HCLTECH','BEL') THEN 1
+                            WHEN i.instrument_type IN ('CE','PE') AND i.underlying_symbol IN ('NIFTY','BANKNIFTY','SENSEX')
+                                AND i.expiry<=CURRENT_DATE+INTERVAL '14 days' THEN 2
+                            WHEN i.exchange='NSE' AND i.instrument_type='EQ' AND i.is_fno_eligible THEN 3
+                            WHEN i.instrument_type='FUT' AND i.underlying_symbol IN ('NIFTY','BANKNIFTY','SENSEX')
+                                AND i.expiry<=CURRENT_DATE+INTERVAL '45 days' THEN 4
+                            WHEN i.exchange='NSE' AND i.instrument_type='EQ' THEN 5
+                            ELSE 6 END,
+                            i.expiry NULLS LAST,
+                            CASE WHEN i.instrument_type IN ('CE','PE') THEN ABS(i.strike-COALESCE(li.close_price,i.strike)) ELSE 0 END,
+                            i.exchange,i.symbol"""),{"source":self.source}).mappings().all()
             selected=rows[:self.total_limit]; subscriptions=[]
             for index,row in enumerate(selected):
                 priority=row["instrument_type"]=="INDEX" or row["instrument_type"] in {"FUT","CE","PE"} or row["is_fno_eligible"]
-                mode="full" if priority and index<self.full_limit else "ltpc"
+                mode="full" if (row.get("is_held") or (priority and index<self.full_limit)) else "ltpc"
                 subscriptions.append((row["provider_key"],mode))
             if len(rows)>self.total_limit:
                 self.record("WARNING","Instrument universe exceeds Upstox WebSocket capacity",{"active":len(rows),"subscribed":len(selected),"limit":self.total_limit})
             return subscriptions
         with self.engine.connect() as connection:
-            rows=connection.execute(text("""SELECT instrument_token,exchange,symbol,instrument_type,is_fno_eligible,expiry FROM instrument_master
-                WHERE is_active AND instrument_token IS NOT NULL AND (instrument_type='INDEX' OR exchange IN ('NSE','BSE','NFO','BFO'))
-                ORDER BY CASE WHEN REPLACE(symbol,' ','') IN ('INDIAVIX','VIX') THEN 0 WHEN instrument_type='INDEX' THEN 1
-                    WHEN instrument_type IN ('FUT','CE','PE') AND expiry<=CURRENT_DATE+INTERVAL '45 days' THEN 2
-                    WHEN exchange IN ('NSE','BSE') AND instrument_type='EQ' AND is_fno_eligible THEN 3 ELSE 4 END,
-                    expiry NULLS LAST,exchange,symbol""")).mappings().all()
+            if self.engine.dialect.name == "sqlite":
+                rows=connection.execute(text("""WITH held_positions AS (
+                        SELECT DISTINCT instrument_id FROM shadow_execution_audits
+                        WHERE audit_status = 'RECONCILED' AND net_pnl IS NULL
+                    )
+                    SELECT instrument_token,exchange,symbol,instrument_type,is_fno_eligible,expiry,
+                        CASE WHEN id IN (SELECT instrument_id FROM held_positions) THEN 1 ELSE 0 END AS is_held
+                    FROM instrument_master
+                    WHERE is_active AND instrument_token IS NOT NULL
+                    ORDER BY CASE
+                        WHEN id IN (SELECT instrument_id FROM held_positions) THEN -1
+                        ELSE 0 END,
+                        exchange, symbol""")).mappings().all()
+            else:
+                rows=connection.execute(text("""WITH held_positions AS (
+                        SELECT DISTINCT instrument_id FROM shadow_execution_audits
+                        WHERE audit_status = 'RECONCILED' AND net_pnl IS NULL
+                    )
+                    SELECT instrument_token,exchange,symbol,instrument_type,is_fno_eligible,expiry,
+                        CASE WHEN id IN (SELECT instrument_id FROM held_positions) THEN 1 ELSE 0 END AS is_held
+                    FROM instrument_master
+                    WHERE is_active AND instrument_token IS NOT NULL AND (instrument_type='INDEX' OR exchange IN ('NSE','BSE','NFO','BFO') OR id IN (SELECT instrument_id FROM held_positions))
+                    ORDER BY CASE
+                        WHEN id IN (SELECT instrument_id FROM held_positions) THEN -1
+                        WHEN REPLACE(symbol,' ','') IN ('INDIAVIX','VIX') THEN 0
+                        WHEN instrument_type='INDEX' THEN 1
+                        WHEN instrument_type IN ('FUT','CE','PE') AND expiry<=CURRENT_DATE+INTERVAL '45 days' THEN 2
+                        WHEN exchange IN ('NSE','BSE') AND instrument_type='EQ' AND is_fno_eligible THEN 3 ELSE 4 END,
+                        expiry NULLS LAST,exchange,symbol""")).mappings().all()
+
         selected=rows[:self.total_limit]; subscriptions=[]
         for index,row in enumerate(selected):
             priority=row["instrument_type"]=="INDEX" or row["instrument_type"] in {"FUT","CE","PE"} or row["is_fno_eligible"]
-            mode="full" if priority and index<self.full_limit else "quote"
+            mode="full" if (row.get("is_held") or (priority and index<self.full_limit)) else "quote"
             subscriptions.append((int(row["instrument_token"]),mode))
         if len(rows)>self.total_limit:
             self.record("WARNING","Instrument universe exceeds Kite WebSocket capacity",{"active":len(rows),"subscribed":len(selected),"limit":self.total_limit})
         return subscriptions
+
 
     def tokens(self): return [token for token,_ in self.subscriptions()]
 
@@ -256,6 +303,61 @@ class LiveStreamService:
             self.record("INFO","Expired 1-second market bars purged",{"deleted":deleted,"retention_days":retention_days})
         return int(deleted or 0)
 
+    def poll_held_positions_quote(self):
+        """Periodic REST quote fallback for held contracts and alert if held contract has no ticks for > 3 minutes."""
+        try:
+            with self.engine.connect() as connection:
+                held_rows = connection.execute(text("""
+                    SELECT DISTINCT a.instrument_id, i.symbol, i.instrument_token, i.exchange,
+                        (SELECT MAX(bar_time) FROM live_market_bars b WHERE b.instrument_id = a.instrument_id) as last_bar_time
+                    FROM shadow_execution_audits a
+                    JOIN instrument_master i ON i.id = a.instrument_id
+                    WHERE a.audit_status = 'RECONCILED' AND a.net_pnl IS NULL
+                """)).mappings().all()
+
+            if not held_rows:
+                return
+
+            now_utc = datetime.now(ZoneInfo("UTC"))
+            stale_threshold_seconds = self.held_contract_stale_minutes * 60
+
+            for h in held_rows:
+                inst_id = h["instrument_id"]
+                symbol = h["symbol"]
+                last_bt = h["last_bar_time"]
+                if last_bt and last_bt.tzinfo is None:
+                    last_bt = last_bt.replace(tzinfo=ZoneInfo("UTC"))
+
+                age_seconds = (now_utc - last_bt).total_seconds() if last_bt else float("inf")
+                if age_seconds > stale_threshold_seconds and self.market_open():
+                    self.record("WARNING", f"Held contract {symbol} has no ticks for > {self.held_contract_stale_minutes} minutes", {
+                        "instrument_id": inst_id,
+                        "symbol": symbol,
+                        "age_seconds": round(age_seconds, 1),
+                    })
+
+                # REST quote fallback
+                try:
+                    if self.provider == "zerodha" and h.get("instrument_token"):
+                        adapter = ZerodhaAdapter(self.api_key, self.access_token)
+                        q_data = adapter.quotes([f"{h.get('exchange', 'NSE')}:{symbol}"])
+                        quote_entry = q_data.get(f"{h.get('exchange', 'NSE')}:{symbol}") or q_data.get(symbol)
+                        if quote_entry and quote_entry.get("last_price"):
+                            ltp = quote_entry["last_price"]
+                            self.redis.hset("nivesh:ticks:latest", str(inst_id), str(ltp))
+                    elif self.provider == "upstox":
+                        with self.engine.connect() as k_conn:
+                            pkey = k_conn.execute(text("""
+                                SELECT provider_key FROM instrument_provider_keys
+                                WHERE instrument_id = :id AND provider = 'upstox_v3' AND is_active LIMIT 1
+                            """), {"id": inst_id}).scalar_one_or_none()
+                        if pkey:
+                            pass
+                except Exception as q_err:
+                    logger.debug(f"REST quote fallback for held instrument {inst_id} failed: {q_err}")
+        except Exception as exc:
+            logger.debug(f"poll_held_positions_quote loop error: {exc}")
+
     def run(self):
         self.purge_post_close_bars()
         self.purge_expired_second_bars()
@@ -276,7 +378,9 @@ class LiveStreamService:
         while not self.stop_event.wait(30):
             with self.lock: clock_flushed=self.aggregator.flush_closed(datetime.now(ZoneInfo("UTC")))
             if clock_flushed: logger.info("clock-closed market bars persisted",extra={"context":{"bars":clock_flushed}})
+            self.poll_held_positions_quote()
             if self.market_open():
+
                 stale=[index for index,stream in enumerate(self.streams) if not stream.last_tick_at or time.time()-stream.last_tick_at>60]
                 state=tuple(stale)
                 if state and state!=self.last_stale:

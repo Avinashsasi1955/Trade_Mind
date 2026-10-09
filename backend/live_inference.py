@@ -3442,6 +3442,59 @@ class LivePaperInference:
             except Exception as orch_exc:
                 logger.warning(f"Agentic orchestrator deliberation bypassed due to error: {orch_exc}")
 
+            underlying_invalidation_level = None
+            if agent_eval.get("trade_mode") == "SWING":
+                try:
+                    from .swing_risk import compute_swing_risk_parameters
+                    with self.engine.connect() as d_conn:
+                        d_rows = d_conn.execute(
+                            text("""
+                                SELECT bar_time, open_price, high_price, low_price, close_price, volume
+                                FROM live_market_bars
+                                WHERE instrument_id = :inst_id
+                                  AND interval = 'day'
+                                  AND bar_time <= :wm
+                                ORDER BY bar_time ASC
+                            """),
+                            {"inst_id": int(item.get("instrument_id") or 0), "wm": causal_watermark}
+                        ).mappings().all()
+                        daily_candles = [dict(r) for r in d_rows]
+                        
+                        und_daily_candles = None
+                        if str(target.get("kind") or "").upper() in ("CE", "PE"):
+                            und_sym = item.get("symbol")
+                            und_rows = d_conn.execute(
+                                text("""
+                                    SELECT b.bar_time, b.open_price, b.high_price, b.low_price, b.close_price, b.volume
+                                    FROM live_market_bars b
+                                    JOIN instrument_master i ON i.id = b.instrument_id
+                                    WHERE (i.symbol = :sym OR i.underlying_symbol = :sym)
+                                      AND i.instrument_type IN ('EQ', 'INDEX')
+                                      AND b.interval = 'day'
+                                      AND b.bar_time <= :wm
+                                    ORDER BY b.bar_time ASC
+                                """),
+                                {"sym": und_sym, "wm": causal_watermark}
+                            ).mappings().all()
+                            und_daily_candles = [dict(r) for r in und_rows]
+
+                    swing_res = compute_swing_risk_parameters(
+                        symbol=str(item.get("symbol") or ""),
+                        side=target["side"],
+                        entry_price=target["price"],
+                        daily_candles=daily_candles,
+                        is_option=bool(str(target.get("kind") or "").upper() in ("CE", "PE")),
+                        underlying_daily_candles=und_daily_candles,
+                        option_type=target.get("kind"),
+                    )
+                    if swing_res:
+                        risk_levels["stop_loss"] = Decimal(str(swing_res["stop_loss_price"]))
+                        risk_levels["take_profit"] = Decimal(str(swing_res["take_profit_price"]))
+                        quantity = max(1, swing_res["quantity"])
+                        underlying_invalidation_level = swing_res.get("underlying_invalidation_level")
+                except Exception as sw_exc:
+                    logger.warning(f"Swing risk computation failed, fallback to standard: {sw_exc}")
+
             if str(target.get("kind", "")).upper() in {"CE", "PE"}:
                 lot = int(target.get("lot_size") or 1)
                 quantity = (quantity // lot) * lot
@@ -3456,6 +3509,7 @@ class LivePaperInference:
                                                                   "directional_intent":item.get("chart_gate",{}).get("directional_intent"),
                                                                   "trade_mode":agent_eval.get("trade_mode","INTRADAY"),
                                                                   "reasoning_chain":agent_eval.get("reasoning_chain"),
+                                                                  "underlying_invalidation_level":underlying_invalidation_level,
                                                                   "spread_basket_id":spread_basket_id,
                                                                   "candidate_grade":assigned_grade,
                                                                   "reason":item.get("chart_gate",{}).get("reason"),

@@ -75,41 +75,46 @@ def get_broker_adapter(user_id: int):
     return ZerodhaAdapter(KITE_API_KEY, access_token(user_id))
 
 
+import threading
 _SHARED_EXECUTION_ENGINE = None
+_EXECUTION_ENGINE_LOCK = threading.Lock()
 
 
 def get_execution_engine(database_url: Optional[str] = None):
-    """Lazy singleton engine for order execution lookups."""
+    """Lazy singleton engine for order execution lookups, guarded by thread lock."""
     global _SHARED_EXECUTION_ENGINE
-    if database_url is not None:
-        if _SHARED_EXECUTION_ENGINE is None or str(_SHARED_EXECUTION_ENGINE.url) != database_url:
-            from sqlalchemy import create_engine
-            kwargs = {"pool_pre_ping": True, "future": True}
-            if not database_url.startswith("sqlite"):
-                kwargs["pool_size"] = 3
-                kwargs["max_overflow"] = 2
-            _SHARED_EXECUTION_ENGINE = create_engine(database_url, **kwargs)
-        return _SHARED_EXECUTION_ENGINE
+    from sqlalchemy.engine import make_url, create_engine
+    with _EXECUTION_ENGINE_LOCK:
+        if database_url is not None:
+            target_parsed = make_url(database_url)
+            if _SHARED_EXECUTION_ENGINE is None or _SHARED_EXECUTION_ENGINE.url != target_parsed:
+                kwargs = {"pool_pre_ping": True, "future": True}
+                if not database_url.startswith("sqlite"):
+                    kwargs["pool_size"] = 3
+                    kwargs["max_overflow"] = 2
+                _SHARED_EXECUTION_ENGINE = create_engine(target_parsed, **kwargs)
+            return _SHARED_EXECUTION_ENGINE
 
-    if _SHARED_EXECUTION_ENGINE is not None:
-        return _SHARED_EXECUTION_ENGINE
+        if _SHARED_EXECUTION_ENGINE is not None:
+            return _SHARED_EXECUTION_ENGINE
 
-    from .config import DATABASE_URL
-    if not DATABASE_URL:
-        return None
-    from sqlalchemy import create_engine
-    kwargs = {"pool_pre_ping": True, "future": True}
-    if not DATABASE_URL.startswith("sqlite"):
-        kwargs["pool_size"] = 3
-        kwargs["max_overflow"] = 2
-    _SHARED_EXECUTION_ENGINE = create_engine(DATABASE_URL, **kwargs)
-    return _SHARED_EXECUTION_ENGINE
+        from .config import DATABASE_URL
+        if not DATABASE_URL:
+            return None
+        target_parsed = make_url(DATABASE_URL)
+        kwargs = {"pool_pre_ping": True, "future": True}
+        if not DATABASE_URL.startswith("sqlite"):
+            kwargs["pool_size"] = 3
+            kwargs["max_overflow"] = 2
+        _SHARED_EXECUTION_ENGINE = create_engine(target_parsed, **kwargs)
+        return _SHARED_EXECUTION_ENGINE
 
 
 def set_execution_engine(engine) -> None:
     """Explicitly set or reset shared execution engine (useful for tests or dependency injection)."""
     global _SHARED_EXECUTION_ENGINE
-    _SHARED_EXECUTION_ENGINE = engine
+    with _EXECUTION_ENGINE_LOCK:
+        _SHARED_EXECUTION_ENGINE = engine
 
 
 def lookup_upstox_provider_key(

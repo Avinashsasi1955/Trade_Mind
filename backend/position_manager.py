@@ -28,12 +28,41 @@ from zoneinfo import ZoneInfo
 import redis
 from sqlalchemy import create_engine, text
 
-from .config import DATABASE_URL, REDIS_URL
+from .config import (
+    DATABASE_URL,
+    REDIS_URL,
+    PRICE_MAX_AGE_SECONDS,
+    PRICE_MAX_AGE_SWING_SECONDS,
+    STALE_DATA_EXIT_MINUTES,
+)
 from .ml.validation_engine import record_shadow_exit
 
 logger = logging.getLogger("nivesh.position_manager")
 IST = ZoneInfo("Asia/Kolkata")
 TRADE_BAR_SOURCES = ("zerodha_kite", "kite_gap_backfill", "upstox_v3", "upstox_rest_5m")
+
+
+class PriceResult(tuple):
+    """2-tuple (price, source) with an optional bar_time attribute for staleness checking."""
+
+    def __new__(cls, price: Optional[Decimal], source: Optional[str], bar_time: Optional[datetime] = None):
+        inst = super().__new__(cls, (price, source))
+        inst.bar_time = bar_time
+        return inst
+
+
+def is_market_hours(dt: Optional[datetime] = None) -> bool:
+    """Return True if given datetime (or now) falls in regular NSE market hours (Mon-Fri 09:15-15:30 IST)."""
+    target = dt or datetime.now(timezone.utc)
+    target_ist = target.astimezone(IST) if getattr(target, "tzinfo", None) else target.replace(tzinfo=timezone.utc).astimezone(IST)
+    if target_ist.weekday() >= 5:  # Saturday = 5, Sunday = 6
+        return False
+    from datetime import time as dt_time
+    m_open = dt_time(9, 15)
+    m_close = dt_time(15, 30)
+    cur_time = target_ist.time()
+    return m_open <= cur_time <= m_close
+
 
 
 
@@ -95,8 +124,11 @@ class PositionManager:
         self.stagnation_tighten_r = Decimal("0.35")
         self.stagnation_scratch_seconds = 900.0  # 15 minutes (intraday)
         self.stagnation_min_expansion_r = Decimal("0.25")
-        
         self.force_flat_time = os.getenv("NIVESH_SHADOW_FORCE_FLAT_IST", "15:15")
+        self.price_max_age_seconds = int(os.getenv("NIVESH_PRICE_MAX_AGE_SECONDS", str(PRICE_MAX_AGE_SECONDS)))
+        self.price_max_age_swing_seconds = int(os.getenv("NIVESH_PRICE_MAX_AGE_SWING_SECONDS", str(PRICE_MAX_AGE_SWING_SECONDS)))
+        self.stale_data_exit_minutes = int(os.getenv("NIVESH_STALE_DATA_EXIT_MINUTES", str(STALE_DATA_EXIT_MINUTES)))
+        self.stale_positions_tracker: Dict[int, datetime] = {}
 
     def execute_exit(
         self,
@@ -164,18 +196,18 @@ class PositionManager:
                 cached_price = self.redis.hget("nivesh:ticks:latest", str(instrument_id))
                 if cached_price:
                     val = Decimal(str(cached_price))
-                    return (val, "market") if return_source else val
-            except Exception:
-                pass
+                    return PriceResult(val, "market", bar_time=watermark) if return_source else val
+            except Exception as e:
+                logger.debug(f"Redis tick cache lookup failed for instrument {instrument_id}: {e}")
 
         with self.engine.connect() as conn:
             row = conn.execute(
                 text("""
-                    SELECT close_price FROM live_market_bars
+                    SELECT close_price, bar_time FROM live_market_bars
                     WHERE instrument_id = :instrument_id
                       AND interval IN ('1second', '1minute', '5minute')
                       AND bar_time <= :watermark
-                      AND source = ANY(:sources)
+                      AND source IN ('zerodha_kite', 'kite_gap_backfill', 'upstox_v3', 'upstox_rest_5m')
                     ORDER BY bar_time DESC,
                              CASE interval WHEN '1second' THEN 0 WHEN '1minute' THEN 1 ELSE 2 END
                     LIMIT 1
@@ -183,12 +215,20 @@ class PositionManager:
                 {
                     "instrument_id": instrument_id,
                     "watermark": watermark,
-                    "sources": list(TRADE_BAR_SOURCES),
                 },
             ).mappings().one_or_none()
             if row and row["close_price"] is not None:
                 val = Decimal(str(row["close_price"]))
-                return (val, "market") if return_source else val
+                b_time = row.get("bar_time")
+                if b_time is not None:
+                    if isinstance(b_time, str):
+                        try:
+                            b_time = datetime.fromisoformat(b_time)
+                        except Exception:
+                            b_time = datetime.strptime(b_time.split(".")[0], "%Y-%m-%d %H:%M:%S")
+                    if getattr(b_time, "tzinfo", None) is None:
+                        b_time = b_time.replace(tzinfo=timezone.utc)
+                return PriceResult(val, "market", bar_time=b_time) if return_source else val
 
             # Option contract mark-to-market derivation from underlying spot
             opt_meta = conn.execute(
@@ -207,15 +247,15 @@ class PositionManager:
                 if und_id:
                     und_row = conn.execute(
                         text("""
-                            SELECT close_price FROM live_market_bars
+                            SELECT close_price, bar_time FROM live_market_bars
                             WHERE instrument_id = :und_id
                               AND interval IN ('1second', '1minute', '5minute', 'day')
                               AND bar_time <= :watermark
                               AND bar_time >= :watermark - INTERVAL '15 minutes'
-                              AND source = ANY(:sources)
+                              AND source IN ('zerodha_kite', 'kite_gap_backfill', 'upstox_v3', 'upstox_rest_5m')
                             ORDER BY bar_time DESC LIMIT 1
                         """),
-                        {"und_id": und_id, "watermark": watermark, "sources": list(TRADE_BAR_SOURCES)}
+                        {"und_id": und_id, "watermark": watermark}
                     ).mappings().one_or_none()
                     if und_row and und_row["close_price"]:
                         spot = float(und_row["close_price"])
@@ -234,10 +274,10 @@ class PositionManager:
                                     WHERE instrument_id = :und_id
                                       AND interval IN ('1second', '1minute', '5minute', 'day')
                                       AND bar_time <= :sig_at
-                                      AND source = ANY(:sources)
+                                      AND source IN ('zerodha_kite', 'kite_gap_backfill', 'upstox_v3', 'upstox_rest_5m')
                                     ORDER BY bar_time DESC LIMIT 1
                                 """),
-                                {"und_id": und_id, "sig_at": signal_at, "sources": list(TRADE_BAR_SOURCES)}
+                                {"und_id": und_id, "sig_at": signal_at}
                             ).mappings().one_or_none()
                             if entry_spot_row and entry_spot_row["close_price"]:
                                 sig_date = (signal_at.astimezone(IST) if getattr(signal_at, "tzinfo", None) else signal_at).date() if hasattr(signal_at, "date") else signal_at
@@ -246,12 +286,24 @@ class PositionManager:
                                 if entry_bs > 0.05:
                                     scale_ratio = max(0.2, min(5.0, float(entry_price) / entry_bs))
                         val = Decimal(str(max(0.05, round(greeks["price"] * scale_ratio, 2))))
-                        return (val, "synthetic") if return_source else val
-        return (None, None) if return_source else None
+                        und_b_time = und_row.get("bar_time")
+                        if und_b_time is not None:
+                            if isinstance(und_b_time, str):
+                                try:
+                                    und_b_time = datetime.fromisoformat(und_b_time)
+                                except Exception:
+                                    und_b_time = datetime.strptime(und_b_time.split(".")[0], "%Y-%m-%d %H:%M:%S")
+                            if getattr(und_b_time, "tzinfo", None) is None:
+                                und_b_time = und_b_time.replace(tzinfo=timezone.utc)
+                        return PriceResult(val, "synthetic", bar_time=und_b_time) if return_source else val
+        return PriceResult(None, None, bar_time=None) if return_source else None
+
 
     def get_exit_bars(self, instrument_id: int, signal_at: datetime, watermark: datetime,
-                      entry_price: Optional[Decimal] = None, is_multi_day: bool = False) -> List[Dict]:
+                      entry_price: Optional[Decimal] = None, is_multi_day: bool = False,
+                      exclusive_start: bool = False) -> List[Dict]:
         """Fetch historical bars since trade entry for high-precision exit checks."""
+        op_start = ">" if exclusive_start else ">="
         with self.engine.connect() as conn:
             # Check real option / equity market bars first: prefer highest resolution that has complete coverage
             max_start_gap = {"1second": 5, "1minute": 120, "5minute": 600}
@@ -262,13 +314,13 @@ class PositionManager:
             target_intervals = ("1minute", "5minute") if is_multi_day else ("1second", "1minute", "5minute")
             for interval in target_intervals:
                 rows = conn.execute(
-                    text("""
-                        SELECT bar_time, high_price, low_price, close_price, volume
+                    text(f"""
+                        SELECT bar_time, open_price, high_price, low_price, close_price, volume
                         FROM live_market_bars
                         WHERE instrument_id = :instrument
                           AND interval = :interval
-                          AND source = ANY(:sources)
-                          AND bar_time >= :signal_at AND bar_time <= :watermark
+                          AND source IN ('zerodha_kite', 'kite_gap_backfill', 'upstox_v3', 'upstox_rest_5m')
+                          AND bar_time {op_start} :signal_at AND bar_time <= :watermark
                         ORDER BY bar_time ASC
                     """),
                     {
@@ -276,11 +328,15 @@ class PositionManager:
                         "interval": interval,
                         "signal_at": signal_at,
                         "watermark": watermark,
-                        "sources": list(TRADE_BAR_SOURCES),
                     },
                 ).mappings().all()
                 if rows:
                     def _ts(v):
+                        if isinstance(v, str):
+                            try:
+                                v = datetime.fromisoformat(v)
+                            except Exception:
+                                v = datetime.strptime(v.split(".")[0], "%Y-%m-%d %H:%M:%S")
                         return v.astimezone(timezone.utc).timestamp() if getattr(v, "tzinfo", None) else v.replace(tzinfo=timezone.utc).timestamp()
                     start_gap = abs(_ts(rows[0]["bar_time"]) - t_sig)
                     start_ok = start_gap <= max_start_gap[interval]
@@ -314,16 +370,16 @@ class PositionManager:
                 if und_id:
                     for und_interval in ("1minute", "5minute"):
                         und_bars = conn.execute(
-                            text("""
-                                SELECT bar_time, high_price, low_price, close_price, volume
+                            text(f"""
+                                SELECT bar_time, open_price, high_price, low_price, close_price, volume
                                 FROM live_market_bars
                                 WHERE instrument_id = :und_id
                                   AND interval = :interval
-                                  AND source = ANY(:sources)
-                                  AND bar_time >= :signal_at AND bar_time <= :watermark
+                                  AND source IN ('zerodha_kite', 'kite_gap_backfill', 'upstox_v3', 'upstox_rest_5m')
+                                  AND bar_time {op_start} :signal_at AND bar_time <= :watermark
                                 ORDER BY bar_time ASC
                             """),
-                            {"und_id": und_id, "interval": und_interval, "sources": list(TRADE_BAR_SOURCES), "signal_at": signal_at, "watermark": watermark}
+                            {"und_id": und_id, "interval": und_interval, "signal_at": signal_at, "watermark": watermark}
                         ).mappings().all()
                         if und_bars:
                             break
@@ -347,22 +403,27 @@ class PositionManager:
                         b_time = ub["bar_time"]
                         b_date = (b_time.astimezone(IST) if getattr(b_time, "tzinfo", None) else b_time).date() if hasattr(b_time, "date") else b_time
                         dte = max(0.5, float((exp_date - b_date).days)) if exp_date else 4.0
+                        u_open = float(ub.get("open_price") or ub["close_price"])
+                        g_open = calculate_black_scholes_greeks(u_open, strike, dte, iv=0.145, option_type=opt_meta["instrument_type"])
                         g_high = calculate_black_scholes_greeks(float(ub["high_price"]), strike, dte, iv=0.145, option_type=opt_meta["instrument_type"])
                         g_low = calculate_black_scholes_greeks(float(ub["low_price"]), strike, dte, iv=0.145, option_type=opt_meta["instrument_type"])
                         g_close = calculate_black_scholes_greeks(float(ub["close_price"]), strike, dte, iv=0.145, option_type=opt_meta["instrument_type"])
+                        o_p = max(0.05, round(g_open["price"] * scale_ratio, 2))
                         h_p = max(0.05, round(max(g_high["price"], g_low["price"]) * scale_ratio, 2))
                         l_p = max(0.05, round(min(g_high["price"], g_low["price"]) * scale_ratio, 2))
                         c_p = max(0.05, round(g_close["price"] * scale_ratio, 2))
                         opt_bars.append({
                             "bar_time": ub["bar_time"],
+                            "open_price": o_p,
                             "high_price": h_p,
                             "low_price": l_p,
                             "close_price": c_p,
-                            "volume": ub["volume"],
+                            "volume": ub.get("volume", 0),
                             "interval": "synthesized_option"
                         })
                     return opt_bars
         return best_real
+
 
     def evaluate_position(self, pos: Dict, watermark: datetime) -> Optional[Dict]:
         """Sub-second evaluation of a single open trade against institutional risk rules."""
@@ -375,15 +436,33 @@ class PositionManager:
                 ).scalar_one_or_none()
                 if is_closed is not None:
                     return None
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Closed status check failed for audit #{pos.get('id')}: {e}")
 
         entry = Decimal(str(pos["theoretical_fill_price"]))
         signal_at = pos["signal_at"]
-        if signal_at.tzinfo is None:
+        if isinstance(signal_at, str):
+            try:
+                signal_at = datetime.fromisoformat(signal_at)
+            except Exception:
+                signal_at = datetime.strptime(signal_at.split(".")[0], "%Y-%m-%d %H:%M:%S")
+        if getattr(signal_at, "tzinfo", None) is None:
             signal_at = signal_at.replace(tzinfo=timezone.utc)
-        if watermark.tzinfo is None:
+
+        if isinstance(watermark, str):
+            try:
+                watermark = datetime.fromisoformat(watermark)
+            except Exception:
+                watermark = datetime.strptime(watermark.split(".")[0], "%Y-%m-%d %H:%M:%S")
+        if getattr(watermark, "tzinfo", None) is None:
             watermark = watermark.replace(tzinfo=timezone.utc)
+
+        side = str(pos["side"]).upper()
+        trade_mode = str(pos.get("trade_mode") or "INTRADAY").upper()
+        quantity = Decimal(str(int(pos.get("quantity") or 1)))
+        fees = Decimal(str(pos.get("estimated_fees") or 0))
+        instrument_type = str(pos.get("instrument_type") or "").upper()
+        is_multi_day = trade_mode in ("SWING", "POSITIONAL")
 
         price_res = self.get_latest_price(pos["instrument_id"], watermark, entry_price=entry, signal_at=signal_at, return_source=True)
         if isinstance(price_res, tuple):
@@ -393,16 +472,39 @@ class PositionManager:
         if latest_price is None or latest_price <= 0:
             return None
 
-        side = str(pos["side"]).upper()
-        trade_mode = str(pos.get("trade_mode") or "INTRADAY").upper()
-        quantity = Decimal(str(int(pos.get("quantity") or 1)))
-        fees = Decimal(str(pos.get("estimated_fees") or 0))
+        # -------------------------------------------------------------
+        # Price Freshness Guard: detect stale price during market hours
+        # -------------------------------------------------------------
+        exit_price: Optional[Decimal] = None
+        exit_reason: Optional[str] = None
+        exit_bar_time: Optional[datetime] = None
+
+        price_bar_time = getattr(price_res, "bar_time", None)
+        max_age = self.price_max_age_swing_seconds if is_multi_day else self.price_max_age_seconds
+        is_stale_price = False
+        if is_market_hours(watermark) and price_bar_time is not None:
+            price_age = max(0.0, (watermark - price_bar_time).total_seconds())
+            if price_age > max_age:
+                is_stale_price = True
+                logger.critical(
+                    f"CRITICAL: STALE_PRICE detected for audit #{pos['id']} ({pos.get('symbol')}): "
+                    f"price age {price_age:.1f}s exceeds max {max_age}s"
+                )
+                if pos["id"] not in self.stale_positions_tracker:
+                    self.stale_positions_tracker[pos["id"]] = watermark
+                stale_duration = (watermark - self.stale_positions_tracker[pos["id"]]).total_seconds()
+                if stale_duration >= self.stale_data_exit_minutes * 60.0:
+                    exit_price = latest_price
+                    exit_reason = "STALE_DATA_EXIT"
+                    exit_bar_time = watermark
+            else:
+                if pos["id"] in self.stale_positions_tracker:
+                    del self.stale_positions_tracker[pos["id"]]
 
         elapsed_seconds = max(0.0, (watermark - signal_at).total_seconds())
 
         stop_loss = Decimal(str(pos["stop_loss_price"])) if pos.get("stop_loss_price") else None
         take_profit = Decimal(str(pos["take_profit_price"])) if pos.get("take_profit_price") else None
-        instrument_type = str(pos.get("instrument_type") or "").upper()
 
         # Institutional Short Options Discipline (CBOE & tastytrade benchmark):
         # 1. 50% Max Profit Target: Holding short options past 50% decay yields severe negative gamma risk.
@@ -424,7 +526,8 @@ class PositionManager:
             elif isinstance(raw_note, str):
                 try:
                     note_dict = json.loads(raw_note)
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Failed to parse improvement_note JSON for audit #{pos.get('id')}: {e}")
                     raw_note_parse_failed = True
                     note_dict = {}
                     # Attempt regex recovery for key metadata if JSON was truncated/malformed
@@ -454,8 +557,8 @@ class PositionManager:
                         note_dict["spread_basket_id"] = rc_data.get("spread_basket_id") or rc_data.get("strategy_group")
                     if not note_dict.get("paired_primary_audit_id"):
                         note_dict["paired_primary_audit_id"] = rc_data.get("paired_primary_audit_id")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed to parse reasoning_chain for audit #{pos.get('id')}: {e}")
 
         # Recover trailed stop from separate storage if unparsed
         if self.redis and not note_dict.get("trailed_stop_price"):
@@ -463,8 +566,8 @@ class PositionManager:
                 sep_val = self.redis.get(f"nivesh:trailed_stop:{pos['id']}")
                 if sep_val:
                     note_dict["trailed_stop_price"] = float(sep_val)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to get trailed stop from Redis for audit #{pos.get('id')}: {e}")
 
         spread_basket_id = note_dict.get("spread_basket_id")
         paired_primary_audit_id = note_dict.get("paired_primary_audit_id")
@@ -490,20 +593,8 @@ class PositionManager:
         tick_size = Decimal("0.05")
         fee_buffer_per_share = ((fees * Decimal("2.5")) + (Decimal("2") * tick_size * quantity)) / max(Decimal("1"), quantity)
 
-        # Multi-day holding invariant: swing trades stay open and mature
-        is_multi_day = trade_mode in ("SWING", "POSITIONAL")
-
-        # 3. Bar history for excursion analysis
-        bars = self.get_exit_bars(pos["instrument_id"], signal_at, watermark, entry_price=entry, is_multi_day=is_multi_day)
-        best_favourable = entry
-        worst_adverse = entry
-
-        exit_price: Optional[Decimal] = None
-        exit_reason: Optional[str] = None
-        exit_bar_time: Optional[datetime] = None
-
         # If this is a paired hedge leg, verify whether primary leg has already closed
-        if is_hedge_leg and paired_primary_audit_id:
+        if not exit_reason and is_hedge_leg and paired_primary_audit_id:
             try:
                 with self.engine.connect() as prim_conn:
                     p_res = prim_conn.execute(
@@ -515,7 +606,8 @@ class PositionManager:
                         if isinstance(p_exit_at, str):
                             try:
                                 p_exit_at = datetime.fromisoformat(p_exit_at)
-                            except Exception:
+                            except Exception as e:
+                                logger.debug(f"Failed to parse p_exit_at ISO datetime: {e}")
                                 p_exit_at = None
                         if isinstance(p_exit_at, datetime) and p_exit_at.tzinfo is None:
                             p_exit_at = p_exit_at.replace(tzinfo=timezone.utc)
@@ -544,116 +636,150 @@ class PositionManager:
                 logger.debug(f"Could not check primary leg #{paired_primary_audit_id}: {prim_err}")
 
         # -------------------------------------------------------------
-        # Chronological Bar-by-Bar Replay (Guarantees Perfect Execution Even After Offline/Reboots)
+        # Incremental Bar Evaluation: O(new bars) Replay
         # -------------------------------------------------------------
-        best_favourable = entry
-        worst_adverse = entry
-        running_sl = initial_sl or stop_loss
+        last_proc_raw = note_dict.get("last_processed_bar_time")
+        last_processed_dt = None
+        if last_proc_raw:
+            try:
+                last_processed_dt = datetime.fromisoformat(last_proc_raw)
+                if last_processed_dt.tzinfo is None:
+                    last_processed_dt = last_processed_dt.replace(tzinfo=timezone.utc)
+            except Exception as e:
+                logger.debug(f"Failed to parse last_processed_bar_time: {e}")
+                last_processed_dt = None
+
+        if last_processed_dt and last_processed_dt >= signal_at:
+            best_favourable = Decimal(str(note_dict["best_favourable"])) if note_dict.get("best_favourable") is not None else entry
+            worst_adverse = Decimal(str(note_dict["worst_adverse"])) if note_dict.get("worst_adverse") is not None else entry
+            running_sl = Decimal(str(note_dict["running_sl"])) if note_dict.get("running_sl") is not None else (initial_sl or stop_loss)
+            bars = self.get_exit_bars(pos["instrument_id"], last_processed_dt, watermark, entry_price=entry, is_multi_day=is_multi_day, exclusive_start=True)
+        else:
+            best_favourable = entry
+            worst_adverse = entry
+            running_sl = initial_sl or stop_loss
+            bars = self.get_exit_bars(pos["instrument_id"], signal_at, watermark, entry_price=entry, is_multi_day=is_multi_day, exclusive_start=False)
 
         # Ensure excursion R metrics are always initialized
         favorable_r = Decimal("0.0")
         current_r = Decimal("0.0")
 
-        tp_candidate_bar = None
-        tp_candidate_price = None
-        tp_candidate_reason = None
+        if not exit_reason:
+            for bar in bars:
+                o = Decimal(str(bar.get("open_price") if bar.get("open_price") is not None else (bar.get("close_price") or entry)))
+                h = Decimal(str(bar.get("high_price") or entry))
+                l = Decimal(str(bar.get("low_price") or entry))
+                c = Decimal(str(bar.get("close_price") or bar.get("high_price") or entry))
+                b_time = bar.get("bar_time")
 
-        sl_candidate_bar = None
-        sl_candidate_price = None
-        sl_candidate_reason = None
+                if side == "BUY":
+                    best_favourable = max(best_favourable, h)
+                    worst_adverse = min(worst_adverse, l)
+                    fav_r = (best_favourable - entry) / r_points
+                    favorable_r = max(favorable_r, fav_r)
 
-        for bar in bars:
-            h = Decimal(str(bar.get("high_price") or entry))
-            l = Decimal(str(bar.get("low_price") or entry))
-            c = Decimal(str(bar.get("close_price") or bar.get("high_price") or entry))
-            b_time = bar.get("bar_time")
+                    if not is_hedge_leg:
+                        # Chronological intra-replay trailing stop progression
+                        if fav_r >= self.breakeven_trigger_r:
+                            be_p = entry + fee_buffer_per_share
+                            running_sl = max(running_sl, be_p) if running_sl else be_p
+                        if fav_r >= self.profit_lock_trigger_r:
+                            pl_p = entry + self.profit_lock_guaranteed_r * r_points
+                            running_sl = max(running_sl, pl_p) if running_sl else pl_p
+                        if fav_r >= self.trailing_trigger_r:
+                            ts_p = best_favourable - self.trailing_giveback_r * r_points
+                            running_sl = max(running_sl, ts_p) if running_sl else ts_p
 
-            if side == "BUY":
-                best_favourable = max(best_favourable, h)
-                worst_adverse = min(worst_adverse, l)
-                fav_r = (best_favourable - entry) / r_points
-                favorable_r = max(favorable_r, fav_r)
+                        # 1. Take Profit hit on this bar (gap-aware open check)
+                        if take_profit and o >= take_profit:
+                            exit_price = o
+                            exit_reason = "TAKE_PROFIT"
+                            exit_bar_time = b_time
+                            break
+                        elif take_profit and h >= take_profit:
+                            exit_price = take_profit
+                            exit_reason = "TAKE_PROFIT"
+                            exit_bar_time = b_time
+                            break
 
-                if not is_hedge_leg:
-                    # Chronological intra-replay trailing stop progression
-                    if fav_r >= self.breakeven_trigger_r:
-                        be_p = entry + fee_buffer_per_share
-                        running_sl = max(running_sl, be_p) if running_sl else be_p
-                    if fav_r >= self.profit_lock_trigger_r:
-                        pl_p = entry + self.profit_lock_guaranteed_r * r_points
-                        running_sl = max(running_sl, pl_p) if running_sl else pl_p
-                    if fav_r >= self.trailing_trigger_r:
-                        ts_p = best_favourable - self.trailing_giveback_r * r_points
-                        running_sl = max(running_sl, ts_p) if running_sl else ts_p
+                        # 2. +2.5R Spike Profit Capture hit on this bar
+                        if fav_r >= Decimal("2.50"):
+                            exit_price = entry + Decimal("2.5") * r_points
+                            exit_reason = "PROFIT_CAPTURE"
+                            exit_bar_time = b_time
+                            break
 
-                    # 1. Take Profit hit on this bar
-                    if take_profit and h >= take_profit:
-                        exit_price = take_profit
-                        exit_reason = "TAKE_PROFIT"
-                        exit_bar_time = b_time
-                        break
+                        # 3. Stop Loss or Trailed Stop hit on this bar (Gap-Aware Fills)
+                        if running_sl:
+                            if o <= running_sl:
+                                exit_price = o
+                                exit_reason = "GAP_DOWN_STOP"
+                                exit_bar_time = b_time
+                                break
+                            elif l <= running_sl:
+                                exit_price = running_sl
+                                if running_sl >= entry + self.profit_lock_guaranteed_r * r_points:
+                                    exit_reason = "TRAILING_STOP"
+                                elif running_sl >= entry:
+                                    exit_reason = "BREAKEVEN_STOP"
+                                else:
+                                    exit_reason = "STOP_LOSS"
+                                exit_bar_time = b_time
+                                break
+                else:  # SELL
+                    best_favourable = min(best_favourable, l)
+                    worst_adverse = max(worst_adverse, h)
+                    fav_r = (entry - best_favourable) / r_points
+                    favorable_r = max(favorable_r, fav_r)
 
-                    # 2. +2.5R Spike Profit Capture hit on this bar
-                    if fav_r >= Decimal("2.50"):
-                        exit_price = entry + Decimal("2.5") * r_points
-                        exit_reason = "PROFIT_CAPTURE"
-                        exit_bar_time = b_time
-                        break
+                    if not is_hedge_leg:
+                        # Chronological intra-replay trailing stop progression
+                        if fav_r >= self.breakeven_trigger_r:
+                            be_p = entry - fee_buffer_per_share
+                            running_sl = min(running_sl, be_p) if running_sl else be_p
+                        if fav_r >= self.profit_lock_trigger_r:
+                            pl_p = entry - self.profit_lock_guaranteed_r * r_points
+                            running_sl = min(running_sl, pl_p) if running_sl else pl_p
+                        if fav_r >= self.trailing_trigger_r:
+                            ts_p = best_favourable + self.trailing_giveback_r * r_points
+                            running_sl = min(running_sl, ts_p) if running_sl else ts_p
 
-                    # 3. Stop Loss or Trailed Stop hit on this bar
-                    if running_sl and l <= running_sl:
-                        exit_price = running_sl
-                        if running_sl >= entry + self.profit_lock_guaranteed_r * r_points:
-                            exit_reason = "TRAILING_STOP"
-                        elif running_sl >= entry:
-                            exit_reason = "BREAKEVEN_STOP"
-                        else:
-                            exit_reason = "STOP_LOSS"
-                        exit_bar_time = b_time
-                        break
-            else:  # SELL
-                best_favourable = min(best_favourable, l)
-                worst_adverse = max(worst_adverse, h)
-                fav_r = (entry - best_favourable) / r_points
-                favorable_r = max(favorable_r, fav_r)
+                        # 1. Take Profit hit on this bar (gap-aware open check)
+                        if take_profit and o <= take_profit:
+                            exit_price = o
+                            exit_reason = "TAKE_PROFIT"
+                            exit_bar_time = b_time
+                            break
+                        elif take_profit and l <= take_profit:
+                            exit_price = take_profit
+                            exit_reason = "TAKE_PROFIT"
+                            exit_bar_time = b_time
+                            break
 
-                if not is_hedge_leg:
-                    # Chronological intra-replay trailing stop progression
-                    if fav_r >= self.breakeven_trigger_r:
-                        be_p = entry - fee_buffer_per_share
-                        running_sl = min(running_sl, be_p) if running_sl else be_p
-                    if fav_r >= self.profit_lock_trigger_r:
-                        pl_p = entry - self.profit_lock_guaranteed_r * r_points
-                        running_sl = min(running_sl, pl_p) if running_sl else pl_p
-                    if fav_r >= self.trailing_trigger_r:
-                        ts_p = best_favourable + self.trailing_giveback_r * r_points
-                        running_sl = min(running_sl, ts_p) if running_sl else ts_p
+                        # 2. +2.5R Spike Profit Capture hit on this bar
+                        if fav_r >= Decimal("2.50"):
+                            exit_price = max(Decimal("0.05"), entry - Decimal("2.5") * r_points)
+                            exit_reason = "PROFIT_CAPTURE"
+                            exit_bar_time = b_time
+                            break
 
-                    # 1. Take Profit hit on this bar
-                    if take_profit and l <= take_profit:
-                        exit_price = take_profit
-                        exit_reason = "TAKE_PROFIT"
-                        exit_bar_time = b_time
-                        break
-
-                    # 2. +2.5R Spike Profit Capture hit on this bar
-                    if fav_r >= Decimal("2.50"):
-                        exit_price = max(Decimal("0.05"), entry - Decimal("2.5") * r_points)
-                        exit_reason = "PROFIT_CAPTURE"
-                        exit_bar_time = b_time
-                        break
-
-                    # 3. Stop Loss or Trailed Stop hit on this bar
-                    if running_sl and h >= running_sl:
-                        exit_price = running_sl
-                        if running_sl <= entry - self.profit_lock_guaranteed_r * r_points:
-                            exit_reason = "TRAILING_STOP"
-                        elif running_sl <= entry:
-                            exit_reason = "BREAKEVEN_STOP"
-                        else:
-                            exit_reason = "STOP_LOSS"
-                        exit_bar_time = b_time
-                        break
+                        # 3. Stop Loss or Trailed Stop hit on this bar (Gap-Aware Fills)
+                        if running_sl:
+                            if o >= running_sl:
+                                exit_price = o
+                                exit_reason = "GAP_UP_STOP"
+                                exit_bar_time = b_time
+                                break
+                            elif h >= running_sl:
+                                exit_price = running_sl
+                                if running_sl <= entry - self.profit_lock_guaranteed_r * r_points:
+                                    exit_reason = "TRAILING_STOP"
+                                elif running_sl <= entry:
+                                    exit_reason = "BREAKEVEN_STOP"
+                                else:
+                                    exit_reason = "STOP_LOSS"
+                                exit_bar_time = b_time
+                                break
 
         persisted_trail_raw = note_dict.get("trailed_stop_price")
         if not exit_reason and not is_hedge_leg:
@@ -764,8 +890,8 @@ class PositionManager:
                     if self.redis:
                         try:
                             self.redis.set(f"nivesh:trailed_stop:{pos['id']}", str(sl_flt), ex=86400)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"Failed to set trailed stop in Redis for audit #{pos['id']}: {e}")
                     try:
                         with self.engine.begin() as conn:
                             if raw_note_parse_failed:
@@ -850,7 +976,36 @@ class PositionManager:
         # Mode-Specific Exits: Swing Multi-Day vs Intraday 15:15 RMS Cutoff
         # -------------------------------------------------------------
         if not exit_reason:
-            if is_multi_day:
+            # Check Option Underlying Invalidation Stop if specified
+            und_inval = note_dict.get("underlying_invalidation_level")
+            if und_inval is not None and instrument_type in ("CE", "PE"):
+                try:
+                    und_inval_dec = Decimal(str(und_inval))
+                    und_sym = pos.get("underlying_symbol") or (pos.get("symbol") or "").split()[0]
+                    with self.engine.connect() as u_conn:
+                        u_row = u_conn.execute(
+                            text("""
+                                SELECT close_price FROM live_market_bars b
+                                JOIN instrument_master i ON i.id = b.instrument_id
+                                WHERE (i.symbol = :sym OR i.underlying_symbol = :sym)
+                                  AND i.instrument_type IN ('EQ', 'INDEX')
+                                  AND b.interval IN ('1second', '1minute', '5minute')
+                                  AND b.bar_time <= :wm
+                                  AND b.source IN ('zerodha_kite', 'kite_gap_backfill', 'upstox_v3', 'upstox_rest_5m')
+                                ORDER BY b.bar_time DESC LIMIT 1
+                            """),
+                            {"sym": und_sym, "wm": watermark}
+                        ).mappings().one_or_none()
+                        if u_row and u_row["close_price"]:
+                            u_spot = Decimal(str(u_row["close_price"]))
+                            if (instrument_type == "CE" and u_spot <= und_inval_dec) or (instrument_type == "PE" and u_spot >= und_inval_dec):
+                                exit_price = latest_price
+                                exit_reason = "UNDERLYING_STOP"
+                                exit_bar_time = watermark
+                except Exception as und_err:
+                    logger.debug(f"Underlying invalidation check failed for #{pos.get('id')}: {und_err}")
+
+            if not exit_reason and is_multi_day:
                 signal_date = signal_at.astimezone(IST).date()
                 current_date = watermark.astimezone(IST).date()
                 expiry_val = pos.get("expiry")
@@ -863,8 +1018,8 @@ class PositionManager:
                     elif isinstance(expiry_val, str):
                         try:
                             expiry_date = date.fromisoformat(expiry_val.split("T")[0])
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"Failed to parse expiry date: {e}")
                     elif hasattr(expiry_val, "date"):
                         expiry_date = expiry_val.date()
                 if instrument_type in {"CE", "PE", "FUT"} and expiry_date:
@@ -877,10 +1032,36 @@ class PositionManager:
                     if days_held >= int(pos.get("max_holding_days") or 15):
                         exit_price = latest_price
                         exit_reason = "SWING_MAX_DAYS_EXPIRED"
-            else:
+            elif not exit_reason:
                 if self.is_force_flat_time(watermark):
                     exit_price = latest_price
                     exit_reason = "SESSION_FORCE_FLAT"
+
+        # Persist incremental evaluation state when position remains open
+        if not exit_reason:
+            note_dict["running_sl"] = float(running_sl) if running_sl is not None else None
+            note_dict["best_favourable"] = float(best_favourable)
+            note_dict["worst_adverse"] = float(worst_adverse)
+            if bars:
+                last_b_time = bars[-1].get("bar_time")
+                note_dict["last_processed_bar_time"] = last_b_time.isoformat() if hasattr(last_b_time, "isoformat") else str(last_b_time)
+            try:
+                with self.engine.begin() as upd_conn:
+                    upd_conn.execute(
+                        text("""
+                            UPDATE shadow_execution_audits
+                            SET improvement_note = :note,
+                                stop_loss_price = :sl
+                            WHERE id = :id AND net_pnl IS NULL
+                        """),
+                        {
+                            "id": int(pos["id"]),
+                            "note": json.dumps(note_dict, default=str),
+                            "sl": float(running_sl) if running_sl is not None else None,
+                        }
+                    )
+            except Exception as e:
+                logger.debug(f"Incremental evaluation update failed for audit #{pos.get('id')}: {e}")
 
         # Position Telemetry Object
         unrealized_pnl = ((latest_price - entry) * quantity - fees) if side == "BUY" else ((entry - latest_price) * quantity - fees)
@@ -901,6 +1082,7 @@ class PositionManager:
             "status": "CLOSED" if exit_reason else "OPEN",
             "exit_reason": exit_reason,
             "exit_price": float(exit_price) if exit_price else None,
+            "stale_price": is_stale_price,
             "updated_at": watermark.isoformat(),
         }
 
@@ -943,7 +1125,8 @@ class PositionManager:
                                     """),
                                     params
                                 ).mappings().all()
-                            except Exception:
+                            except Exception as e:
+                                logger.debug(f"Query without reasoning_chain fallback: {e}")
                                 sib_rows = sib_conn.execute(
                                     text(f"""
                                         SELECT id, instrument_id, theoretical_fill_price, side, quantity, signal_at, improvement_note
@@ -965,7 +1148,8 @@ class PositionManager:
                                 elif isinstance(sib_note_raw, str):
                                     try:
                                         sib_note = json.loads(sib_note_raw)
-                                    except Exception:
+                                    except Exception as e:
+                                        logger.debug(f"Failed to parse sibling improvement_note: {e}")
                                         sib_note = {}
                                         # Regex recovery for truncated notes
                                         m_basket = re.search(r'"spread_basket_id":\s*"([^"]+)"', sib_note_raw)
@@ -985,8 +1169,8 @@ class PositionManager:
                                             sib_note["spread_basket_id"] = sib_rc_data.get("spread_basket_id") or sib_rc_data.get("strategy_group")
                                         if not sib_note.get("paired_primary_audit_id"):
                                             sib_note["paired_primary_audit_id"] = sib_rc_data.get("paired_primary_audit_id")
-                                    except Exception:
-                                        pass
+                                    except Exception as e:
+                                        logger.debug(f"Failed to parse sibling reasoning_chain: {e}")
 
                             # Strict exact membership verification:
                             matches_basket = bool(spread_basket_id and sib_note.get("spread_basket_id") == spread_basket_id)
@@ -1002,8 +1186,10 @@ class PositionManager:
                             if isinstance(sib_sig_at, str):
                                 try:
                                     sib_sig_at = datetime.fromisoformat(sib_sig_at)
-                                except Exception:
+                                except Exception as e:
+                                    logger.debug(f"Failed to parse sibling signal_at: {e}")
                                     sib_sig_at = None
+
                             if isinstance(sib_sig_at, datetime) and sib_sig_at.tzinfo is None:
                                 sib_sig_at = sib_sig_at.replace(tzinfo=timezone.utc)
                             pricing_wm = exit_bar_time or watermark
