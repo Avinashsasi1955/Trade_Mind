@@ -113,6 +113,20 @@ def _calculate_ema(values: List[float], period: int) -> List[float]:
     return res
 
 
+def _calculate_atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
+    """Calculate Average True Range on candle series."""
+    if len(closes) < 2:
+        return 1.0
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+        trs.append(tr)
+    if not trs:
+        return 1.0
+    p = min(period, len(trs))
+    return sum(trs[-p:]) / p
+
+
 def compute_reversal_score(
     bars_5m: List[Dict[str, Any]],
     side: str = "BUY",
@@ -128,15 +142,19 @@ def compute_reversal_score(
 
     Components:
     1. Structure break (BOS / CHoCH against position): 25 pts
-    2. Close back across VWAP or EMA9/EMA21 against position: 20 pts
+    2. Close back across VWAP or EMA9/EMA21 by >= 0.1 ATR against position: 20 pts
     3. Rejection wick (wick > 2x body) on above-average volume: 20 pts
-    4. RSI divergence / overbought rollover: 15 pts
+    4. RSI divergence / overbought rollover across swing pivots: 15 pts
     5. Multi-timeframe flip (15m trend against position): 10 pts
     6. Options IV/theta decay (premium falling while underlying stalls): 15 pts
     7. Index regime flip against trade: 10 pts
 
+    Safety Constraint:
+    Requires at least TWO independent active components to trigger an 'EXIT' action.
+    If score >= exit_threshold but only 1 component is active, action is downgraded to 'TIGHTEN'.
+
     Returns:
-        Dict with reversal_score, action ('EXIT', 'TIGHTEN', 'HOLD'), components, and reasons.
+        Dict with reversal_score, action ('EXIT', 'TIGHTEN', 'HOLD'), components, active_count, and reasons.
     """
     side_upper = str(side).upper()
     total_score = 0.0
@@ -148,6 +166,7 @@ def compute_reversal_score(
             "reversal_score": 0.0,
             "action": "HOLD",
             "components": {},
+            "active_count": 0,
             "reasons": ["insufficient_bars"],
         }
 
@@ -162,6 +181,7 @@ def compute_reversal_score(
     latest_high = highs[-1]
     latest_low = lows[-1]
     latest_vol = volumes[-1]
+    atr_5m = _calculate_atr(highs, lows, closes, 14)
 
     # 1. Structure Break (BOS / CHoCH against position) - 25 pts
     struct_active = False
@@ -200,7 +220,7 @@ def compute_reversal_score(
     components["structure_break"] = {"active": struct_active, "score": struct_pts, "detail": struct_desc}
     total_score += struct_pts
 
-    # 2. Close Back Across VWAP or EMA9/EMA21 - 20 pts
+    # 2. Close Back Across VWAP or EMA9/EMA21 (Tightened: >= 0.1 ATR beyond EMA) - 20 pts
     vwap_ema_active = False
     vwap_ema_pts = 0.0
     vwap_desc = []
@@ -216,12 +236,15 @@ def compute_reversal_score(
     if len(closes) >= 9:
         ema9 = _calculate_ema(closes, 9)[-1]
         ema21 = _calculate_ema(closes, 21 if len(closes) >= 21 else len(closes))[-1]
-        if side_upper == "BUY" and (latest_close < ema9 or ema9 < ema21):
-            vwap_ema_active = True
-            vwap_desc.append(f"bearish EMA9/21 cross or close below EMA9 ({latest_close:.2f} < {ema9:.2f})")
-        elif side_upper == "SELL" and (latest_close > ema9 or ema9 > ema21):
-            vwap_ema_active = True
-            vwap_desc.append(f"bullish EMA9/21 cross or close above EMA9 ({latest_close:.2f} > {ema9:.2f})")
+        atr_margin = 0.10 * atr_5m
+        if side_upper == "BUY":
+            if latest_close < (ema9 - atr_margin):
+                vwap_ema_active = True
+                vwap_desc.append(f"close {latest_close:.2f} < EMA9 - 0.1 ATR ({ema9 - atr_margin:.2f})")
+        elif side_upper == "SELL":
+            if latest_close > (ema9 + atr_margin):
+                vwap_ema_active = True
+                vwap_desc.append(f"close {latest_close:.2f} > EMA9 + 0.1 ATR ({ema9 + atr_margin:.2f})")
 
     if vwap_ema_active:
         vwap_ema_pts = 20.0
@@ -259,27 +282,43 @@ def compute_reversal_score(
     components["rejection_wick"] = {"active": wick_active, "score": wick_pts, "detail": wick_desc}
     total_score += wick_pts
 
-    # 4. RSI Divergence / Overbought Exhaustion - 15 pts
+    # 4. RSI Divergence Across Swing Pivots / Overbought Rollover (Tightened) - 15 pts
     rsi_active = False
     rsi_pts = 0.0
     rsi_desc = ""
     rsi_series = _calculate_rsi(closes)
-    if len(rsi_series) >= 2:
+    if len(rsi_series) >= 4:
         curr_rsi = rsi_series[-1]
-        prev_rsi = rsi_series[-2]
         if side_upper == "BUY":
-            # Bearish divergence or overbought rollover (RSI falling from > 70)
-            if (curr_rsi > 70.0 and curr_rsi < prev_rsi) or (curr_rsi < prev_rsi and latest_close > closes[-2]):
+            # Search for a prior swing high pivot in earlier candles
+            prior_high = max(highs[-15:-2]) if len(highs) >= 4 else highs[0]
+            prior_high_idx = highs.index(prior_high) if prior_high in highs else -3
+            prior_rsi = rsi_series[prior_high_idx] if prior_high_idx < len(rsi_series) else 50.0
+
+            if (latest_high >= prior_high and curr_rsi < (prior_rsi - 2.0)):
                 rsi_active = True
                 rsi_pts = 15.0
-                rsi_desc = f"RSI bearish divergence/rollover ({prev_rsi:.1f} -> {curr_rsi:.1f})"
+                rsi_desc = f"RSI swing divergence (price {latest_high:.2f} >= {prior_high:.2f}, RSI {curr_rsi:.1f} < {prior_rsi:.1f})"
+                reasons.append(rsi_desc)
+            elif curr_rsi < 68.0 and max(rsi_series[-4:-1]) >= 75.0:
+                rsi_active = True
+                rsi_pts = 15.0
+                rsi_desc = f"RSI overbought exhaustion rollover ({max(rsi_series[-4:-1]):.1f} -> {curr_rsi:.1f})"
                 reasons.append(rsi_desc)
         else:
-            # Bullish divergence or oversold rollover (RSI rising from < 30)
-            if (curr_rsi < 30.0 and curr_rsi > prev_rsi) or (curr_rsi > prev_rsi and latest_close < closes[-2]):
+            prior_low = min(lows[-15:-2]) if len(lows) >= 4 else lows[0]
+            prior_low_idx = lows.index(prior_low) if prior_low in lows else -3
+            prior_rsi = rsi_series[prior_low_idx] if prior_low_idx < len(rsi_series) else 50.0
+
+            if (latest_low <= prior_low and curr_rsi > (prior_rsi + 2.0)):
                 rsi_active = True
                 rsi_pts = 15.0
-                rsi_desc = f"RSI bullish divergence/bounce ({prev_rsi:.1f} -> {curr_rsi:.1f})"
+                rsi_desc = f"RSI swing divergence (price {latest_low:.2f} <= {prior_low:.2f}, RSI {curr_rsi:.1f} > {prior_rsi:.1f})"
+                reasons.append(rsi_desc)
+            elif curr_rsi > 32.0 and min(rsi_series[-4:-1]) <= 25.0:
+                rsi_active = True
+                rsi_pts = 15.0
+                rsi_desc = f"RSI oversold exhaustion bounce ({min(rsi_series[-4:-1]):.1f} -> {curr_rsi:.1f})"
                 reasons.append(rsi_desc)
 
     components["rsi_divergence"] = {"active": rsi_active, "score": rsi_pts, "detail": rsi_desc}
@@ -339,9 +378,15 @@ def compute_reversal_score(
     total_score += reg_pts
 
     final_score = min(100.0, round(total_score, 1))
+    active_count = sum(1 for c in components.values() if c.get("active", False))
 
+    # Safety: Require at least TWO independent active components to trigger EXIT
     if final_score >= exit_threshold:
-        action = "EXIT"
+        if active_count >= 2:
+            action = "EXIT"
+        else:
+            action = "TIGHTEN"
+            reasons.append("exit downgraded to tighten (requires >= 2 independent components)")
     elif final_score >= tighten_threshold:
         action = "TIGHTEN"
     else:
@@ -351,5 +396,6 @@ def compute_reversal_score(
         "reversal_score": final_score,
         "action": action,
         "components": components,
+        "active_count": active_count,
         "reasons": reasons,
     }

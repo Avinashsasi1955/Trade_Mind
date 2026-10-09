@@ -399,21 +399,15 @@ def run_profit_harvest_ab_replay(
     """A/B Counterfactual Replay comparing Baseline execution (Arm A) vs Profit-Harvest (Arm B).
 
     For each trade:
-    - Arm A (Baseline): Realized R under standard exit rules (SL, TP, trailing, EOD).
-    - Arm B (Harvest): Counterfactual execution with Profit-Harvest enabled:
-        - When favorable progress >= harvest_trigger (default 0.83, i.e. 1.25R of 1.5R):
-            - If reversal_score >= exit_threshold (70.0): market exit at reversal candle.
-            - If reversal_score >= tighten_threshold (40.0): tighten stop to lock lock_fraction (0.65) of open profit.
-            - Else: continue baseline trailing.
-
-    Computes delta R (Arm B - Arm A) and 95% bootstrap confidence interval.
+    - Arm A (Baseline): Realized R under standard PositionManager exit rules (flag OFF).
+    - Arm B (Harvest): Realized R under PositionManager exit rules with profit harvest enabled (flag ON).
+    - Replays real 1m/5m price bars from entry to exit using replay_trade_walk_forward.
+    - Computes max favorable price from price bars, not exit price.
+    - Applies fees and 2-tick slippage.
+    - Computes delta R (Arm B - Arm A) and 95% bootstrap confidence interval.
     """
     import random
-    from backend.profit_harvest import (
-        calculate_progress,
-        calculate_harvest_stop,
-        compute_reversal_score,
-    )
+    from backend.position_manager import replay_trade_walk_forward
 
     trade_samples: List[Dict[str, Any]] = []
 
@@ -424,23 +418,32 @@ def run_profit_harvest_ab_replay(
             with engine.connect() as conn:
                 params: Dict[str, Any] = {}
                 date_filter = ""
+                dialect = getattr(getattr(engine, "dialect", None), "name", "")
                 if start_date:
-                    date_filter += " AND (a.signal_at AT TIME ZONE 'Asia/Kolkata')::date >= :start_d"
-                    params["start_d"] = start_date
+                    if dialect == "sqlite":
+                        date_filter += " AND date(a.signal_at) >= date(:start_d)"
+                    else:
+                        date_filter += " AND (a.signal_at AT TIME ZONE 'Asia/Kolkata')::date >= :start_d"
+                    params["start_d"] = start_date.isoformat() if dialect == "sqlite" else start_date
                 if end_date:
-                    date_filter += " AND (a.signal_at AT TIME ZONE 'Asia/Kolkata')::date <= :end_d"
-                    params["end_d"] = end_date
+                    if dialect == "sqlite":
+                        date_filter += " AND date(a.signal_at) <= date(:end_d)"
+                    else:
+                        date_filter += " AND (a.signal_at AT TIME ZONE 'Asia/Kolkata')::date <= :end_d"
+                    params["end_d"] = end_date.isoformat() if dialect == "sqlite" else end_date
 
                 query = text(f"""
-                    SELECT a.id, a.instrument_id, a.side, a.signal_at, a.closed_at,
+                    SELECT a.id, a.instrument_id, a.side, a.signal_at, a.exit_at,
                            a.stop_loss_price, a.take_profit_price,
-                           a.theoretical_fill_price, a.theoretical_exit_price,
-                           a.exit_reason, a.improvement_note, i.symbol
+                           a.theoretical_fill_price, a.realised_exit_price,
+                           a.exit_reason, a.improvement_note,
+                           COALESCE(a.trade_mode, 'INTRADAY') AS trade_mode,
+                           a.quantity, a.estimated_fees, i.symbol
                     FROM shadow_execution_audits a
                     JOIN instrument_master i ON i.id = a.instrument_id
                     WHERE a.net_pnl IS NOT NULL
                       AND a.theoretical_fill_price IS NOT NULL
-                      AND a.theoretical_exit_price IS NOT NULL
+                      AND a.realised_exit_price IS NOT NULL
                       {date_filter}
                     ORDER BY a.signal_at ASC
                 """)
@@ -452,19 +455,43 @@ def run_profit_harvest_ab_replay(
                             note = json.loads(r["improvement_note"]) if isinstance(r["improvement_note"], str) else r["improvement_note"]
                         except Exception:
                             note = {}
+
+                    trade_bars = []
+                    if r.get("instrument_id") and r.get("signal_at") and r.get("exit_at"):
+                        b_rows = conn.execute(
+                            text("""
+                                SELECT bar_time, open_price, high_price, low_price, close_price, volume
+                                FROM live_market_bars
+                                WHERE instrument_id = :inst_id
+                                  AND interval IN ('1minute', '1m', '5minute', '5m')
+                                  AND bar_time >= :sig_at AND bar_time <= :ex_at
+                                ORDER BY bar_time ASC
+                            """),
+                            {"inst_id": r["instrument_id"], "sig_at": r["signal_at"], "ex_at": r["exit_at"]}
+                        ).mappings().all()
+                        trade_bars = [dict(b) for b in b_rows]
+
                     trade_samples.append({
                         "id": r["id"],
                         "symbol": r["symbol"],
                         "side": r["side"],
                         "entry": float(r["theoretical_fill_price"]),
+                        "theoretical_fill_price": float(r["theoretical_fill_price"]),
                         "initial_sl": float(r["stop_loss_price"] or 0.0),
+                        "stop_loss_price": float(r["stop_loss_price"] or 0.0),
                         "target_price": float(r["take_profit_price"] or 0.0),
-                        "exit_price": float(r["theoretical_exit_price"]),
+                        "take_profit_price": float(r["take_profit_price"] or 0.0),
+                        "exit_price": float(r["realised_exit_price"]),
+                        "realised_exit_price": float(r["realised_exit_price"]),
                         "exit_reason": r.get("exit_reason"),
                         "instrument_id": r.get("instrument_id"),
                         "signal_at": r.get("signal_at"),
-                        "closed_at": r.get("closed_at"),
+                        "exit_at": r.get("exit_at"),
+                        "trade_mode": r.get("trade_mode"),
+                        "quantity": int(r.get("quantity") or 1),
+                        "estimated_fees": float(r.get("estimated_fees") or 0.0),
                         "note": note,
+                        "bars": trade_bars,
                     })
         except Exception as err:
             logger.warning("Failed to fetch historical shadow trades for A/B replay: %s", err)
@@ -496,17 +523,15 @@ def run_profit_harvest_ab_replay(
     eval_records: List[Dict[str, Any]] = []
 
     for t in trade_samples:
-        entry = float(t.get("entry") or 0.0)
-        sl = float(t.get("initial_sl") or 0.0)
+        entry = float(t.get("theoretical_fill_price") or t.get("entry") or 0.0)
+        sl = float(t.get("stop_loss_price") or t.get("initial_sl") or 0.0)
         side = str(t.get("side") or "BUY").upper()
-        baseline_exit = float(t.get("exit_price") or entry)
+        target = float(t.get("take_profit_price") or t.get("target_price") or 0.0)
 
         r_points = abs(entry - sl)
         if r_points <= 1e-4:
-            # Fallback 1% risk if missing stop
             r_points = max(1.0, entry * 0.01)
 
-        target = float(t.get("target_price") or 0.0)
         if target <= 0.0:
             target = entry + (1.5 * r_points) if side == "BUY" else entry - (1.5 * r_points)
 
@@ -514,55 +539,48 @@ def run_profit_harvest_ab_replay(
         if target_dist <= 1e-4:
             continue
 
-        baseline_r = (baseline_exit - entry) / r_points if side == "BUY" else (entry - baseline_exit) / r_points
+        bars = t.get("bars") or []
+        if not bars:
+            exit_p = float(t.get("realised_exit_price") or t.get("exit_price") or entry)
+            max_fav = float(t.get("max_favorable_price") or (exit_p if (exit_p > entry if side == "BUY" else exit_p < entry) else entry))
+            bars = [
+                {"open": entry, "high": max(entry, max_fav), "low": min(entry, max_fav), "close": entry},
+                {"open": entry, "high": max(entry, max_fav), "low": min(entry, max_fav), "close": max_fav},
+                {"open": max_fav, "high": max(entry, exit_p, max_fav), "low": min(entry, exit_p, max_fav), "close": exit_p},
+            ]
 
-        # Determine favorable move achieved
-        max_favorable = float(t.get("max_favorable_price") or (
-            baseline_exit if (baseline_exit > entry if side == "BUY" else baseline_exit < entry) else entry
-        ))
-        favorable_dist = (max_favorable - entry) if side == "BUY" else (entry - max_favorable)
-        max_progress = favorable_dist / target_dist if target_dist > 0 else 0.0
+        # Compute max favorable price directly from bars
+        if side == "BUY":
+            max_favorable = max(float(b.get("high_price") if b.get("high_price") is not None else b.get("high", entry)) for b in bars)
+            fav_dist = max_favorable - entry
+        else:
+            max_favorable = min(float(b.get("low_price") if b.get("low_price") is not None else b.get("low", entry)) for b in bars)
+            fav_dist = entry - max_favorable
 
-        # Evaluate Harvest arm
-        harvest_r = baseline_r
-        harvest_action = "NONE"
-        harvest_exit_price = baseline_exit
-
-        bars = t.get("bars")
-        rev_score = float(t.get("reversal_score") or 0.0)
-
-        if max_progress >= harvest_trigger:
+        max_prog = fav_dist / target_dist if target_dist > 0 else 0.0
+        if max_prog >= harvest_trigger:
             harvest_triggered_count += 1
 
-            # If explicit bars provided, compute reversal score
-            if bars and len(bars) >= 3 and rev_score == 0.0:
-                rev_res = compute_reversal_score(
-                    bars_5m=bars,
-                    side=side,
-                    exit_threshold=exit_threshold,
-                    tighten_threshold=tighten_threshold,
-                )
-                rev_score = rev_res["reversal_score"]
+        # Walk bars forward with REAL PositionManager exit rules
+        res_a = replay_trade_walk_forward(
+            trade=t,
+            bars=bars,
+            harvest_enabled=False,
+        )
+        res_b = replay_trade_walk_forward(
+            trade=t,
+            bars=bars,
+            harvest_enabled=True,
+            harvest_trigger=harvest_trigger,
+            exit_threshold=exit_threshold,
+            tighten_threshold=tighten_threshold,
+            lock_fraction=lock_fraction,
+        )
 
-            if rev_score >= exit_threshold:
-                harvest_action = "EXIT"
-                harvest_exit_price = float(t.get("reversal_price") or max_favorable)
-                harvest_r = (harvest_exit_price - entry) / r_points if side == "BUY" else (entry - harvest_exit_price) / r_points
-            elif rev_score >= tighten_threshold:
-                harvest_action = "TIGHTEN"
-                tightened_sl = entry + (lock_fraction * (max_favorable - entry)) if side == "BUY" else entry - (lock_fraction * (entry - max_favorable))
-                # Check if baseline pulled back below tightened stop
-                pulled_back = baseline_exit < tightened_sl if side == "BUY" else baseline_exit > tightened_sl
-                if pulled_back:
-                    harvest_exit_price = tightened_sl
-                    harvest_r = (tightened_sl - entry) / r_points if side == "BUY" else (entry - tightened_sl) / r_points
-                else:
-                    harvest_r = baseline_r
-            else:
-                harvest_action = "HOLD"
-                harvest_r = baseline_r
+        baseline_r = res_a["realized_r"]
+        harvest_r = res_b["realized_r"]
+        delta_r = round(harvest_r - baseline_r, 4)
 
-        delta_r = harvest_r - baseline_r
         baseline_rs.append(baseline_r)
         harvest_rs.append(harvest_r)
         deltas.append(delta_r)
@@ -578,14 +596,15 @@ def run_profit_harvest_ab_replay(
             "symbol": t.get("symbol"),
             "side": side,
             "entry": round(entry, 2),
-            "baseline_exit": round(baseline_exit, 2),
-            "harvest_exit": round(harvest_exit_price, 2),
-            "baseline_r": round(baseline_r, 3),
-            "harvest_r": round(harvest_r, 3),
-            "delta_r": round(delta_r, 3),
-            "progress": round(max_progress, 3),
-            "reversal_score": round(rev_score, 1),
-            "harvest_action": harvest_action,
+            "baseline_exit": round(res_a["exit_price"], 2),
+            "harvest_exit": round(res_b["exit_price"], 2),
+            "baseline_reason": res_a["exit_reason"],
+            "harvest_reason": res_b["exit_reason"],
+            "baseline_r": baseline_r,
+            "harvest_r": harvest_r,
+            "delta_r": delta_r,
+            "progress": round(max_prog, 3),
+            "max_favorable": round(max_favorable, 2),
         })
 
     N = len(deltas)

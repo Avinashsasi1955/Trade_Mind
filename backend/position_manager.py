@@ -20,7 +20,7 @@ import logging
 import os
 import re
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -243,9 +243,15 @@ class PositionManager:
         self.harvest_exit_threshold = float(os.getenv("NIVESH_HARVEST_EXIT_THRESHOLD", str(HARVEST_EXIT_THRESHOLD)))
         self.harvest_tighten_threshold = float(os.getenv("NIVESH_HARVEST_TIGHTEN_THRESHOLD", str(HARVEST_TIGHTEN_THRESHOLD)))
         self.harvest_lock_fraction = float(os.getenv("NIVESH_HARVEST_LOCK_FRACTION", str(HARVEST_LOCK_FRACTION)))
+        self._harvest_cache: Dict[Tuple[int, datetime], Dict[str, Any]] = {}
 
     def _get_recent_5m_bars(self, instrument_id: int, watermark: datetime, limit: int = 20) -> List[Dict[str, Any]]:
-        """Fetch or derive recent 5m bars for instrument up to watermark."""
+        """Fetch or derive recent CLOSED 5m bars for instrument up to watermark.
+
+        Drops in-progress candles: a 5m bar starting at bar_time is only closed when
+        watermark >= bar_time + 5 minutes.
+        """
+        closed_cutoff = watermark - timedelta(minutes=5)
         try:
             with self.engine.connect() as conn:
                 rows = conn.execute(
@@ -258,7 +264,7 @@ class PositionManager:
                         ORDER BY bar_time DESC
                         LIMIT :limit
                     """),
-                    {"inst_id": instrument_id, "wm": watermark, "limit": limit}
+                    {"inst_id": instrument_id, "wm": closed_cutoff, "limit": limit}
                 ).mappings().all()
                 if rows and len(rows) >= 3:
                     return [
@@ -302,9 +308,12 @@ class PositionManager:
                     current_bucket = None
                     for b in bars_1m:
                         b_time = b["bar_time"]
+                        if isinstance(b_time, str):
+                            b_time = datetime.fromisoformat(b_time)
                         bucket_time = b_time.replace(minute=(b_time.minute // 5) * 5, second=0, microsecond=0)
                         if not current_bucket or current_bucket["bar_time"] != bucket_time:
-                            if current_bucket:
+                            # Only append previously completed bucket if fully closed
+                            if current_bucket and (current_bucket["bar_time"] + timedelta(minutes=5) <= watermark):
                                 bars_5m.append(current_bucket)
                             current_bucket = {
                                 "open": b["open"],
@@ -319,12 +328,143 @@ class PositionManager:
                             current_bucket["low"] = min(current_bucket["low"], b["low"])
                             current_bucket["close"] = b["close"]
                             current_bucket["volume"] += b["volume"]
-                    if current_bucket:
+                    # Check if final bucket is closed
+                    if current_bucket and (current_bucket["bar_time"] + timedelta(minutes=5) <= watermark):
                         bars_5m.append(current_bucket)
                     return bars_5m[-limit:]
         except Exception as e:
             logger.debug(f"Failed to fetch 5m bars for instrument #{instrument_id}: {e}")
         return []
+
+    def _get_recent_15m_bars(self, instrument_id: int, watermark: datetime, limit: int = 10) -> List[Dict[str, Any]]:
+        """Fetch or derive recent CLOSED 15m bars up to watermark."""
+        closed_15m_cutoff = watermark - timedelta(minutes=15)
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text("""
+                        SELECT open_price, high_price, low_price, close_price, volume, bar_time
+                        FROM live_market_bars
+                        WHERE instrument_id = :inst_id
+                          AND interval IN ('15minute', '15m')
+                          AND bar_time <= :wm
+                        ORDER BY bar_time DESC
+                        LIMIT :limit
+                    """),
+                    {"inst_id": instrument_id, "wm": closed_15m_cutoff, "limit": limit}
+                ).mappings().all()
+                if rows and len(rows) >= 3:
+                    return [
+                        {
+                            "open": float(r["open_price"]),
+                            "high": float(r["high_price"]),
+                            "low": float(r["low_price"]),
+                            "close": float(r["close_price"]),
+                            "volume": float(r["volume"] or 0),
+                            "bar_time": r["bar_time"],
+                        }
+                        for r in reversed(rows)
+                    ]
+        except Exception:
+            pass
+
+        # Derive from closed 5m bars
+        bars_5m = self._get_recent_5m_bars(instrument_id, watermark, limit=limit * 3)
+        if not bars_5m:
+            return []
+        bars_15m = []
+        current_bucket = None
+        for b in bars_5m:
+            b_time = b.get("bar_time") or watermark
+            if isinstance(b_time, str):
+                b_time = datetime.fromisoformat(b_time)
+            bucket_time = b_time.replace(minute=(b_time.minute // 15) * 15, second=0, microsecond=0)
+            if not current_bucket or current_bucket["bar_time"] != bucket_time:
+                if current_bucket and (current_bucket["bar_time"] + timedelta(minutes=15) <= watermark):
+                    bars_15m.append(current_bucket)
+                current_bucket = {
+                    "open": b["open"],
+                    "high": b["high"],
+                    "low": b["low"],
+                    "close": b["close"],
+                    "volume": b["volume"],
+                    "bar_time": bucket_time,
+                }
+            else:
+                current_bucket["high"] = max(current_bucket["high"], b["high"])
+                current_bucket["low"] = min(current_bucket["low"], b["low"])
+                current_bucket["close"] = b["close"]
+                current_bucket["volume"] += b["volume"]
+        if current_bucket and (current_bucket["bar_time"] + timedelta(minutes=15) <= watermark):
+            bars_15m.append(current_bucket)
+        return bars_15m[-limit:]
+
+    def _get_session_vwap(self, instrument_id: int, watermark: datetime) -> Optional[float]:
+        """Compute session VWAP from the day's 1m bars from 09:15 IST up to watermark."""
+        try:
+            wm_ist = watermark.astimezone(IST) if getattr(watermark, "tzinfo", None) else watermark.replace(tzinfo=timezone.utc).astimezone(IST)
+            sess_start_ist = datetime.combine(wm_ist.date(), dt_time(9, 15), tzinfo=IST)
+            sess_start_utc = sess_start_ist.astimezone(timezone.utc)
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text("""
+                        SELECT high_price, low_price, close_price, volume
+                        FROM live_market_bars
+                        WHERE instrument_id = :inst_id
+                          AND interval IN ('1minute', '1m')
+                          AND bar_time >= :start_time AND bar_time <= :wm
+                        ORDER BY bar_time ASC
+                    """),
+                    {"inst_id": instrument_id, "start_time": sess_start_utc, "wm": watermark}
+                ).mappings().all()
+                if not rows:
+                    return None
+                total_vp = 0.0
+                total_vol = 0.0
+                for r in rows:
+                    v = float(r["volume"] or 0.0)
+                    if v <= 0:
+                        continue
+                    typ_p = (float(r["high_price"]) + float(r["low_price"]) + float(r["close_price"])) / 3.0
+                    total_vp += typ_p * v
+                    total_vol += v
+                if total_vol > 0:
+                    return round(total_vp / total_vol, 4)
+        except Exception as e:
+            logger.debug(f"Failed to compute session VWAP for #{instrument_id}: {e}")
+        return None
+
+    def _get_index_regime_against(self, side: str, watermark: datetime) -> bool:
+        """Check whether benchmark index (NIFTY 50) closed 5m candle is flipped against position."""
+        try:
+            with self.engine.connect() as conn:
+                idx_id = conn.execute(
+                    text("""
+                        SELECT id FROM instrument_master 
+                        WHERE symbol IN ('NIFTY', 'NIFTY 50', 'NIFTY 50 INDEX') 
+                           OR underlying_symbol IN ('NIFTY', 'NIFTY 50')
+                        ORDER BY id ASC LIMIT 1
+                    """)
+                ).scalar_one_or_none()
+                if not idx_id:
+                    return False
+                bars_5m = self._get_recent_5m_bars(idx_id, watermark, limit=10)
+                if not bars_5m or len(bars_5m) < 3:
+                    return False
+                closes = [b["close"] for b in bars_5m]
+                alpha = 2.0 / (9.0 + 1.0)
+                ema9 = closes[0]
+                for c in closes[1:]:
+                    ema9 = c * alpha + ema9 * (1.0 - alpha)
+
+                side_upper = str(side).upper()
+                if side_upper == "BUY" and closes[-1] < ema9:
+                    return True
+                elif side_upper == "SELL" and closes[-1] > ema9:
+                    return True
+        except Exception as e:
+            logger.debug(f"Failed to check index regime: {e}")
+        return False
 
     def _get_recent_underlying_bars(self, symbol: str, watermark: datetime, limit: int = 20) -> List[Dict[str, Any]]:
         """Fetch underlying equity bars for an option contract."""
@@ -1120,44 +1260,66 @@ class PositionManager:
                 # Profit-Harvest Layer (Phase 2): Target 1.5R, Progress >= 0.83, Reversal Analysis
                 harvest_stop_price = None
                 harvest_exit_requested = False
-                if take_profit is not None:
+                if self.profit_harvest_enabled and take_profit is not None:
                     target_progress = calculate_progress(side, entry, latest_price, take_profit)
+
+                    # 50% target progress breakeven stop ONLY when profit_harvest_enabled is True!
                     if target_progress >= 0.50 and breakeven_price is None:
                         breakeven_price = (entry + fee_buffer_per_share) if side == "BUY" else (entry - fee_buffer_per_share)
 
                     if target_progress >= self.harvest_trigger:
-                        bars_5m = self._get_recent_5m_bars(pos["instrument_id"], watermark, limit=20)
-                        is_option = str(pos.get("option_type") or "").upper() in ("CE", "PE", "CALL", "PUT") or (" " in str(pos.get("symbol", "")))
-                        und_bars = self._get_recent_underlying_bars(pos["symbol"], watermark, limit=20) if is_option else None
+                        # Cache key per closed 5m candle
+                        wm_utc = watermark.astimezone(timezone.utc) if getattr(watermark, "tzinfo", None) else watermark.replace(tzinfo=timezone.utc)
+                        closed_5m_t = (wm_utc - timedelta(minutes=5)).replace(second=0, microsecond=0)
+                        closed_5m_t = closed_5m_t.replace(minute=(closed_5m_t.minute // 5) * 5)
+                        cache_key = (int(pos["instrument_id"]), closed_5m_t)
 
-                        harvest_res = compute_reversal_score(
-                            bars_5m=bars_5m,
-                            side=side,
-                            vwap=float(pos.get("vwap") or 0.0) if pos.get("vwap") else None,
-                            is_option=is_option,
-                            underlying_bars=und_bars,
-                            exit_threshold=self.harvest_exit_threshold,
-                            tighten_threshold=self.harvest_tighten_threshold,
-                        )
+                        if not hasattr(self, "_harvest_cache") or self._harvest_cache is None:
+                            self._harvest_cache = {}
+                        harvest_res = self._harvest_cache.get(cache_key)
+                        if harvest_res is None:
+                            bars_5m = self._get_recent_5m_bars(pos["instrument_id"], watermark, limit=20)
+                            bars_15m = self._get_recent_15m_bars(pos["instrument_id"], watermark, limit=10)
+                            sess_vwap = self._get_session_vwap(pos["instrument_id"], watermark)
+                            is_option = str(pos.get("option_type") or "").upper() in ("CE", "PE", "CALL", "PUT") or (" " in str(pos.get("symbol", "")))
+                            und_bars = self._get_recent_underlying_bars(pos["symbol"], watermark, limit=20) if is_option else None
+                            idx_regime = self._get_index_regime_against(side, watermark)
+
+                            harvest_res = compute_reversal_score(
+                                bars_5m=bars_5m,
+                                side=side,
+                                bars_15m=bars_15m,
+                                vwap=sess_vwap or (float(pos.get("vwap") or 0.0) if pos.get("vwap") else None),
+                                is_option=is_option,
+                                underlying_bars=und_bars,
+                                index_regime_against=idx_regime,
+                                exit_threshold=self.harvest_exit_threshold,
+                                tighten_threshold=self.harvest_tighten_threshold,
+                            )
+                            if len(self._harvest_cache) > 200:
+                                self._harvest_cache.clear()
+                            self._harvest_cache[cache_key] = harvest_res
+
                         note_dict["profit_harvest"] = {
                             "progress": round(target_progress, 4),
                             "reversal_score": harvest_res["reversal_score"],
                             "action": harvest_res["action"],
+                            "active_count": harvest_res.get("active_count", 0),
                             "reasons": harvest_res["reasons"],
-                            "enabled": self.profit_harvest_enabled,
+                            "enabled": True,
+                            "evaluated_at": watermark.isoformat(),
                         }
 
-                        if self.profit_harvest_enabled:
-                            if harvest_res["action"] == "EXIT":
-                                harvest_exit_requested = True
-                            elif harvest_res["action"] == "TIGHTEN":
-                                harvest_stop_price = calculate_harvest_stop(
-                                    side=side,
-                                    entry_price=entry,
-                                    latest_price=latest_price,
-                                    current_sl=running_sl,
-                                    lock_fraction=self.harvest_lock_fraction,
-                                )
+                        if harvest_res["action"] == "EXIT":
+                            harvest_exit_requested = True
+                        elif harvest_res["action"] == "TIGHTEN":
+                            harvest_stop_price = calculate_harvest_stop(
+                                side=side,
+                                entry_price=entry,
+                                latest_price=latest_price,
+                                current_sl=running_sl,
+                                lock_fraction=self.harvest_lock_fraction,
+                            )
 
                 trailing_stop_price = None
                 if favorable_r >= self.trailing_trigger_r:
@@ -1614,3 +1776,230 @@ class PositionManager:
                 logger.error(f"Error in PositionManager loop: {exc}", exc_info=True)
             elapsed = time.time() - start
             time.sleep(max(0.05, interval_seconds - elapsed))
+
+
+def replay_trade_walk_forward(
+    trade: Dict[str, Any],
+    bars: List[Dict[str, Any]],
+    harvest_enabled: bool = False,
+    harvest_trigger: float = 0.83,
+    exit_threshold: float = 70.0,
+    tighten_threshold: float = 40.0,
+    lock_fraction: float = 0.65,
+    breakeven_trigger_r: float = 1.10,
+    profit_lock_trigger_r: float = 1.60,
+    profit_lock_guaranteed_r: float = 1.00,
+    trailing_trigger_r: float = 1.50,
+    trailing_giveback_r: float = 0.40,
+    tick_size: float = 0.05,
+    bars_15m: Optional[List[Dict[str, Any]]] = None,
+    vwap: Optional[float] = None,
+    index_regime_against: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Pure walk-forward replay executing real PositionManager exit rules across bar series.
+
+    Applies:
+    - Real PositionManager trailing stops, profit locks, breakeven stops, take profits, and stop losses.
+    - If harvest_enabled=True: 50% target progress breakeven, harvest trigger reversal evaluation (exit/tighten).
+    - If harvest_enabled=False: byte-for-byte baseline exit logic (no 50% breakeven, no harvest stops).
+    - Real fees and slippage (2 ticks).
+    """
+    if not bars:
+        entry_val = float(trade.get("theoretical_fill_price") or trade.get("entry") or 0.0)
+        exit_val = float(trade.get("realised_exit_price") or trade.get("exit_price") or entry_val)
+        sl_val = float(trade.get("stop_loss_price") or trade.get("initial_sl") or (entry_val * 0.99))
+        r_dist = abs(entry_val - sl_val) or 1.0
+        side_u = str(trade.get("side") or "BUY").upper()
+        rel_r = (exit_val - entry_val) / r_dist if side_u == "BUY" else (entry_val - exit_val) / r_dist
+        return {
+            "exit_price": exit_val,
+            "exit_reason": trade.get("exit_reason") or "NO_BARS",
+            "net_pnl": 0.0,
+            "realized_r": round(rel_r, 4),
+            "max_favorable": exit_val,
+        }
+
+    entry = Decimal(str(trade.get("theoretical_fill_price") or trade.get("entry") or 0.0))
+    initial_sl = Decimal(str(trade["stop_loss_price"])) if trade.get("stop_loss_price") else (
+        Decimal(str(trade["initial_sl"])) if trade.get("initial_sl") else None
+    )
+    take_profit = Decimal(str(trade["take_profit_price"])) if trade.get("take_profit_price") else (
+        Decimal(str(trade["target_price"])) if trade.get("target_price") else None
+    )
+    side = str(trade.get("side") or "BUY").upper()
+    quantity = Decimal(str(trade.get("quantity") or 1))
+    fees = Decimal(str(trade.get("estimated_fees") or 0))
+
+    fallback_risk = max(Decimal("0.50"), entry * Decimal("0.006"))
+    if side == "BUY":
+        r_points = (entry - initial_sl) if (initial_sl and entry > initial_sl) else fallback_risk
+    else:
+        r_points = (initial_sl - entry) if (initial_sl and initial_sl > entry) else fallback_risk
+    r_points = max(Decimal("0.05"), r_points)
+
+    target_dist = abs(take_profit - entry) if take_profit else (r_points * Decimal("1.5"))
+    fee_buffer = ((fees * Decimal("2.5")) + (Decimal("2") * Decimal(str(tick_size)) * quantity)) / max(Decimal("1"), quantity)
+
+    running_sl = initial_sl
+    best_favourable = entry
+    exit_price: Optional[Decimal] = None
+    exit_reason: Optional[str] = None
+    harvest_stop: Optional[Decimal] = None
+
+    # Track 5m closed candles for reversal analysis
+    closed_5m_bars: List[Dict[str, Any]] = []
+
+    for b in bars:
+        b_open = Decimal(str(b.get("open_price") if b.get("open_price") is not None else b.get("open", entry)))
+        b_high = Decimal(str(b.get("high_price") if b.get("high_price") is not None else b.get("high", entry)))
+        b_low = Decimal(str(b.get("low_price") if b.get("low_price") is not None else b.get("low", entry)))
+        b_close = Decimal(str(b.get("close_price") if b.get("close_price") is not None else b.get("close", entry)))
+        b_vol = float(b.get("volume") or 0)
+        b_time = b.get("bar_time")
+
+        # Update favorable excursion
+        if side == "BUY":
+            best_favourable = max(best_favourable, b_high)
+            favorable_r = (best_favourable - entry) / r_points
+        else:
+            best_favourable = min(best_favourable, b_low)
+            favorable_r = (entry - best_favourable) / r_points
+
+        profit_lock_price = None
+        if favorable_r >= Decimal(str(profit_lock_trigger_r)):
+            profit_lock_price = (entry + Decimal(str(profit_lock_guaranteed_r)) * r_points) if side == "BUY" else (entry - Decimal(str(profit_lock_guaranteed_r)) * r_points)
+
+        breakeven_price = None
+        if favorable_r >= Decimal(str(breakeven_trigger_r)):
+            breakeven_price = (entry + fee_buffer) if side == "BUY" else (entry - fee_buffer)
+
+        trailing_stop_price = None
+        if favorable_r >= Decimal(str(trailing_trigger_r)):
+            trailing_stop_price = (best_favourable - Decimal(str(trailing_giveback_r)) * r_points) if side == "BUY" else (best_favourable + Decimal(str(trailing_giveback_r)) * r_points)
+
+        # Accumulate 5m candle
+        closed_5m_bars.append({
+            "open": float(b_open),
+            "high": float(b_high),
+            "low": float(b_low),
+            "close": float(b_close),
+            "volume": b_vol,
+            "bar_time": b_time,
+        })
+
+        # Profit-Harvest Layer (Only active when harvest_enabled is True)
+        if harvest_enabled and take_profit is not None:
+            prog = float((b_close - entry) / target_dist) if side == "BUY" else float((entry - b_close) / target_dist)
+            best_prog = float((best_favourable - entry) / target_dist) if side == "BUY" else float((entry - best_favourable) / target_dist)
+
+            if (prog >= 0.50 or best_prog >= 0.50) and breakeven_price is None:
+                breakeven_price = (entry + fee_buffer) if side == "BUY" else (entry - fee_buffer)
+
+            if prog >= harvest_trigger or best_prog >= harvest_trigger:
+                if len(closed_5m_bars) >= 3:
+                    calc_vwap = vwap
+                    if calc_vwap is None:
+                        tot_v = sum(float(x.get("volume") or 1) for x in closed_5m_bars)
+                        tot_pv = sum(float(x.get("close") or entry) * float(x.get("volume") or 1) for x in closed_5m_bars)
+                        calc_vwap = (tot_pv / tot_v) if tot_v > 0 else float(entry)
+
+                    rev_res = compute_reversal_score(
+                        bars_5m=closed_5m_bars[-20:],
+                        side=side,
+                        bars_15m=bars_15m,
+                        vwap=calc_vwap,
+                        index_regime_against=index_regime_against or False,
+                        exit_threshold=exit_threshold,
+                        tighten_threshold=tighten_threshold,
+                    )
+                    if rev_res["action"] == "EXIT":
+                        exit_price = b_close
+                        exit_reason = "PROFIT_HARVEST_REVERSAL_EXIT"
+                        break
+                    elif rev_res["action"] == "TIGHTEN":
+                        harvest_stop = calculate_harvest_stop(
+                            side=side,
+                            entry_price=entry,
+                            latest_price=b_close,
+                            current_sl=running_sl,
+                            lock_fraction=lock_fraction,
+                        )
+
+        # Ratchet trailing stop loss
+        candidates = [p for p in (running_sl, profit_lock_price, breakeven_price, trailing_stop_price, harvest_stop if harvest_enabled else None) if p is not None]
+        if candidates:
+            trailed_sl = max(candidates) if side == "BUY" else min(candidates)
+            if side == "BUY":
+                running_sl = max(running_sl, trailed_sl) if running_sl else trailed_sl
+            else:
+                running_sl = min(running_sl, trailed_sl) if running_sl else trailed_sl
+
+        # Check stops and targets execution on current bar
+        if side == "BUY":
+            if running_sl and b_open <= running_sl:
+                exit_price = b_open
+                exit_reason = "GAP_DOWN_STOP"
+                break
+            elif running_sl and b_low <= running_sl:
+                exit_price = running_sl
+                if harvest_stop and running_sl == harvest_stop:
+                    exit_reason = "PROFIT_HARVEST_STOP"
+                elif profit_lock_price and running_sl >= profit_lock_price:
+                    exit_reason = "TRAILING_STOP"
+                elif breakeven_price and running_sl >= breakeven_price:
+                    exit_reason = "BREAKEVEN_STOP"
+                else:
+                    exit_reason = "STOP_LOSS"
+                break
+            elif take_profit and b_open >= take_profit:
+                exit_price = b_open
+                exit_reason = "TAKE_PROFIT"
+                break
+            elif take_profit and b_high >= take_profit:
+                exit_price = take_profit
+                exit_reason = "TAKE_PROFIT"
+                break
+        else:  # SELL
+            if running_sl and b_open >= running_sl:
+                exit_price = b_open
+                exit_reason = "GAP_UP_STOP"
+                break
+            elif running_sl and b_high >= running_sl:
+                exit_price = running_sl
+                if harvest_stop and running_sl == harvest_stop:
+                    exit_reason = "PROFIT_HARVEST_STOP"
+                elif profit_lock_price and running_sl <= profit_lock_price:
+                    exit_reason = "TRAILING_STOP"
+                elif breakeven_price and running_sl <= breakeven_price:
+                    exit_reason = "BREAKEVEN_STOP"
+                else:
+                    exit_reason = "STOP_LOSS"
+                break
+            elif take_profit and b_open <= take_profit:
+                exit_price = b_open
+                exit_reason = "TAKE_PROFIT"
+                break
+            elif take_profit and b_low <= take_profit:
+                exit_price = take_profit
+                exit_reason = "TAKE_PROFIT"
+                break
+
+    if exit_price is None:
+        last_b = bars[-1]
+        exit_price = Decimal(str(trade.get("realised_exit_price") or last_b.get("close_price") or last_b.get("close") or entry))
+        exit_reason = str(trade.get("exit_reason") or "EOD_CLOSE")
+
+    # Apply fees and 2-tick slippage
+    slippage_per_share = Decimal(str(tick_size)) * Decimal("2")
+    net_exit = (exit_price - slippage_per_share) if side == "BUY" else (exit_price + slippage_per_share)
+    gross_pnl = ((net_exit - entry) * quantity) if side == "BUY" else ((entry - net_exit) * quantity)
+    net_pnl = gross_pnl - fees
+    realized_r = float(((net_exit - entry) - (fees / quantity)) / r_points) if side == "BUY" else float(((entry - net_exit) - (fees / quantity)) / r_points)
+
+    return {
+        "exit_price": float(exit_price),
+        "exit_reason": exit_reason,
+        "net_pnl": float(net_pnl),
+        "realized_r": round(realized_r, 4),
+        "max_favorable": float(best_favourable),
+    }

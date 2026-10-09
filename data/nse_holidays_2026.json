@@ -106,7 +106,8 @@
       "day": "Sunday",
       "status": "SPECIAL",
       "opens_at": "18:15:00",
-      "closes_at": "19:15:00"
+      "closes_at": "19:15:00",
+      "note": "Timings tentative (customary 18:15-19:15); exact schedule to be notified subsequently by separate NSE circular close to date"
     },
     {
       "date": "2026-11-10",
