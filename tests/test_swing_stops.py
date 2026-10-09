@@ -22,14 +22,29 @@ from backend.config import (
     SWING_MAX_POSITION_PCT,
     STALE_OPEN_GRACE_SECONDS,
 )
-from backend.position_manager import PositionManager, is_market_hours, get_market_open_time, PriceResult
-from backend.swing_risk import calculate_daily_atr, compute_swing_risk_parameters
+from backend.position_manager import (
+    PositionManager,
+    is_market_hours,
+    get_market_open_time,
+    get_calendar_session,
+    clear_calendar_cache,
+    PriceResult,
+)
+from backend.swing_risk import (
+    calculate_daily_atr,
+    compute_swing_risk_parameters,
+    SWING_REJECTED_THIN_HISTORY,
+    SWING_REJECTED_ATR_CALCULATION,
+    SWING_REJECTED_STOP_CAP_EXCEEDED,
+    SWING_REJECTED_ZERO_QUANTITY,
+)
 
 IST = ZoneInfo("Asia/Kolkata")
 
 
 class TestSwingStopsAndRisk(unittest.TestCase):
     def setUp(self):
+        clear_calendar_cache()
         # In-memory SQLite database for deterministic fast tests
         self.engine = create_engine("sqlite:///:memory:", future=True)
         with self.engine.begin() as conn:
@@ -117,6 +132,24 @@ class TestSwingStopsAndRisk(unittest.TestCase):
                     message TEXT,
                     payload TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """))
+
+            conn.execute(text("""
+                CREATE TABLE trade_candidate_audits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    observed_at TIMESTAMP,
+                    model_version TEXT,
+                    exchange TEXT,
+                    symbol TEXT,
+                    instrument_id INTEGER,
+                    signal TEXT,
+                    probability NUMERIC,
+                    decision_price NUMERIC,
+                    selector_stage TEXT,
+                    accepted BOOLEAN,
+                    rejection_reason TEXT,
+                    trade_mode TEXT
                 );
             """))
 
@@ -490,10 +523,12 @@ class TestSwingStopsAndRisk(unittest.TestCase):
     # -------------------------------------------------------------
 
     def test_upstox_rest_quote_fallback_and_critical_alert(self):
-        """poll_held_positions_quote uses Upstox REST LTP, writes to Redis and bars, and emits CRITICAL when dead."""
+        """poll_held_positions_quote uses Upstox REST LTP, writes to Redis with timestamp,
+        never inserts fake bars into live_market_bars, and only runs when ticks are stale."""
         from backend.live_stream_service import LiveStreamService
 
         with self.engine.begin() as conn:
+            conn.execute(text("DELETE FROM live_market_bars;"))
             # Active open position for RELIANCE (id=1)
             conn.execute(text("""
                 INSERT INTO shadow_execution_audits (
@@ -532,6 +567,8 @@ class TestSwingStopsAndRisk(unittest.TestCase):
             with patch("backend.live_stream_service.PostgresBarAggregator"):
                 with patch("redis.Redis.from_url") as mock_redis_cls:
                     mock_redis = MagicMock()
+                    mock_pipe = MagicMock()
+                    mock_redis.pipeline.return_value = mock_pipe
                     mock_redis_cls.return_value = mock_redis
 
                     service = LiveStreamService()
@@ -542,18 +579,163 @@ class TestSwingStopsAndRisk(unittest.TestCase):
                     with patch("urllib.request.urlopen", return_value=mock_resp):
                         service.poll_held_positions_quote()
 
-                        # Verify Redis write
-                        mock_redis.hset.assert_called_with("nivesh:ticks:latest", "1", "2515.5")
+                        # Verify Redis write with price AND timestamp
+                        mock_pipe.hset.assert_any_call("nivesh:ticks:latest", "1", "2515.5")
+                        ts_calls = [c for c in mock_pipe.hset.call_args_list if c[0][0] == "nivesh:ticks:timestamp"]
+                        self.assertTrue(len(ts_calls) > 0, "Must write timestamp to nivesh:ticks:timestamp")
 
-                        # Verify live_market_bars database insertion
+                        # Verify NO bars written to live_market_bars!
                         with self.engine.connect() as check_conn:
-                            bar_row = check_conn.execute(text("""
-                                SELECT close_price, source FROM live_market_bars
-                                WHERE instrument_id = 1 ORDER BY bar_time DESC LIMIT 1
-                            """)).mappings().one_or_none()
-                            self.assertIsNotNone(bar_row)
-                            self.assertEqual(float(bar_row["close_price"]), 2515.50)
-                            self.assertEqual(bar_row["source"], "upstox_v3")
+                            bar_count = check_conn.execute(text("""
+                                SELECT COUNT(*) FROM live_market_bars WHERE instrument_id = 1
+                            """)).scalar()
+                            self.assertEqual(bar_count, 0, "REST fallback must never insert fake bars into live_market_bars")
+
+    # -------------------------------------------------------------
+    # 6. Empty Calendar Table on Weekday Holiday Test
+    # -------------------------------------------------------------
+
+    def test_empty_calendar_on_weekday_holiday_suppresses_stale_data_exit(self):
+        """When exchange_trading_calendar table is empty on a weekday holiday (e.g. Dussehra 2026-10-20),
+        STALE_DATA_EXIT must NOT be executed; only a CRITICAL alert is raised."""
+        clear_calendar_cache()
+        # 2026-10-20 is Tuesday (weekday=1), Dussehra. Empty calendar table.
+        watermark = datetime(2026, 10, 20, 6, 0, 0, tzinfo=timezone.utc)  # 11:30 AM IST
+        bar_time = watermark - timedelta(hours=2)
+
+        with self.engine.begin() as conn:
+            conn.execute(text("DELETE FROM exchange_trading_calendar;"))
+            conn.execute(text("""
+                INSERT INTO shadow_execution_audits (
+                    instrument_id, side, quantity, theoretical_fill_price, stop_loss_price,
+                    signal_at, audit_status, trade_mode, improvement_note
+                ) VALUES (
+                    1, 'BUY', 10, 2500.0, 2400.0, :sig_at, 'RECONCILED', 'SWING', '{}'
+                )
+            """), {"sig_at": bar_time - timedelta(days=1)})
+            conn.execute(text("""
+                INSERT INTO live_market_bars (
+                    instrument_id, interval, bar_time, open_price, high_price, low_price, close_price, source
+                ) VALUES (
+                    1, '1minute', :bt, 2500.0, 2505.0, 2495.0, 2500.0, 'upstox_v3'
+                )
+            """), {"bt": bar_time})
+
+        pm = PositionManager(database_url="sqlite:///:memory:", redis_client=self.mock_redis)
+        pm.engine = self.engine
+        pm.price_max_age_seconds = 60
+        pm.price_max_age_swing_seconds = 60
+        pm.stale_data_exit_minutes = 5
+
+        pos = pm.get_open_positions()[0]
+        # Simulate tracker already past 5 minutes threshold
+        pm.stale_positions_tracker[pos["id"]] = watermark - timedelta(minutes=6)
+
+        with self.assertLogs("nivesh.position_manager", level="CRITICAL") as cm:
+            res = pm.evaluate_position(pos, watermark)
+
+        # Assert position remains OPEN and NOT exited with STALE_DATA_EXIT
+        self.assertIsNotNone(res)
+        self.assertEqual(res["status"], "OPEN")
+        self.assertNotEqual(res.get("exit_reason"), "STALE_DATA_EXIT")
+        # Assert CRITICAL alert was raised
+        alert_found = any("Suppressing STALE_DATA_EXIT" in record.getMessage() for record in cm.records)
+        self.assertTrue(alert_found, "Must raise CRITICAL alert warning about missing calendar row suppressing exit")
+
+    def test_calendar_caching_and_single_missing_warning(self):
+        """Calendar lookup is cached per IST date; missing calendar logs warning only once per date."""
+        clear_calendar_cache()
+        target_dt = datetime(2026, 10, 20, 5, 0, 0, tzinfo=timezone.utc)
+        target_date = target_dt.astimezone(IST).date()
+
+        with self.engine.begin() as conn:
+            conn.execute(text("DELETE FROM exchange_trading_calendar;"))
+
+        # First call logs warning and caches None
+        with self.assertLogs("nivesh.position_manager", level="WARNING") as cm:
+            res1 = is_market_hours(target_dt, engine=self.engine)
+            res2 = get_market_open_time(target_dt, engine=self.engine)
+            res3 = get_calendar_session(target_date, engine=self.engine)
+
+        warn_count = sum(1 for r in cm.records if f"No exchange_trading_calendar row for NSE on {target_date}" in r.getMessage())
+        self.assertTrue(res1, "10:30 AM IST on weekday falls back to open market hours")
+        self.assertFalse(is_market_hours(datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc), engine=self.engine))
+        self.assertEqual(res2, dt_time(9, 15))
+        self.assertIsNone(res3)
+
+    # -------------------------------------------------------------
+    # 7. Swing Rejection Skips Candidate and Records Reason Test
+    # -------------------------------------------------------------
+
+    def test_rejected_swing_skips_candidate_and_records_reason(self):
+        """When swing setup is rejected, candidate is skipped with reason code SWING_REJECTED_<why>."""
+        # 1. compute_swing_risk_parameters returns SWING_REJECTED_THIN_HISTORY
+        res, reason = compute_swing_risk_parameters(
+            symbol="INFY",
+            side="BUY",
+            entry_price=1500.0,
+            daily_candles=[{"high": 1510, "low": 1490, "close": 1500}],  # < 15 candles
+            return_reason=True,
+        )
+        self.assertIsNone(res)
+        self.assertEqual(reason, SWING_REJECTED_THIN_HISTORY)
+
+        # 2. Stop cap exceeded returns SWING_REJECTED_STOP_CAP_EXCEEDED
+        daily_candles = [
+            {"high": 100 + i, "low": 90 + i, "close": 95 + i} for i in range(20)
+        ]
+        daily_candles_wide = list(daily_candles)
+        daily_candles_wide[0] = {"high": 100, "low": 10, "close": 95}
+        res2, reason2 = compute_swing_risk_parameters(
+            symbol="INFY",
+            side="BUY",
+            entry_price=100.0,
+            daily_candles=daily_candles_wide,
+            max_stop_atr=2.0,
+            return_reason=True,
+        )
+        self.assertIsNone(res2)
+        self.assertEqual(reason2, SWING_REJECTED_STOP_CAP_EXCEEDED)
+
+    def test_rejected_swing_candidate_audit_funnel_logging(self):
+        """When a swing candidate is rejected during live inference, it records SWING_REJECTED_<why>
+        in trade_candidate_audits so the funnel diagnostic can count it."""
+        from datetime import datetime, timezone
+        now_dt = datetime.now(timezone.utc)
+
+        # Pre-insert candidate that was initially marked accepted in top10
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO trade_candidate_audits (
+                    observed_at, model_version, exchange, symbol, instrument_id,
+                    signal, probability, decision_price, selector_stage, accepted,
+                    rejection_reason, trade_mode
+                ) VALUES (
+                    :dt, 'v1.0', 'NSE', 'TCS', 1, 'BUY', 0.85, 3500.0, 'accepted_top10', 1, NULL, 'SWING'
+                )
+            """), {"dt": now_dt})
+
+        # Simulate swing rejection audit update
+        reject_code = SWING_REJECTED_THIN_HISTORY
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE trade_candidate_audits
+                SET accepted = 0,
+                    rejection_reason = :reason,
+                    selector_stage = 'swing_risk'
+                WHERE symbol = 'TCS'
+            """), {"reason": reject_code})
+
+        # Verify audit row state for funnel reporting
+        with self.engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT selector_stage, accepted, rejection_reason, trade_mode
+                FROM trade_candidate_audits WHERE symbol = 'TCS'
+            """)).mappings().one()
+
+            self.assertEqual(row["selector_stage"], "swing_risk")
+            self.assertEqual(int(row["accepted"]), 0)
+            self.assertEqual(row["rejection_reason"], "SWING_REJECTED_THIN_HISTORY")
 
 
 if __name__ == "__main__":

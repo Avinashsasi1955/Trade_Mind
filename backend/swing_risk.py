@@ -13,6 +13,11 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("nivesh.swing_risk")
 
+SWING_REJECTED_THIN_HISTORY = "SWING_REJECTED_THIN_HISTORY"
+SWING_REJECTED_ATR_CALCULATION = "SWING_REJECTED_ATR_CALCULATION"
+SWING_REJECTED_STOP_CAP_EXCEEDED = "SWING_REJECTED_STOP_CAP_EXCEEDED"
+SWING_REJECTED_ZERO_QUANTITY = "SWING_REJECTED_ZERO_QUANTITY"
+
 
 def calculate_daily_atr(candles: List[Dict[str, Any]], period: int = 14) -> Optional[Decimal]:
     """Calculate true Average True Range over daily candles.
@@ -54,7 +59,8 @@ def compute_swing_risk_parameters(
     lot_size: int = 1,
     max_stop_atr: Optional[float] = None,
     max_position_pct: Optional[float] = None,
-) -> Optional[Dict[str, Any]]:
+    return_reason: bool = False,
+) -> Any:
     """Recomputes swing SL/TP from daily structure and ATR(14) with gap buffers and sizing.
 
     Rules:
@@ -96,6 +102,9 @@ def compute_swing_risk_parameters(
 
     und_invalidation: Optional[float] = None
 
+    def _reject(reason: str):
+        return (None, reason) if return_reason else None
+
     if is_option:
         # Option contracts: must have at least 15 daily candles on the underlying
         if not underlying_daily_candles or len(underlying_daily_candles) < 15:
@@ -103,12 +112,12 @@ def compute_swing_risk_parameters(
                 f"Rejecting SWING option setup for {symbol}: insufficient underlying daily history "
                 f"({len(underlying_daily_candles) if underlying_daily_candles else 0} < 15 candles)"
             )
-            return None
+            return _reject(SWING_REJECTED_THIN_HISTORY)
 
         und_atr = calculate_daily_atr(underlying_daily_candles, 14)
         if und_atr is None:
             logger.warning(f"Rejecting SWING option setup for {symbol}: unable to compute underlying daily ATR")
-            return None
+            return _reject(SWING_REJECTED_ATR_CALCULATION)
 
         und_lookback = underlying_daily_candles[-20:] if len(underlying_daily_candles) >= 20 else underlying_daily_candles
         und_spot = Decimal(str(underlying_daily_candles[-1].get("close") or underlying_daily_candles[-1].get("close_price") or entry))
@@ -136,7 +145,7 @@ def compute_swing_risk_parameters(
                 f"Rejecting SWING option setup for {symbol}: underlying structural stop {und_raw_stop:.2f} "
                 f"exceeds max allowed {max_allowed_und_stop:.2f} ({max_stop_atr}x ATR)"
             )
-            return None
+            return _reject(SWING_REJECTED_STOP_CAP_EXCEEDED)
 
         # Convert underlying stop distance to option premium via delta
         approx_delta = abs(Decimal(str(delta))) if delta is not None and float(delta) > 0 else Decimal("0.50")
@@ -154,12 +163,12 @@ def compute_swing_risk_parameters(
                 f"Rejecting SWING setup for {symbol}: insufficient daily history "
                 f"({len(daily_candles) if daily_candles else 0} < 15 candles)"
             )
-            return None
+            return _reject(SWING_REJECTED_THIN_HISTORY)
 
         atr = Decimal(str(atr14)) if atr14 is not None else calculate_daily_atr(daily_candles, 14)
         if atr is None:
             logger.warning(f"Rejecting SWING setup for {symbol}: unable to compute daily ATR")
-            return None
+            return _reject(SWING_REJECTED_ATR_CALCULATION)
 
         atr = max(Decimal("0.10"), atr)
         effective_atr = atr
@@ -179,7 +188,7 @@ def compute_swing_risk_parameters(
                     f"Rejecting SWING setup for {symbol}: structural stop distance {raw_stop_dist:.2f} "
                     f"exceeds max allowed {max_allowed_stop:.2f} ({max_stop_atr}x ATR)"
                 )
-                return None
+                return _reject(SWING_REJECTED_STOP_CAP_EXCEEDED)
             final_sl = max(Decimal("0.05"), round(entry - raw_stop_dist, 2))
             stop_distance = max(Decimal("0.05"), entry - final_sl)
             final_tp = round(entry + (Decimal("1.5") * stop_distance), 2)
@@ -191,7 +200,7 @@ def compute_swing_risk_parameters(
                     f"Rejecting SWING setup for {symbol}: structural stop distance {raw_stop_dist:.2f} "
                     f"exceeds max allowed {max_allowed_stop:.2f} ({max_stop_atr}x ATR)"
                 )
-                return None
+                return _reject(SWING_REJECTED_STOP_CAP_EXCEEDED)
             final_sl = round(entry + raw_stop_dist, 2)
             stop_distance = max(Decimal("0.05"), final_sl - entry)
             final_tp = max(Decimal("0.05"), round(entry - (Decimal("1.5") * stop_distance), 2))
@@ -214,7 +223,7 @@ def compute_swing_risk_parameters(
                 f"Rejecting SWING option setup for {symbol}: sizing ({target_qty}) is less than 1 lot ({lot}). "
                 f"Risk budget: {risk_budget:.2f}, Max position value: {max_position_val:.2f}"
             )
-            return None
+            return _reject(SWING_REJECTED_ZERO_QUANTITY)
     else:
         final_qty = target_qty
         if final_qty <= 0:
@@ -222,11 +231,11 @@ def compute_swing_risk_parameters(
                 f"Rejecting SWING setup for {symbol}: sizing yielded 0 quantity. "
                 f"Risk budget: {risk_budget:.2f}, Max position value: {max_position_val:.2f}"
             )
-            return None
+            return _reject(SWING_REJECTED_ZERO_QUANTITY)
 
     rr_ratio = round(float(abs(final_tp - entry) / stop_distance), 2)
 
-    return {
+    res = {
         "symbol": symbol,
         "trade_mode": "SWING",
         "side": side,
@@ -239,3 +248,4 @@ def compute_swing_risk_parameters(
         "atr14": float(effective_atr),
         "underlying_invalidation_level": und_invalidation,
     }
+    return (res, None) if return_reason else res

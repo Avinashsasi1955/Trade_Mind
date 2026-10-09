@@ -42,6 +42,7 @@ infra/aws-ha/backend.hcl
 data/*
 !data/security_master
 !data/security_master/**
+!data/nse_holidays_2026.json
 outputs/
 work/
 tmp/

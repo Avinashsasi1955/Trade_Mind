@@ -51,8 +51,17 @@ def run_preflight(database_url=None,redis_url=None,require_integrations=True):
             detail=f"{token_count} active broker tokens"
         checks["instrument_master"]={"passed":token_count>=50 if require_integrations else True,"detail":detail}
         calendar=connection.execute(text("SELECT session_status,source FROM exchange_trading_calendar WHERE exchange='NSE' AND session_date=:day"),{"day":now.date()}).mappings().one_or_none()
-        calendar_passed=now.weekday()<5 and (not calendar or calendar["session_status"]!="CLOSED")
-        calendar_detail="weekend closed" if now.weekday()>=5 else (f"{calendar['session_status']} ({calendar['source']})" if calendar else "weekday fallback; official row not loaded")
+        from backend.config import IS_PRODUCTION
+        if not calendar:
+            if IS_PRODUCTION:
+                calendar_passed = False
+                calendar_detail = f"CRITICAL: Missing exchange_trading_calendar row for {now.date()}; run scripts/sync_trading_calendar.py"
+            else:
+                calendar_passed = now.weekday() < 5
+                calendar_detail = "weekend closed" if now.weekday() >= 5 else "weekday fallback; official row not loaded"
+        else:
+            calendar_passed = now.weekday() < 5 and calendar["session_status"] != "CLOSED"
+            calendar_detail = f"{calendar['session_status']} ({calendar['source']})"
         checks["exchange_calendar"]={"passed":calendar_passed,"detail":calendar_detail}
         heartbeat=connection.execute(text("SELECT created_at FROM monitoring_events WHERE component='celery_worker' ORDER BY id DESC LIMIT 1")).scalar_one_or_none()
         checks["worker_heartbeat"]={"passed":bool(heartbeat and heartbeat>=datetime.now(heartbeat.tzinfo)-timedelta(minutes=3)),

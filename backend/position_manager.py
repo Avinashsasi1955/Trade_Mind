@@ -67,31 +67,71 @@ def _parse_time(val: Any) -> Optional[dt_time]:
     return None
 
 
+import threading
+
+# Calendar session cache: date -> (dict of session row or None)
+_CALENDAR_CACHE: Dict[date, Optional[Dict[str, Any]]] = {}
+_MISSING_CALENDAR_WARNED_DATES: set[date] = set()
+_CALENDAR_LOCK = threading.Lock()
+
+
+def clear_calendar_cache() -> None:
+    """Clear calendar cache and warning tracking for tests and resets."""
+    with _CALENDAR_LOCK:
+        _CALENDAR_CACHE.clear()
+        _MISSING_CALENDAR_WARNED_DATES.clear()
+
+
+def get_calendar_session(target_date: date, engine: Any = None) -> Optional[Dict[str, Any]]:
+    """Retrieve and cache exchange_trading_calendar row for target_date.
+
+    Caches per IST date to avoid database hits per second per position.
+    Logs a missing-calendar warning once per date.
+    """
+    with _CALENDAR_LOCK:
+        if target_date in _CALENDAR_CACHE:
+            return _CALENDAR_CACHE[target_date]
+
+    session_row = None
+    if engine is not None:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("""
+                        SELECT session_status, opens_at, closes_at, source
+                        FROM exchange_trading_calendar
+                        WHERE exchange = 'NSE' AND session_date = :day
+                    """),
+                    {"day": target_date}
+                ).mappings().one_or_none()
+                if row:
+                    session_row = dict(row)
+        except Exception as e:
+            logger.debug(f"exchange_trading_calendar lookup failed for {target_date}: {e}")
+
+    with _CALENDAR_LOCK:
+        _CALENDAR_CACHE[target_date] = session_row
+        if session_row is None and target_date not in _MISSING_CALENDAR_WARNED_DATES:
+            logger.warning(
+                f"No exchange_trading_calendar row for NSE on {target_date}; "
+                f"falling back to weekday 09:15-15:30 IST"
+            )
+            _MISSING_CALENDAR_WARNED_DATES.add(target_date)
+
+    return session_row
+
+
 def is_market_hours(dt: Optional[datetime] = None, engine: Any = None) -> bool:
     """Return True if given datetime falls in regular NSE market hours using exchange_trading_calendar.
 
-    Falls back to weekday plus 09:15-15:30 IST only if no calendar row exists, logging a warning.
+    Falls back to weekday plus 09:15-15:30 IST only if no calendar row exists, logging a warning once per date.
     """
     target = dt or datetime.now(timezone.utc)
     target_ist = target.astimezone(IST) if getattr(target, "tzinfo", None) else target.replace(tzinfo=timezone.utc).astimezone(IST)
     target_date = target_ist.date()
     cur_time = target_ist.time()
 
-    session_row = None
-    if engine is not None:
-        try:
-            with engine.connect() as conn:
-                session_row = conn.execute(
-                    text("""
-                        SELECT session_status, opens_at, closes_at
-                        FROM exchange_trading_calendar
-                        WHERE exchange = 'NSE' AND session_date = :day
-                    """),
-                    {"day": target_date}
-                ).mappings().one_or_none()
-        except Exception as e:
-            logger.debug(f"exchange_trading_calendar lookup failed for {target_date}: {e}")
-
+    session_row = get_calendar_session(target_date, engine)
     if session_row is not None:
         status = str(session_row.get("session_status") or "").upper()
         if status == "CLOSED":
@@ -100,11 +140,7 @@ def is_market_hours(dt: Optional[datetime] = None, engine: Any = None) -> bool:
         closes = _parse_time(session_row.get("closes_at")) or dt_time(15, 30)
         return opens <= cur_time <= closes
 
-    # Fallback to weekday check with warning
-    logger.warning(
-        f"No exchange_trading_calendar row for NSE on {target_date}; "
-        f"falling back to weekday 09:15-15:30 IST"
-    )
+    # Fallback to weekday check if calendar row is missing
     if target_ist.weekday() >= 5:  # Saturday = 5, Sunday = 6
         return False
     return dt_time(9, 15) <= cur_time <= dt_time(15, 30)
@@ -113,19 +149,11 @@ def is_market_hours(dt: Optional[datetime] = None, engine: Any = None) -> bool:
 def get_market_open_time(dt: datetime, engine: Any = None) -> dt_time:
     """Get NSE market open time for date of given datetime, checking calendar."""
     target_ist = dt.astimezone(IST) if getattr(dt, "tzinfo", None) else dt.replace(tzinfo=timezone.utc).astimezone(IST)
-    if engine is not None:
-        try:
-            with engine.connect() as conn:
-                row = conn.execute(
-                    text("SELECT opens_at FROM exchange_trading_calendar WHERE exchange = 'NSE' AND session_date = :day"),
-                    {"day": target_ist.date()}
-                ).scalar_one_or_none()
-                if row:
-                    t = _parse_time(row)
-                    if t:
-                        return t
-        except Exception:
-            pass
+    session_row = get_calendar_session(target_ist.date(), engine)
+    if session_row is not None:
+        opens = _parse_time(session_row.get("opens_at"))
+        if opens:
+            return opens
     return dt_time(9, 15)
 
 
@@ -256,7 +284,7 @@ class PositionManager:
         if watermark:
             now_utc = datetime.now(timezone.utc)
             wm_utc = watermark.astimezone(timezone.utc) if getattr(watermark, "tzinfo", None) else watermark.replace(tzinfo=timezone.utc)
-            if (now_utc - wm_utc).total_seconds() > 10.0:
+            if abs((now_utc - wm_utc).total_seconds()) > 10.0:
                 is_historical = True
 
         # Try redis tick cache first if available and not historical/bypassed
@@ -265,7 +293,24 @@ class PositionManager:
                 cached_price = self.redis.hget("nivesh:ticks:latest", str(instrument_id))
                 if cached_price:
                     val = Decimal(str(cached_price))
-                    return PriceResult(val, "market", bar_time=watermark) if return_source else val
+                    cached_ts_raw = self.redis.hget("nivesh:ticks:timestamp", str(instrument_id))
+                    cached_bar_time = None
+                    if cached_ts_raw:
+                        if isinstance(cached_ts_raw, bytes):
+                            cached_ts_raw = cached_ts_raw.decode("utf-8")
+                        try:
+                            cached_bar_time = datetime.fromisoformat(cached_ts_raw)
+                        except Exception:
+                            try:
+                                cached_bar_time = datetime.strptime(cached_ts_raw.split(".")[0], "%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                try:
+                                    cached_bar_time = datetime.fromtimestamp(float(cached_ts_raw), tz=timezone.utc)
+                                except Exception:
+                                    pass
+                        if cached_bar_time and cached_bar_time.tzinfo is None:
+                            cached_bar_time = cached_bar_time.replace(tzinfo=timezone.utc)
+                    return PriceResult(val, "market", bar_time=cached_bar_time or watermark) if return_source else val
             except Exception as e:
                 logger.debug(f"Redis tick cache lookup failed for instrument {instrument_id}: {e}")
 
@@ -571,9 +616,17 @@ class PositionManager:
                         self.stale_positions_tracker[pos["id"]] = watermark
                     stale_duration = (watermark - self.stale_positions_tracker[pos["id"]]).total_seconds()
                     if stale_duration >= self.stale_data_exit_minutes * 60.0:
-                        exit_price = latest_price
-                        exit_reason = "STALE_DATA_EXIT"
-                        exit_bar_time = watermark
+                        session_row = get_calendar_session(wm_ist.date(), self.engine)
+                        if session_row is None:
+                            logger.critical(
+                                f"CRITICAL: Stale data duration ({stale_duration:.1f}s) exceeded exit threshold for audit #{pos['id']} ({pos.get('symbol')}), "
+                                f"but no exchange_trading_calendar row exists for {wm_ist.date()}. "
+                                f"Suppressing STALE_DATA_EXIT to prevent false liquidation on unrecorded holiday/session."
+                            )
+                        else:
+                            exit_price = latest_price
+                            exit_reason = "STALE_DATA_EXIT"
+                            exit_bar_time = watermark
                 else:
                     if pos["id"] in self.stale_positions_tracker:
                         del self.stale_positions_tracker[pos["id"]]

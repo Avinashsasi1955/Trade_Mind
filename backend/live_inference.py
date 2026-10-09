@@ -3481,7 +3481,7 @@ class LivePaperInference:
                     greeks = target.get("greeks") or {}
                     opt_delta = greeks.get("delta")
                     lot_sz = int(target.get("lot_size") or 1)
-                    swing_res = compute_swing_risk_parameters(
+                    swing_res, swing_reason = compute_swing_risk_parameters(
                         symbol=str(item.get("symbol") or ""),
                         side=target["side"],
                         entry_price=target["price"],
@@ -3491,6 +3491,7 @@ class LivePaperInference:
                         option_type=target.get("kind"),
                         delta=opt_delta,
                         lot_size=lot_sz,
+                        return_reason=True,
                     )
                     if swing_res:
                         risk_levels["stop_loss"] = Decimal(str(swing_res["stop_loss_price"]))
@@ -3498,11 +3499,79 @@ class LivePaperInference:
                         quantity = max(1, swing_res["quantity"])
                         underlying_invalidation_level = swing_res.get("underlying_invalidation_level")
                     else:
-                        logger.warning(f"Swing setup rejected for {item.get('symbol')}; keeping trade INTRADAY")
-                        agent_eval["trade_mode"] = "INTRADAY"
+                        reject_code = swing_reason or "SWING_REJECTED_UNKNOWN"
+                        logger.warning(f"Swing setup rejected for {item.get('symbol')} ({reject_code}); skipping candidate")
+                        rejected += 1
+                        try:
+                            with self.engine.begin() as connection:
+                                updated = connection.execute(text("""
+                                    UPDATE trade_candidate_audits
+                                    SET accepted = FALSE,
+                                        rejection_reason = :reason,
+                                        selector_stage = 'swing_risk'
+                                    WHERE symbol = :symbol 
+                                      AND observed_at >= :watermark - INTERVAL '2 minutes'
+                                      AND observed_at <= :watermark + INTERVAL '2 minutes'
+                                      AND accepted = TRUE
+                                      AND (instrument_id = :instrument_id OR instrument_id IS NULL)
+                                      AND (model_version = :model_version OR model_version IS NULL)
+                                """), {
+                                    "symbol": item.get("symbol"),
+                                    "instrument_id": int(item.get("instrument_id") or 0) or None,
+                                    "model_version": model.get("version"),
+                                    "watermark": item["session"]["timestamp"],
+                                    "reason": reject_code
+                                }).rowcount
+                                if not updated:
+                                    connection.execute(text("""
+                                        INSERT INTO trade_candidate_audits (
+                                            observed_at, model_version, exchange, symbol, instrument_id,
+                                            signal, probability, decision_price, selector_stage, accepted,
+                                            rejection_reason, trade_mode
+                                        ) VALUES (
+                                            :observed_at, :model_version, :exchange, :symbol, :instrument_id,
+                                            :signal, :probability, :decision_price, 'swing_risk', FALSE,
+                                            :reason, 'SWING'
+                                        )
+                                    """), {
+                                        "observed_at": item["session"]["timestamp"],
+                                        "model_version": model.get("version"),
+                                        "exchange": item.get("exchange", "NSE"),
+                                        "symbol": item.get("symbol"),
+                                        "instrument_id": int(item.get("instrument_id") or 0) or None,
+                                        "signal": target.get("side", "BUY"),
+                                        "probability": float(item.get("probability") or 0.0),
+                                        "decision_price": float(target.get("price") or 0.0),
+                                        "reason": reject_code,
+                                    })
+                        except Exception as audit_err:
+                            logger.debug(f"Failed to record swing rejection in candidate audit log: {audit_err}")
+                        continue
                 except Exception as sw_exc:
-                    logger.warning(f"Swing risk computation failed, fallback to standard INTRADAY: {sw_exc}")
-                    agent_eval["trade_mode"] = "INTRADAY"
+                    logger.warning(f"Swing risk computation failed for {item.get('symbol')}: {sw_exc}; skipping candidate")
+                    rejected += 1
+                    try:
+                        with self.engine.begin() as connection:
+                            connection.execute(text("""
+                                UPDATE trade_candidate_audits
+                                SET accepted = FALSE,
+                                    rejection_reason = 'SWING_REJECTED_ERROR',
+                                    selector_stage = 'swing_risk'
+                                WHERE symbol = :symbol 
+                                  AND observed_at >= :watermark - INTERVAL '2 minutes'
+                                  AND observed_at <= :watermark + INTERVAL '2 minutes'
+                                  AND accepted = TRUE
+                                  AND (instrument_id = :instrument_id OR instrument_id IS NULL)
+                                  AND (model_version = :model_version OR model_version IS NULL)
+                            """), {
+                                "symbol": item.get("symbol"),
+                                "instrument_id": int(item.get("instrument_id") or 0) or None,
+                                "model_version": model.get("version"),
+                                "watermark": item["session"]["timestamp"],
+                            })
+                    except Exception:
+                        pass
+                    continue
 
             if str(target.get("kind", "")).upper() in {"CE", "PE"}:
                 lot = int(target.get("lot_size") or 1)

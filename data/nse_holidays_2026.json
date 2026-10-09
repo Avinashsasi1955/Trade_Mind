@@ -1,0 +1,99 @@
+{
+  "source": "NSE Official Trading Holidays 2026 Circular / Calendar (NSE/CMTR/2026)",
+  "year": 2026,
+  "exchange": "NSE",
+  "holidays": [
+    {
+      "date": "2026-01-26",
+      "name": "Republic Day",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-03-03",
+      "name": "Holi",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-03-20",
+      "name": "Id-Ul-Fitr (Ramzan Id)",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-03-27",
+      "name": "Ram Navami",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-03-31",
+      "name": "Mahavir Jayanti",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-04-03",
+      "name": "Good Friday",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-04-14",
+      "name": "Dr. Baba Saheb Ambedkar Jayanti",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-05-01",
+      "name": "Maharashtra Day",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-05-27",
+      "name": "Bakri Id / Eid-ul-Adha",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-06-25",
+      "name": "Muharram",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-08-15",
+      "name": "Independence Day",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-08-25",
+      "name": "Milad-un-Nabi (Id-e-Milad)",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-10-02",
+      "name": "Mahatma Gandhi Jayanti",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-10-20",
+      "name": "Dussehra",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-11-08",
+      "name": "Diwali Laxmi Pujan (Muhurat Trading)",
+      "status": "SPECIAL",
+      "opens_at": "18:15:00",
+      "closes_at": "19:15:00"
+    },
+    {
+      "date": "2026-11-10",
+      "name": "Diwali Balipratipada",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-11-24",
+      "name": "Gurunanak Jayanti",
+      "status": "CLOSED"
+    },
+    {
+      "date": "2026-12-25",
+      "name": "Christmas",
+      "status": "CLOSED"
+    }
+  ]
+}

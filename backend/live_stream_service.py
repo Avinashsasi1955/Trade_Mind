@@ -41,7 +41,8 @@ class LiveStreamService:
         self.engine=create_engine(self.database_url,pool_pre_ping=True,future=True); self.aggregator=PostgresBarAggregator(self.database_url,source=self.source)
         self.redis=redis.Redis.from_url(os.environ["REDIS_URL"],decode_responses=True,socket_timeout=5)
         self.lock=threading.Lock(); self.stop_event=threading.Event(); self.streams=[]; self.last_stale=(); self.open_gaps={}
-        self.backfill_lock=threading.Lock(); self.full_limit=max(100,int(os.getenv("NIVESH_KITE_FULL_MODE_LIMIT","2500")))
+        self.backfill_lock=threading.Lock(); self.quote_fallback_lock=threading.Lock(); self.real_last_tick_times: Dict[int, datetime]={}
+        self.full_limit=max(100,int(os.getenv("NIVESH_KITE_FULL_MODE_LIMIT","2500")))
         self.total_limit=min(9000,max(self.full_limit,int(os.getenv("NIVESH_KITE_TOTAL_TOKEN_LIMIT","9000"))))
         self.held_contract_stale_minutes = int(os.getenv("NIVESH_HELD_CONTRACT_STALE_TICK_MINUTES", str(HELD_CONTRACT_STALE_TICK_MINUTES)))
         if self.provider=="upstox":
@@ -236,6 +237,7 @@ class LiveStreamService:
         finally: self.backfill_lock.release()
 
     def on_ticks(self,ticks):
+        now_utc = datetime.now(ZoneInfo("UTC"))
         pipeline=self.redis.pipeline(transaction=False)
         for tick in ticks:
             depth=tick.get("depth") or []; buys=[x for x in depth if x.get("side")=="buy" and x.get("price")]; sells=[x for x in depth if x.get("side")=="sell" and x.get("price")]
@@ -245,6 +247,14 @@ class LiveStreamService:
                           "bid_quantity":bid.get("quantity",0),"ask_quantity":ask.get("quantity",0),
                           "exchange_timestamp":tick.get("exchange_timestamp"),"received_at":tick.get("received_at")}
                 pipeline.setex(f"nivesh:depth:{int(tick['instrument_token'])}",900,json.dumps(snapshot))
+            token = int(tick.get("instrument_token") or 0)
+            inst_id = self.aggregator.tokens.get(token) if hasattr(self.aggregator, "tokens") and self.aggregator.tokens else None
+            if inst_id:
+                self.real_last_tick_times[inst_id] = now_utc
+                lp = tick.get("last_price")
+                if lp:
+                    pipeline.hset("nivesh:ticks:latest", str(inst_id), str(lp))
+                    pipeline.hset("nivesh:ticks:timestamp", str(inst_id), now_utc.isoformat())
         pipeline.execute()
         with self.lock:
             completed=self.aggregator.ingest(ticks)
@@ -304,12 +314,17 @@ class LiveStreamService:
         return int(deleted or 0)
 
     def poll_held_positions_quote(self):
-        """Periodic REST quote fallback for held contracts and alert if held contract has no ticks for > 3 minutes."""
+        """Periodic REST quote fallback for held contracts and alert if held contract has no ticks for > 3 minutes.
+        
+        Runs with timeout=3, batches all keys into a single call, writes LTP and timestamp to Redis,
+        and never inserts into live_market_bars.
+        """
+        if not self.quote_fallback_lock.acquire(blocking=False):
+            return
         try:
             with self.engine.connect() as connection:
                 held_rows = connection.execute(text("""
-                    SELECT DISTINCT a.instrument_id, i.symbol, i.instrument_token, i.exchange,
-                        (SELECT MAX(bar_time) FROM live_market_bars b WHERE b.instrument_id = a.instrument_id) as last_bar_time
+                    SELECT DISTINCT a.instrument_id, i.symbol, i.instrument_token, i.exchange
                     FROM shadow_execution_audits a
                     JOIN instrument_master i ON i.id = a.instrument_id
                     WHERE a.audit_status = 'RECONCILED' AND a.net_pnl IS NULL
@@ -321,14 +336,34 @@ class LiveStreamService:
             now_utc = datetime.now(ZoneInfo("UTC"))
             stale_threshold_seconds = self.held_contract_stale_minutes * 60
 
+            stale_contracts = []
             for h in held_rows:
                 inst_id = h["instrument_id"]
                 symbol = h["symbol"]
-                last_bt = h["last_bar_time"]
-                if last_bt and last_bt.tzinfo is None:
-                    last_bt = last_bt.replace(tzinfo=ZoneInfo("UTC"))
 
-                age_seconds = (now_utc - last_bt).total_seconds() if last_bt else float("inf")
+                # Determine real last tick time from WebSocket or previous tick cache
+                last_tick_time = self.real_last_tick_times.get(inst_id)
+                if last_tick_time is None and self.redis:
+                    try:
+                        cached_ts = self.redis.hget("nivesh:ticks:timestamp", str(inst_id))
+                        if cached_ts:
+                            last_tick_time = datetime.fromisoformat(cached_ts)
+                    except Exception:
+                        pass
+                if last_tick_time is None:
+                    # Check genuine live_market_bars
+                    try:
+                        with self.engine.connect() as b_conn:
+                            lb = b_conn.execute(
+                                text("SELECT MAX(bar_time) FROM live_market_bars WHERE instrument_id = :id"),
+                                {"id": inst_id}
+                            ).scalar_one_or_none()
+                            if lb:
+                                last_tick_time = lb if getattr(lb, "tzinfo", None) else lb.replace(tzinfo=ZoneInfo("UTC"))
+                    except Exception:
+                        pass
+
+                age_seconds = (now_utc - last_tick_time).total_seconds() if last_tick_time else float("inf")
                 if age_seconds > stale_threshold_seconds and self.market_open():
                     self.record("CRITICAL", f"Held contract {symbol} has no ticks for > {self.held_contract_stale_minutes} minutes", {
                         "instrument_id": inst_id,
@@ -339,60 +374,81 @@ class LiveStreamService:
                         f"CRITICAL: Held contract {symbol} (id={inst_id}) has no ticks for {age_seconds:.1f}s "
                         f"(> {self.held_contract_stale_minutes}m)"
                     )
+                    stale_contracts.append(h)
 
-                # REST quote fallback
-                try:
-                    ltp = None
-                    if self.provider == "zerodha" and h.get("instrument_token"):
-                        adapter = ZerodhaAdapter(self.api_key, self.access_token)
-                        q_data = adapter.quotes([f"{h.get('exchange', 'NSE')}:{symbol}"])
-                        quote_entry = q_data.get(f"{h.get('exchange', 'NSE')}:{symbol}") or q_data.get(symbol)
-                        if quote_entry and quote_entry.get("last_price"):
-                            ltp = float(quote_entry["last_price"])
-                    elif self.provider == "upstox":
-                        with self.engine.connect() as k_conn:
-                            pkey = k_conn.execute(text("""
-                                SELECT provider_key FROM instrument_provider_keys
-                                WHERE instrument_id = :id AND provider = 'upstox_v3' AND is_active LIMIT 1
-                            """), {"id": inst_id}).scalar_one_or_none()
-                        if pkey:
-                            from urllib.parse import quote as url_quote
-                            from urllib.request import Request, urlopen
-                            req = Request(
-                                f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={url_quote(str(pkey))}",
-                                headers={
-                                    "Accept": "application/json",
-                                    "Authorization": f"Bearer {self.upstox_token}",
-                                },
-                                method="GET",
-                            )
-                            with urlopen(req, timeout=10) as resp:
-                                q_res = json.loads(resp.read().decode("utf-8"))
-                            if isinstance(q_res, dict) and q_res.get("status") in ("success", "ok") and "data" in q_res:
-                                d_map = q_res["data"]
-                                entry_val = d_map.get(pkey) or d_map.get(str(pkey).replace("|", ":")) or (next(iter(d_map.values())) if d_map else None)
-                                if isinstance(entry_val, dict) and entry_val.get("last_price"):
-                                    ltp = float(entry_val["last_price"])
+            if not stale_contracts:
+                return
 
-                    if ltp is not None and ltp > 0:
-                        if self.redis:
-                            self.redis.hset("nivesh:ticks:latest", str(inst_id), str(ltp))
-                        src = "upstox_v3" if self.provider == "upstox" else "zerodha_kite"
-                        with self.engine.begin() as b_conn:
-                            b_conn.execute(
-                                text("""
-                                    INSERT INTO live_market_bars (
-                                        instrument_id, interval, bar_time, open_price, high_price, low_price, close_price, volume, source
-                                    ) VALUES (
-                                        :id, '1minute', :bt, :p, :p, :p, :p, 0, :src
-                                    )
-                                """),
-                                {"id": inst_id, "bt": now_utc, "p": ltp, "src": src}
-                            )
-                except Exception as q_err:
-                    logger.warning(f"REST quote fallback for held instrument {inst_id} ({symbol}) failed: {q_err}")
+            # Batch REST quote fallback for stale contracts only (never write to live_market_bars)
+            try:
+                if self.provider == "upstox":
+                    inst_ids = [c["instrument_id"] for c in stale_contracts]
+                    id_list = ",".join(str(int(x)) for x in inst_ids)
+                    with self.engine.connect() as k_conn:
+                        key_rows = k_conn.execute(text(f"""
+                            SELECT instrument_id, provider_key FROM instrument_provider_keys
+                            WHERE instrument_id IN ({id_list}) AND provider = 'upstox_v3' AND is_active
+                        """)).mappings().all()
+
+                    key_to_id = {}
+                    pkeys = []
+                    for kr in key_rows:
+                        pk = kr["provider_key"]
+                        key_to_id[pk] = kr["instrument_id"]
+                        key_to_id[str(pk).replace("|", ":")] = kr["instrument_id"]
+                        pkeys.append(pk)
+
+                    if pkeys:
+                        from urllib.parse import quote as url_quote
+                        from urllib.request import Request, urlopen
+                        keys_param = ",".join(url_quote(str(k)) for k in pkeys)
+                        req = Request(
+                            f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={keys_param}",
+                            headers={
+                                "Accept": "application/json",
+                                "Authorization": f"Bearer {self.upstox_token}",
+                            },
+                            method="GET",
+                        )
+                        with urlopen(req, timeout=3) as resp:
+                            q_res = json.loads(resp.read().decode("utf-8"))
+
+                        if isinstance(q_res, dict) and q_res.get("status") in ("success", "ok") and "data" in q_res:
+                            d_map = q_res["data"]
+                            if self.redis:
+                                pipeline = self.redis.pipeline(transaction=False)
+                                for item_k, item_v in d_map.items():
+                                    if isinstance(item_v, dict) and item_v.get("last_price"):
+                                        ltp = float(item_v["last_price"])
+                                        target_id = key_to_id.get(item_k) or key_to_id.get(item_v.get("instrument_token"))
+                                        if not target_id and len(stale_contracts) == 1:
+                                            target_id = stale_contracts[0]["instrument_id"]
+                                        if target_id and ltp > 0:
+                                            pipeline.hset("nivesh:ticks:latest", str(target_id), str(ltp))
+                                            pipeline.hset("nivesh:ticks:timestamp", str(target_id), now_utc.isoformat())
+                                pipeline.execute()
+
+                elif self.provider == "zerodha":
+                    adapter = ZerodhaAdapter(self.api_key, self.access_token)
+                    query_symbols = [f"{c.get('exchange', 'NSE')}:{c['symbol']}" for c in stale_contracts]
+                    q_data = adapter.quotes(query_symbols)
+                    if self.redis and q_data:
+                        pipeline = self.redis.pipeline(transaction=False)
+                        for c in stale_contracts:
+                            sym_key = f"{c.get('exchange', 'NSE')}:{c['symbol']}"
+                            entry = q_data.get(sym_key) or q_data.get(c["symbol"])
+                            if entry and entry.get("last_price"):
+                                ltp = float(entry["last_price"])
+                                if ltp > 0:
+                                    pipeline.hset("nivesh:ticks:latest", str(c["instrument_id"]), str(ltp))
+                                    pipeline.hset("nivesh:ticks:timestamp", str(c["instrument_id"]), now_utc.isoformat())
+                        pipeline.execute()
+            except Exception as q_err:
+                logger.warning(f"Batch REST quote fallback failed: {q_err}")
         except Exception as exc:
             logger.warning(f"poll_held_positions_quote loop error: {exc}")
+        finally:
+            self.quote_fallback_lock.release()
 
     def run(self):
         self.purge_post_close_bars()
@@ -414,7 +470,8 @@ class LiveStreamService:
         while not self.stop_event.wait(30):
             with self.lock: clock_flushed=self.aggregator.flush_closed(datetime.now(ZoneInfo("UTC")))
             if clock_flushed: logger.info("clock-closed market bars persisted",extra={"context":{"bars":clock_flushed}})
-            self.poll_held_positions_quote()
+            # Run quote fallback off the main loop in a separate thread
+            threading.Thread(target=self.poll_held_positions_quote, daemon=True, name="rest-quote-fallback").start()
             if self.market_open():
 
                 stale=[index for index,stream in enumerate(self.streams) if not stream.last_tick_at or time.time()-stream.last_tick_at>60]
