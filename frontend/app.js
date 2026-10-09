@@ -4535,23 +4535,21 @@ async function initializeApp(){
   try {
     try {
       await api('/api/auth/session');
+      sessionAuthenticated = true;
+      toggleAuth(false);
     } catch (sessionErr) {
-      // If unauthenticated, auto-login with default demo credentials for immediate live access
-      await api('/api/auth/login', {
-        method: 'POST',
-        body: JSON.stringify({ email: 'arjun@example.com', password: 'nivesh123' })
-      });
-      await api('/api/auth/session');
+      sessionAuthenticated = false;
+      toggleAuth(true);
+      window._niveshReady = true;
+      return;
     }
     await refreshData();
-    sessionAuthenticated = true;
-    toggleAuth(false);
     render('dashboard');
     startMarketUpdater();
     initSSETransport();
     setInterval(pollAlerts, 10000);
   } catch(err) {
-    console.warn('Auto auth session error:', err);
+    console.warn('Auth session error:', err);
     authToken = '';
     sessionAuthenticated = false;
     toggleAuth(true);

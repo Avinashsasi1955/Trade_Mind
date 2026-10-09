@@ -15,11 +15,41 @@ INDEX_SECURITIES = [
     {"exchange": "BSE", "symbol": "SENSEX", "code": "SENSEX", "name": "BSE Sensex Index", "series": "INDEX", "isin": "", "status": "ACTIVE"},
 ]
 
+CORE_EQUITY_SECURITIES = [
+    {"exchange": "NSE", "symbol": "RELIANCE", "code": "RELIANCE", "name": "Reliance Industries Limited", "series": "EQ", "isin": "INE002A01018", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "TCS", "code": "TCS", "name": "Tata Consultancy Services Limited", "series": "EQ", "isin": "INE467B01029", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "INFY", "code": "INFY", "name": "Infosys Limited", "series": "EQ", "isin": "INE009A01021", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "HDFCBANK", "code": "HDFCBANK", "name": "HDFC Bank Limited", "series": "EQ", "isin": "INE040A01034", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "ICICIBANK", "code": "ICICIBANK", "name": "ICICI Bank Limited", "series": "EQ", "isin": "INE090A01021", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "TATAMOTORS", "code": "TATAMOTORS", "name": "Tata Motors Limited", "series": "EQ", "isin": "INE155A01022", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "SBIN", "code": "SBIN", "name": "State Bank of India", "series": "EQ", "isin": "INE062A01020", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "BHARTIARTL", "code": "BHARTIARTL", "name": "Bharti Airtel Limited", "series": "EQ", "isin": "INE397D01024", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "LT", "code": "LT", "name": "Larsen & Toubro Limited", "series": "EQ", "isin": "INE018A01030", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "SUNPHARMA", "code": "SUNPHARMA", "name": "Sun Pharmaceutical Industries Limited", "series": "EQ", "isin": "INE044A01036", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "MARUTI", "code": "MARUTI", "name": "Maruti Suzuki India Limited", "series": "EQ", "isin": "INE585B01010", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "BEL", "code": "BEL", "name": "Bharat Electronics Limited", "series": "EQ", "isin": "INE263A01024", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "TRENT", "code": "TRENT", "name": "Trent Limited", "series": "EQ", "isin": "INE849A01020", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "COALINDIA", "code": "COALINDIA", "name": "Coal India Limited", "series": "EQ", "isin": "INE522F01014", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "AXISBANK", "code": "AXISBANK", "name": "Axis Bank Limited", "series": "EQ", "isin": "INE238A01034", "lot": 1, "status": "Active"},
+    {"exchange": "NSE", "symbol": "ULTRACEMCO", "code": "ULTRACEMCO", "name": "UltraTech Cement Limited", "series": "EQ", "isin": "INE481G01011", "lot": 1, "status": "Active"},
+]
+
 
 @lru_cache(maxsize=1)
 def load_security_master() -> Dict:
     if not MASTER_PATH.is_file():
-        return {"as_of": None, "sources": {}, "counts": {"NSE": 0, "BSE": 0, "total": 0}, "securities": []}
+        bootstrap = {
+            "as_of": "BOOTSTRAP",
+            "sources": {"NSE": "Builtin Core Equities Fallback", "BSE": "Builtin Core Equities Fallback"},
+            "counts": {"NSE": len(CORE_EQUITY_SECURITIES), "BSE": 0, "total": len(CORE_EQUITY_SECURITIES)},
+            "securities": CORE_EQUITY_SECURITIES
+        }
+        try:
+            MASTER_PATH.parent.mkdir(parents=True, exist_ok=True)
+            MASTER_PATH.write_text(json.dumps(bootstrap, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        return bootstrap
     return json.loads(MASTER_PATH.read_text(encoding="utf-8"))
 
 

@@ -25,6 +25,11 @@ UPSTOX_PROVIDER = "upstox_v3"
 SUPPORTED_SEGMENTS = {"NSE_EQ", "BSE_EQ", "NSE_INDEX", "BSE_INDEX", "NSE_FO", "BSE_FO"}
 
 
+class UpstoxAuthExpiredError(RuntimeError):
+    """Raised when Upstox rejects an access token due to expiration or revocation (HTTP 401/403)."""
+    pass
+
+
 def provider_token(instrument_key: str) -> int:
     """Stable positive token for internal aggregation maps.
 
@@ -374,6 +379,10 @@ class UpstoxStream:
             timeout=20,
             headers={"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"},
         )
+        if response.status_code in {401, 403}:
+            raise UpstoxAuthExpiredError(
+                f"Upstox access token expired or unauthorized (HTTP {response.status_code}). Interactive re-authentication or token refresh required."
+            )
         response.raise_for_status()
         url = response.json().get("data", {}).get("authorized_redirect_uri")
         if not url or not str(url).startswith("wss://"):
@@ -411,6 +420,16 @@ class UpstoxStream:
         while not self._stop:
             try:
                 url = self.authorized_url()
+            except UpstoxAuthExpiredError as exc:
+                if self.on_status:
+                    self.on_status("AUTH_EXPIRED", {"type": "UpstoxAuthExpiredError", "stage": "authorize", "error": str(exc)})
+                try:
+                    from .observability import page
+                    page("CRITICAL", f"Upstox streaming token expired: {exc}. Market stream suspended.", {"error": str(exc)})
+                except Exception:
+                    pass
+                time.sleep(30)
+                continue
             except Exception as exc:
                 if self.on_status:
                     self.on_status("ERROR", {"type": type(exc).__name__, "stage": "authorize"})

@@ -68,7 +68,7 @@ class PositionManager:
         self.stagnation_scratch_seconds = 900.0  # 15 minutes (intraday)
         self.stagnation_min_expansion_r = Decimal("0.25")
         
-        self.force_flat_time = "15:15"
+        self.force_flat_time = os.getenv("NIVESH_SHADOW_FORCE_FLAT_IST", "15:20")
 
     def is_force_flat_time(self, current_dt: datetime) -> bool:
         """Returns True if current time is at or past 15:15 IST (avoiding Zerodha RMS penalty)."""

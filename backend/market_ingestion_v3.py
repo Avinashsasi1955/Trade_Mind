@@ -1,15 +1,17 @@
-"""Kite instrument synchronization and deterministic PostgreSQL bar aggregation."""
+import logging
 import os
 import time as time_module
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Tuple
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, text
 
 from .candle_sanitizer import BarInvariantValidator, TickSanitizer
 from .zerodha_adapter import ZerodhaAdapter
+
+logger = logging.getLogger("nivesh.market_ingestion")
 
 
 
@@ -74,26 +76,31 @@ def sync_instrument_master(database_url: str,api_key: str,access_token: str) -> 
 
 
 class PostgresBarAggregator:
-    def __init__(self,database_url: str,source: str="zerodha_kite"):
-        self.engine=create_engine(database_url,pool_pre_ping=True,future=True)
-        self.states={}; self.tokens={}; self.vix_tokens=set(); self.source=source
-        self.token_types={}
+    def __init__(self, database_url: str, source: str = "zerodha_kite"):
+        self.engine = create_engine(database_url, pool_pre_ping=True, future=True)
+        self.states: Dict[Tuple[int, str], Dict] = {}
+        self.tokens = {}
+        self.vix_tokens = set()
+        self.source = source
+        self.token_types = {}
         self.sanitizer = TickSanitizer()
-        self.open_trades_cache={}
-        self.last_open_trades_sync=0.0
+        self.open_trades_cache = {}
+        self.last_open_trades_sync = 0.0
+        self.prev_cumulative_volume: Dict[int, int] = {}
+        self.last_completed_bar_time: Dict[Tuple[int, str], datetime] = {}
         self.refresh_tokens()
 
     def refresh_tokens(self):
         with self.engine.connect() as connection:
-            if self.source=="upstox_v3":
-                rows=connection.execute(text("""SELECT i.id,k.provider_token instrument_token,i.exchange,i.symbol,i.instrument_type
+            if self.source == "upstox_v3":
+                rows = connection.execute(text("""SELECT i.id,k.provider_token instrument_token,i.exchange,i.symbol,i.instrument_type
                     FROM instrument_provider_keys k JOIN instrument_master i ON i.id=k.instrument_id
                     WHERE i.is_active AND k.is_active AND k.provider='upstox_v3'""")).fetchall()
             else:
-                rows=connection.execute(text("SELECT id,instrument_token,exchange,symbol,instrument_type FROM instrument_master WHERE is_active AND instrument_token IS NOT NULL")).fetchall()
-        self.tokens={int(row.instrument_token):int(row.id) for row in rows}
-        self.token_types={int(row.instrument_token):str(row.instrument_type or "EQ").upper() for row in rows}
-        self.vix_tokens={int(row.instrument_token) for row in rows if row.symbol.replace(" ","").upper() in {"INDIAVIX","VIX"} and row.instrument_type=="INDEX"}
+                rows = connection.execute(text("SELECT id,instrument_token,exchange,symbol,instrument_type FROM instrument_master WHERE is_active AND instrument_token IS NOT NULL")).fetchall()
+        self.tokens = {int(row.instrument_token): int(row.id) for row in rows}
+        self.token_types = {int(row.instrument_token): str(row.instrument_type or "EQ").upper() for row in rows}
+        self.vix_tokens = {int(row.instrument_token) for row in rows if row.symbol.replace(" ", "").upper() in {"INDIAVIX", "VIX"} and row.instrument_type == "INDEX"}
 
     def refresh_open_trades(self, force: bool = False):
         """Periodically sync active open trades cache for sub-second exit matching."""
@@ -115,8 +122,8 @@ class PostgresBarAggregator:
                     instr = int(r["instrument_id"])
                     cache.setdefault(instr, []).append(dict(r))
                 self.open_trades_cache = cache
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to refresh open trades cache: %s", exc)
 
     def check_instant_exit_breach(self, instrument_id: int, price: Decimal, observed: datetime):
         """Sub-second Autonomous Trade Closer Hook: checks incoming ticks against open trade SL/TP."""
@@ -146,8 +153,8 @@ class PostgresBarAggregator:
                 try:
                     from .ml.validation_engine import record_shadow_exit
                     record_shadow_exit(self.engine, int(trade["id"]), price, exit_reason, observed)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.error("Failed to record instant exit breach for trade %s: %s", trade.get("id"), exc, exc_info=True)
             else:
                 remaining.append(trade)
 
@@ -158,9 +165,13 @@ class PostgresBarAggregator:
 
     @staticmethod
     def _timestamp(tick: Dict) -> datetime:
-        raw=tick.get("exchange_timestamp") or tick.get("last_trade_time")
-        if isinstance(raw,(int,float)) and raw>0: return datetime.fromtimestamp(raw,timezone.utc)
-        if isinstance(raw,str): return datetime.fromisoformat(raw.replace("Z","+00:00")).astimezone(timezone.utc)
+        raw = tick.get("exchange_timestamp") or tick.get("last_trade_time")
+        if isinstance(raw, datetime):
+            return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+        if isinstance(raw, (int, float)) and raw > 0:
+            return datetime.fromtimestamp(raw, timezone.utc)
+        if isinstance(raw, str):
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
         return datetime.now(timezone.utc)
 
     @staticmethod
@@ -170,13 +181,16 @@ class PostgresBarAggregator:
         epoch = int(value.timestamp())
         return datetime.fromtimestamp(epoch - (epoch % seconds), timezone.utc)
 
-    def ingest(self,ticks: Iterable[Dict]):
-        completed=[]
+    def ingest(self, ticks: Iterable[Dict]):
+        completed = []
         self.refresh_open_trades()
         for tick in ticks:
-            token=int(tick.get("instrument_token") or 0); instrument=self.tokens.get(token); price=Decimal(str(tick.get("last_price") or 0))
-            if not instrument or price<=0: continue
-            observed=self._timestamp(tick)
+            token = int(tick.get("instrument_token") or 0)
+            instrument = self.tokens.get(token)
+            price = Decimal(str(tick.get("last_price") or 0))
+            if not instrument or price <= 0:
+                continue
+            observed = self._timestamp(tick)
             if not _is_continuous_market_bar(observed):
                 continue
 
@@ -187,39 +201,97 @@ class PostgresBarAggregator:
             if not is_valid:
                 continue
 
-            if token in self.vix_tokens: self._save_vix(observed,price)
+            if token in self.vix_tokens:
+                self._save_vix(observed, price)
 
             # Sub-Second Trade Closer check on real-time tick price
             if instrument in self.open_trades_cache:
                 self.check_instant_exit_breach(instrument, price, observed)
 
-            for seconds,label in ((1,"1second"),(60,"1minute"),(300,"5minute")):
-                bucket=self._bucket_seconds(observed,seconds); key=(instrument,label); state=self.states.get(key)
-                if state and state["bar_time"]!=bucket: completed.append(state); state=None
+            for seconds, label in ((1, "1second"), (60, "1minute"), (300, "5minute")):
+                bucket = self._bucket_seconds(observed, seconds)
+                key = (instrument, label)
+                last_completed = self.last_completed_bar_time.get(key)
+                if last_completed is not None and bucket <= last_completed:
+                    # Late tick arrived after bar was already closed and saved.
+                    # Drop it from reopening/corrupting completed candles.
+                    continue
+
+                state = self.states.get(key)
+                if state is not None and bucket < state["bar_time"]:
+                    # Out-of-order tick older than current in-progress bar.
+                    # Do not evict current bar; drop out-of-order tick.
+                    continue
+
+                if state is not None and state["bar_time"] != bucket:
+                    # Rollover: previous bar complete
+                    baseline = int(state.get("baseline_volume") if state.get("baseline_volume") is not None else state.get("first_volume", 0))
+                    state["volume"] = max(0, int(state.get("last_volume") or 0) - baseline)
+                    completed.append(state)
+                    self.last_completed_bar_time[key] = state["bar_time"]
+                    self.prev_cumulative_volume[instrument] = int(state.get("last_volume") or 0)
+                    state = None
+
                 if state is None:
-                    state={"instrument_id":instrument,"interval":label,"bar_time":bucket,"open":price,"high":price,"low":price,"close":price,
-                           "first_volume":int(tick.get("volume") or 0),"last_volume":int(tick.get("volume") or 0),
-                           "first_oi":int(tick.get("oi") or 0),"last_oi":int(tick.get("oi") or 0),"exchange_timestamp":observed}
-                    self.states[key]=state
+                    prev_cum = self.prev_cumulative_volume.get(instrument)
+                    baseline = prev_cum if prev_cum is not None else raw_vol
+                    self.prev_cumulative_volume[instrument] = max(self.prev_cumulative_volume.get(instrument, 0), raw_vol)
+                    state = {
+                        "instrument_id": instrument,
+                        "interval": label,
+                        "bar_time": bucket,
+                        "open": price,
+                        "high": price,
+                        "low": price,
+                        "close": price,
+                        "baseline_volume": baseline,
+                        "first_volume": raw_vol,
+                        "last_volume": raw_vol,
+                        "volume": max(0, raw_vol - baseline),
+                        "first_oi": int(tick.get("oi") or 0),
+                        "last_oi": int(tick.get("oi") or 0),
+                        "exchange_timestamp": observed,
+                    }
+                    self.states[key] = state
                 else:
-                    state["high"]=max(state["high"],price); state["low"]=min(state["low"],price); state["close"]=price
-                    state["last_volume"]=int(tick.get("volume") or state["last_volume"]); state["last_oi"]=int(tick.get("oi") or state["last_oi"]); state["exchange_timestamp"]=observed
-        if completed: self._save_bars(completed)
+                    state["high"] = max(state["high"], price)
+                    state["low"] = min(state["low"], price)
+                    state["close"] = price
+                    state["last_volume"] = max(int(state.get("last_volume") or 0), raw_vol)
+                    baseline = int(state.get("baseline_volume") if state.get("baseline_volume") is not None else state.get("first_volume", 0))
+                    state["volume"] = max(0, int(state["last_volume"]) - baseline)
+                    self.prev_cumulative_volume[instrument] = max(self.prev_cumulative_volume.get(instrument, 0), raw_vol)
+                    state["last_oi"] = int(tick.get("oi") or state.get("last_oi") or 0)
+                    state["exchange_timestamp"] = observed
+
+        if completed:
+            self._save_bars(completed)
         return len(completed)
 
     def discard_partial(self):
         """Never persist an in-progress candle as completed during shutdown."""
-        count=len(self.states); self.states.clear(); return count
+        count = len(self.states)
+        self.states.clear()
+        return count
 
-    def flush_closed(self,watermark: datetime = None):
+    def flush_closed(self, watermark: datetime = None):
         """Persist states whose complete interval is at or before ``watermark``."""
-        watermark=(watermark or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        completed=[]
-        for key,state in list(self.states.items()):
-            seconds={"1second":1,"1minute":60,"5minute":300}.get(state["interval"],60)
-            if state["bar_time"]+timedelta(seconds=seconds)<=watermark:
-                completed.append(state); self.states.pop(key,None)
-        if completed: self._save_bars(completed)
+        watermark = (watermark or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        completed = []
+        for key, state in list(self.states.items()):
+            seconds = {"1second": 1, "1minute": 60, "5minute": 300}.get(state["interval"], 60)
+            if state["bar_time"] + timedelta(seconds=seconds) <= watermark:
+                baseline = int(state.get("baseline_volume") if state.get("baseline_volume") is not None else state.get("first_volume", 0))
+                state["volume"] = max(0, int(state.get("last_volume") or 0) - baseline)
+                completed.append(state)
+                self.last_completed_bar_time[key] = state["bar_time"]
+                self.prev_cumulative_volume[state["instrument_id"]] = max(
+                    self.prev_cumulative_volume.get(state["instrument_id"], 0),
+                    int(state.get("last_volume") or 0),
+                )
+                self.states.pop(key, None)
+        if completed:
+            self._save_bars(completed)
         return len(completed)
 
     def partial_snapshots(self):
@@ -228,8 +300,10 @@ class PostgresBarAggregator:
         These snapshots are intentionally not persisted as completed market bars,
         so ML training/inference still consumes closed candles only.
         """
-        result=[]
+        result = []
         for state in self.states.values():
+            baseline = int(state.get("baseline_volume") if state.get("baseline_volume") is not None else state.get("first_volume", 0))
+            last_vol = int(state.get("last_volume") or 0)
             result.append({
                 "instrument_id": state["instrument_id"],
                 "interval": state["interval"],
@@ -238,20 +312,20 @@ class PostgresBarAggregator:
                 "high": float(state["high"]),
                 "low": float(state["low"]),
                 "close": float(state["close"]),
-                "volume": max(0,int(state.get("last_volume") or 0)-int(state.get("first_volume") or 0)),
+                "volume": max(0, last_vol - baseline),
                 "open_interest": int(state.get("last_oi") or 0),
                 "exchange_timestamp": state["exchange_timestamp"].isoformat(),
             })
         return result
 
-    def _save_vix(self,observed: datetime,value: Decimal):
+    def _save_vix(self, observed: datetime, value: Decimal):
         if not _is_continuous_market_bar(observed):
             return
         with self.engine.begin() as connection:
             connection.execute(text("""INSERT INTO india_vix_history(observed_at,value,source) VALUES(:time,:value,:source)
-            ON CONFLICT(observed_at) DO UPDATE SET value=EXCLUDED.value,source=EXCLUDED.source,received_at=CURRENT_TIMESTAMP"""),{"time":observed,"value":value,"source":self.source})
+            ON CONFLICT(observed_at) DO UPDATE SET value=EXCLUDED.value,source=EXCLUDED.source,received_at=CURRENT_TIMESTAMP"""), {"time": observed, "value": value, "source": self.source})
 
-    def _save_bars(self,bars):
+    def _save_bars(self, bars):
         with self.engine.begin() as connection:
             for bar in bars:
                 if not _is_continuous_market_bar(bar["bar_time"]):
@@ -261,6 +335,8 @@ class PostgresBarAggregator:
                   INSERT INTO live_market_bars(instrument_id,interval,bar_time,open_price,high_price,low_price,close_price,volume,open_interest,oi_change,source,exchange_timestamp)
                   VALUES(:instrument_id,CAST(:interval AS bar_interval),:bar_time,:open,:high,:low,:close,:volume,:oi,:oi_change,:source,:exchange_timestamp)
                   ON CONFLICT(instrument_id,interval,bar_time) DO UPDATE SET high_price=GREATEST(live_market_bars.high_price,EXCLUDED.high_price),
-                  low_price=LEAST(live_market_bars.low_price,EXCLUDED.low_price),close_price=EXCLUDED.close_price,volume=EXCLUDED.volume,
+                  low_price=LEAST(live_market_bars.low_price,EXCLUDED.low_price),close_price=EXCLUDED.close_price,
+                  volume=GREATEST(live_market_bars.volume,EXCLUDED.volume),
                   open_interest=EXCLUDED.open_interest,oi_change=EXCLUDED.oi_change,source=EXCLUDED.source,exchange_timestamp=EXCLUDED.exchange_timestamp,received_at=CURRENT_TIMESTAMP
-                """),{**sanitized,"source":self.source})
+                """), {**sanitized, "source": self.source})
+

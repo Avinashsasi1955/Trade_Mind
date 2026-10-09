@@ -325,9 +325,11 @@ def handle_sse_connection(request_handler: Any, user_id: int) -> None:
     request_handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
     request_handler.send_header("Cache-Control", "no-cache, no-transform")
     request_handler.send_header("Connection", "keep-alive")
-    request_handler.send_header("X-Accel-Buffering", "no")
-    request_handler.send_header("Access-Control-Allow-Origin", "*")
-    request_handler.send_header("Access-Control-Allow-Credentials", "true")
+    origin = request_handler.headers.get("Origin") if hasattr(request_handler, "headers") and request_handler.headers else None
+    if origin:
+        request_handler.send_header("Access-Control-Allow-Origin", origin)
+        request_handler.send_header("Access-Control-Allow-Credentials", "true")
+        request_handler.send_header("Vary", "Origin")
     request_handler._security_headers()
     request_handler.end_headers()
 

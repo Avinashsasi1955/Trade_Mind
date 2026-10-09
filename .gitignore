@@ -39,7 +39,9 @@ data/backups/
 *.tfstate.*
 infra/aws-ha/backend.hcl
 
-data/
+data/*
+!data/security_master
+!data/security_master/**
 outputs/
 work/
 tmp/

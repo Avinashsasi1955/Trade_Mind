@@ -9,10 +9,9 @@ from backend.agent import TradingAgent
 from backend.database import SCHEMA, create_user, seed_demo_portfolio
 from backend.market import market_snapshot
 from backend.security import create_token, decode_token, hash_password, verify_password
-from backend.service import dashboard, run_agent, update_settings
-from backend.service import stock_analysis
+from backend.service import dashboard, run_agent, stock_analysis, update_settings
 from backend.technical_analysis import GLOSSARY, analyse_structure
-from backend.model_provider import provider_catalog
+from backend.model_provider import BaseProvider, provider_catalog
 from backend.sentiment import _event, _lexical_score, analyse_sentiment
 from backend.news_gateway import articles_for_symbol
 from backend.config import _load_env
@@ -287,7 +286,8 @@ class NiveshSystemTests(unittest.TestCase):
         self.assertEqual(update["breadth"]["advancing"] + update["breadth"]["declining"], len(update["quotes"]))
         self.assertIsInstance(update["indices"][0]["price"], float)
 
-    def test_ai_gateway_audits_and_caches_explanations(self):
+    @patch("backend.ai_gateway.get_provider", return_value=BaseProvider())
+    def test_ai_gateway_audits_and_caches_explanations(self, _mock_provider):
         analysis = analyse_structure("RELIANCE", "Reliance Industries", 2993.20)
         first = AIGateway(self.db, self.user_id).explain(analysis)
         second = AIGateway(self.db, self.user_id).explain(analysis)

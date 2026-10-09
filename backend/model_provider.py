@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 
 from .config import (
     ANTHROPIC_API_KEY, ANTHROPIC_MODEL, GEMINI_API_KEY, GEMINI_MODEL,
+    GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL,
     LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, MODEL_PROVIDER,
     OLLAMA_BASE_URL, OLLAMA_ENABLED, OLLAMA_MODEL,
     OPENAI_API_KEY, OPENAI_MODEL,
@@ -37,7 +38,8 @@ def _context(analysis: Dict) -> Dict:
 
 
 def _post(url: str, payload: Dict, headers: Dict) -> Dict:
-    request = Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", **headers}, method="POST")
+    req_headers = {"Content-Type": "application/json", "User-Agent": "TradeMind/1.0", **headers}
+    request = Request(url, data=json.dumps(payload).encode(), headers=req_headers, method="POST")
     with urlopen(request, timeout=18) as response:
         return json.loads(response.read())
 
@@ -122,6 +124,10 @@ def get_provider() -> BaseProvider:
             return selected
         if GEMINI_API_KEY:
             return GeminiProvider()
+        if GROQ_API_KEY:
+            selected = OpenAICompatibleProvider(GROQ_BASE_URL, GROQ_MODEL, GROQ_API_KEY, name="groq", free_tier=True)
+            selected.available = True
+            return selected
         if OLLAMA_ENABLED:
             return OpenAICompatibleProvider(OLLAMA_BASE_URL, OLLAMA_MODEL, name="ollama", free_tier=True)
         if LLM_BASE_URL and LLM_MODEL:
@@ -129,6 +135,10 @@ def get_provider() -> BaseProvider:
         return BaseProvider()
     if provider == "gemini":
         return GeminiProvider()
+    if provider == "groq":
+        selected = OpenAICompatibleProvider(GROQ_BASE_URL, GROQ_MODEL, GROQ_API_KEY, name="groq", free_tier=True)
+        selected.available = bool(GROQ_API_KEY)
+        return selected
     if provider == "anthropic":
         return AnthropicProvider()
     if provider == "openai":
@@ -159,6 +169,10 @@ def configured_providers() -> list[BaseProvider]:
         providers.append(selected)
     if GEMINI_API_KEY:
         providers.append(GeminiProvider())
+    if GROQ_API_KEY:
+        selected = OpenAICompatibleProvider(GROQ_BASE_URL, GROQ_MODEL, GROQ_API_KEY, name="groq", free_tier=True)
+        selected.available = True
+        providers.append(selected)
     if OLLAMA_ENABLED:
         providers.append(OpenAICompatibleProvider(OLLAMA_BASE_URL, OLLAMA_MODEL, name="ollama", free_tier=True))
     if ANTHROPIC_API_KEY:
@@ -213,6 +227,7 @@ def provider_catalog() -> Dict:
     return {"active": active, "providers": [
         {"id": "local", "model": "market-structure-ensemble", "free_tier": True, "configured": True},
         {"id": "gemini", "model": GEMINI_MODEL, "free_tier": True, "configured": bool(GEMINI_API_KEY)},
+        {"id": "groq", "model": GROQ_MODEL, "free_tier": True, "configured": bool(GROQ_API_KEY)},
         {"id": "ollama", "model": OLLAMA_MODEL, "free_tier": True, "configured": OLLAMA_ENABLED},
         {"id": "anthropic", "model": ANTHROPIC_MODEL, "free_tier": False, "configured": bool(ANTHROPIC_API_KEY)},
         {"id": "openai", "model": OPENAI_MODEL, "free_tier": False, "configured": bool(OPENAI_API_KEY)},

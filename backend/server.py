@@ -687,7 +687,7 @@ def main():
         print(f"[nivesh] SSE initialization notice: {sse_err}")
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Nivesh AI running at http://{HOST}:{PORT}")
-    if DEMO_MODE: print("Demo login: arjun@example.com / nivesh123")
+    if DEMO_MODE: print("Demo mode enabled (non-production)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

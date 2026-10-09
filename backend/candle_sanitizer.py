@@ -122,9 +122,13 @@ class BarInvariantValidator:
         sanitized_high = max(high_p, max_oc)
         sanitized_low = max(Decimal("0.05"), min(low_p, min_oc))
 
-        first_vol = int(bar.get("first_volume") or 0)
-        last_vol = int(bar.get("last_volume") or 0)
-        volume = max(0, last_vol - first_vol)
+        if "volume" in bar and bar["volume"] is not None:
+            volume = max(0, int(bar["volume"]))
+        else:
+            first_vol = int(bar.get("first_volume") or 0)
+            last_vol = int(bar.get("last_volume") or 0)
+            baseline_vol = int(bar.get("baseline_volume") if bar.get("baseline_volume") is not None else first_vol)
+            volume = max(0, last_vol - baseline_vol)
 
         first_oi = int(bar.get("first_oi") or 0)
         last_oi = int(bar.get("last_oi") or 0)
