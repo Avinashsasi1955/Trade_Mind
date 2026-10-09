@@ -14,6 +14,7 @@ from backend.execution import (
     submit_intent,
     get_broker_adapter,
     lookup_upstox_provider_key,
+    set_execution_engine,
 )
 from backend.upstox_adapter import UpstoxAdapter
 from backend.position_manager import PositionManager, execute_exit
@@ -307,6 +308,185 @@ class Phase0BlockerTests(unittest.TestCase):
             self.assertEqual(result["status"], "degraded")
             self.assertEqual(result["data_mode"], "database_unavailable")
             self.assertFalse(result["orders_allowed"])
+
+
+class Phase0cProviderKeySQLTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from sqlalchemy import create_engine, text
+        cls.engine = create_engine("sqlite:///:memory:")
+        with cls.engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE instrument_master (
+                    id INTEGER PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    is_active BOOLEAN NOT NULL DEFAULT 1
+                );
+            """))
+            conn.execute(text("""
+                CREATE TABLE instrument_provider_keys (
+                    id INTEGER PRIMARY KEY,
+                    instrument_id INTEGER NOT NULL REFERENCES instrument_master(id),
+                    provider TEXT NOT NULL,
+                    provider_key TEXT NOT NULL,
+                    is_active BOOLEAN NOT NULL DEFAULT 1,
+                    last_synced_at TEXT
+                );
+            """))
+            # Populate test data:
+            # 1. RELIANCE (active instrument, active key)
+            conn.execute(text("INSERT INTO instrument_master (id, symbol, exchange, is_active) VALUES (1, 'RELIANCE', 'NSE', 1);"))
+            conn.execute(text("INSERT INTO instrument_provider_keys (id, instrument_id, provider, provider_key, is_active, last_synced_at) VALUES (1, 1, 'upstox_v3', 'NSE_EQ|INE002A01018', 1, '2026-10-08 09:15:00');"))
+
+            # 2. SBIN (multiple keys, newest last_synced_at wins)
+            conn.execute(text("INSERT INTO instrument_master (id, symbol, exchange, is_active) VALUES (2, 'SBIN', 'NSE', 1);"))
+            conn.execute(text("INSERT INTO instrument_provider_keys (id, instrument_id, provider, provider_key, is_active, last_synced_at) VALUES (2, 2, 'upstox_v3', 'SBIN_OLD_KEY', 1, '2026-09-01 10:00:00');"))
+            conn.execute(text("INSERT INTO instrument_provider_keys (id, instrument_id, provider, provider_key, is_active, last_synced_at) VALUES (3, 2, 'upstox_v3', 'SBIN_NEW_KEY', 1, '2026-10-09 10:00:00');"))
+            conn.execute(text("INSERT INTO instrument_provider_keys (id, instrument_id, provider, provider_key, is_active, last_synced_at) VALUES (4, 2, 'upstox_v3', 'SBIN_NULL_DATE', 1, NULL);"))
+
+            # 3. TCS (inactive key ignored)
+            conn.execute(text("INSERT INTO instrument_master (id, symbol, exchange, is_active) VALUES (3, 'TCS', 'NSE', 1);"))
+            conn.execute(text("INSERT INTO instrument_provider_keys (id, instrument_id, provider, provider_key, is_active, last_synced_at) VALUES (5, 3, 'upstox_v3', 'TCS_INACTIVE_KEY', 0, '2026-10-08 09:15:00');"))
+
+            # 4. WIPRO (inactive instrument ignored)
+            conn.execute(text("INSERT INTO instrument_master (id, symbol, exchange, is_active) VALUES (4, 'WIPRO', 'NSE', 0);"))
+            conn.execute(text("INSERT INTO instrument_provider_keys (id, instrument_id, provider, provider_key, is_active, last_synced_at) VALUES (6, 4, 'upstox_v3', 'WIPRO_KEY', 1, '2026-10-08 09:15:00');"))
+
+            # 5. INFY (non-upstox provider ignored)
+            conn.execute(text("INSERT INTO instrument_master (id, symbol, exchange, is_active) VALUES (5, 'INFY', 'NSE', 1);"))
+            conn.execute(text("INSERT INTO instrument_provider_keys (id, instrument_id, provider, provider_key, is_active, last_synced_at) VALUES (7, 5, 'zerodha', '256265', 1, '2026-10-08 09:15:00');"))
+
+    def test_sql_lookup_found(self):
+        """Phase 0c.2: Real SQL lookup returns active Upstox provider_key."""
+        key = lookup_upstox_provider_key("RELIANCE", "NSE", engine=self.engine)
+        self.assertEqual(key, "NSE_EQ|INE002A01018")
+        # Case insensitive
+        key_lower = lookup_upstox_provider_key("reliance", "nse", engine=self.engine)
+        self.assertEqual(key_lower, "NSE_EQ|INE002A01018")
+
+    def test_sql_lookup_newest_last_synced_at_wins(self):
+        """Phase 0c.2: Real SQL query chooses newest last_synced_at row (DESC NULLS LAST)."""
+        key = lookup_upstox_provider_key("SBIN", "NSE", engine=self.engine)
+        self.assertEqual(key, "SBIN_NEW_KEY")
+
+    def test_sql_lookup_inactive_key_ignored(self):
+        """Phase 0c.2: Real SQL query ignores inactive provider keys."""
+        key = lookup_upstox_provider_key("TCS", "NSE", engine=self.engine)
+        self.assertIsNone(key)
+
+    def test_sql_lookup_inactive_instrument_ignored(self):
+        """Phase 0c.2: Real SQL query ignores inactive instruments."""
+        key = lookup_upstox_provider_key("WIPRO", "NSE", engine=self.engine)
+        self.assertIsNone(key)
+
+    def test_sql_lookup_not_found(self):
+        """Phase 0c.2: Real SQL query returns None when instrument is missing."""
+        key = lookup_upstox_provider_key("HDFCBANK", "NSE", engine=self.engine)
+        self.assertIsNone(key)
+        # Non-upstox provider
+        key_infy = lookup_upstox_provider_key("INFY", "NSE", engine=self.engine)
+        self.assertIsNone(key_infy)
+
+    def test_sql_lookup_db_error_path(self):
+        """Phase 0c.2: Real SQL query failure raises and logs RuntimeError."""
+        from sqlalchemy import create_engine
+        empty_engine = create_engine("sqlite:///:memory:")  # has no tables
+        with self.assertRaises(RuntimeError) as ctx:
+            lookup_upstox_provider_key("RELIANCE", "NSE", engine=empty_engine)
+        self.assertIn("Database error while looking up Upstox provider key", str(ctx.exception))
+
+    def test_sql_lookup_unconfigured_database_raises_explicitly(self):
+        """Phase 0c.1: Empty DATABASE_URL raises explicit database unavailable RuntimeError."""
+        set_execution_engine(None)
+        with patch("backend.config.DATABASE_URL", ""):
+            with self.assertRaises(RuntimeError) as ctx:
+                lookup_upstox_provider_key("RELIANCE", "NSE", engine=None)
+            self.assertIn("DATABASE_URL is not configured", str(ctx.exception))
+
+    def test_submit_intent_with_real_sql_execution(self):
+        """Phase 0c.2: submit_intent exercises real SQL for found, missing, and db error paths without mocking lookup."""
+        set_execution_engine(self.engine)
+
+        mock_db = MagicMock()
+        mock_adapter = MagicMock(spec=UpstoxAdapter)
+        mock_adapter.configured = True
+        mock_adapter.place_order.return_value = {"order_id": "UP-REAL-SQL-1"}
+
+        with patch("backend.execution.LIVE_TRADING_ENABLED", True), \
+             patch("backend.execution.LIVE_ELIGIBLE", True), \
+             patch("backend.execution.get_broker_adapter", return_value=mock_adapter), \
+             patch("backend.execution.intent_detail", return_value={"id": 1, "status": "SUBMITTED"}):
+
+            # 1. Found path (RELIANCE): passes real token from SQL
+            mock_db.execute.return_value.fetchone.side_effect = [
+                {
+                    "id": 1,
+                    "user_id": 1,
+                    "status": "APPROVED",
+                    "symbol": "RELIANCE",
+                    "exchange": "NSE",
+                    "transaction_type": "BUY",
+                    "quantity": 10,
+                    "order_type": "LIMIT",
+                    "product": "CNC",
+                    "limit_price": 2500.0,
+                },
+                {"live_eligible": True},
+            ]
+            res = submit_intent(mock_db, user_id=1, intent_id=1)
+            self.assertEqual(res["status"], "SUBMITTED")
+            mock_adapter.place_order.assert_called_once()
+            self.assertEqual(mock_adapter.place_order.call_args[1].get("instrument_token"), "NSE_EQ|INE002A01018")
+
+            # 2. Missing path (TCS - inactive key in SQL): raises ValueError (broker rejection guard)
+            mock_adapter.place_order.reset_mock()
+            mock_db.execute.return_value.fetchone.side_effect = [
+                {
+                    "id": 2,
+                    "user_id": 1,
+                    "status": "APPROVED",
+                    "symbol": "TCS",
+                    "exchange": "NSE",
+                    "transaction_type": "BUY",
+                    "quantity": 5,
+                    "order_type": "LIMIT",
+                    "product": "CNC",
+                    "limit_price": 3500.0,
+                },
+                {"live_eligible": True},
+            ]
+            with self.assertRaises(ValueError) as ctx:
+                submit_intent(mock_db, user_id=1, intent_id=2)
+            self.assertIn("Missing Upstox provider_key in instrument_provider_keys for NSE:TCS", str(ctx.exception))
+            mock_adapter.place_order.assert_not_called()
+
+            # 3. Database outage path: raises RuntimeError (distinguishable from missing key)
+            from sqlalchemy import create_engine
+            broken_engine = create_engine("sqlite:///:memory:")  # no tables
+            set_execution_engine(broken_engine)
+            mock_db.execute.return_value.fetchone.side_effect = [
+                {
+                    "id": 3,
+                    "user_id": 1,
+                    "status": "APPROVED",
+                    "symbol": "RELIANCE",
+                    "exchange": "NSE",
+                    "transaction_type": "BUY",
+                    "quantity": 10,
+                    "order_type": "LIMIT",
+                    "product": "CNC",
+                    "limit_price": 2500.0,
+                },
+                {"live_eligible": True},
+            ]
+            with self.assertRaises(RuntimeError) as ctx:
+                submit_intent(mock_db, user_id=1, intent_id=3)
+            self.assertIn("Database error while looking up Upstox provider key", str(ctx.exception))
+            mock_adapter.place_order.assert_not_called()
+
+            # Reset engine
+            set_execution_engine(None)
 
 
 if __name__ == "__main__":

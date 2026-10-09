@@ -1,7 +1,10 @@
 """Approval-gated order-intent lifecycle with immutable event history."""
 import json
+import logging
 import uuid
 from typing import Dict, Optional
+
+logger = logging.getLogger("nivesh.execution")
 
 from .config import (
     BROKER_ROUTING, KITE_API_KEY, LIVE_ELIGIBLE, LIVE_TRADING_ENABLED,
@@ -72,15 +75,69 @@ def get_broker_adapter(user_id: int):
     return ZerodhaAdapter(KITE_API_KEY, access_token(user_id))
 
 
-def lookup_upstox_provider_key(symbol: str, exchange: str = "NSE") -> Optional[str]:
-    """Look up exact provider_key from instrument_provider_keys for provider='upstox_v3'."""
-    from sqlalchemy import create_engine, text
+_SHARED_EXECUTION_ENGINE = None
+
+
+def get_execution_engine(database_url: Optional[str] = None):
+    """Lazy singleton engine for order execution lookups."""
+    global _SHARED_EXECUTION_ENGINE
+    if database_url is not None:
+        if _SHARED_EXECUTION_ENGINE is None or str(_SHARED_EXECUTION_ENGINE.url) != database_url:
+            from sqlalchemy import create_engine
+            kwargs = {"pool_pre_ping": True, "future": True}
+            if not database_url.startswith("sqlite"):
+                kwargs["pool_size"] = 3
+                kwargs["max_overflow"] = 2
+            _SHARED_EXECUTION_ENGINE = create_engine(database_url, **kwargs)
+        return _SHARED_EXECUTION_ENGINE
+
+    if _SHARED_EXECUTION_ENGINE is not None:
+        return _SHARED_EXECUTION_ENGINE
+
     from .config import DATABASE_URL
     if not DATABASE_URL:
         return None
+    from sqlalchemy import create_engine
+    kwargs = {"pool_pre_ping": True, "future": True}
+    if not DATABASE_URL.startswith("sqlite"):
+        kwargs["pool_size"] = 3
+        kwargs["max_overflow"] = 2
+    _SHARED_EXECUTION_ENGINE = create_engine(DATABASE_URL, **kwargs)
+    return _SHARED_EXECUTION_ENGINE
+
+
+def set_execution_engine(engine) -> None:
+    """Explicitly set or reset shared execution engine (useful for tests or dependency injection)."""
+    global _SHARED_EXECUTION_ENGINE
+    _SHARED_EXECUTION_ENGINE = engine
+
+
+def lookup_upstox_provider_key(
+    symbol: str,
+    exchange: str = "NSE",
+    engine=None,
+) -> Optional[str]:
+    """Look up exact provider_key from instrument_provider_keys for provider='upstox_v3'.
+
+    Reuses a shared engine instance rather than creating new engines per order.
+    Distinguishes 'no row found' (returns None) from 'database error' (raises RuntimeError and logs).
+    If DATABASE_URL is not configured or engine is unavailable, raises RuntimeError explicitly.
+    """
+    from sqlalchemy import text
+    from .config import DATABASE_URL
+
+    active_engine = engine or get_execution_engine()
+    if active_engine is None:
+        raise RuntimeError(
+            "Database unavailable: DATABASE_URL is not configured; "
+            "instrument master and provider keys cannot be queried."
+        )
+
+    clean_symbol = symbol.strip().upper()
+    clean_exchange = exchange.strip().upper()
+
     try:
-        engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
-        with engine.connect() as conn:
+        with active_engine.connect() as conn:
             row = conn.execute(
                 text("""
                     SELECT k.provider_key
@@ -94,13 +151,22 @@ def lookup_upstox_provider_key(symbol: str, exchange: str = "NSE") -> Optional[s
                     ORDER BY k.last_synced_at DESC NULLS LAST
                     LIMIT 1
                 """),
-                {"symbol": symbol.strip().upper(), "exchange": exchange.strip().upper()}
+                {"symbol": clean_symbol, "exchange": clean_exchange}
             ).fetchone()
             if row and row[0]:
                 return str(row[0])
-    except Exception:
-        pass
-    return None
+            return None
+    except Exception as exc:
+        logger.error(
+            "Database query failed while looking up Upstox provider key for %s:%s: %s",
+            clean_exchange,
+            clean_symbol,
+            exc,
+            exc_info=True,
+        )
+        raise RuntimeError(
+            f"Database error while looking up Upstox provider key for {clean_exchange}:{clean_symbol}: {exc}"
+        ) from exc
 
 
 def submit_intent(db, user_id: int, intent_id: int) -> Dict:
