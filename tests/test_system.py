@@ -220,11 +220,24 @@ class NiveshSystemTests(unittest.TestCase):
         self.assertTrue({"SL", "TP", "OB", "FVG", "CHOCH", "BOS", "POI"}.issubset(GLOSSARY))
 
     def test_analysis_is_persisted(self):
-        result = stock_analysis(self.db, self.user_id, "RELIANCE", enhance_narrative=False)
-        self.assertEqual(result["symbol"], "RELIANCE")
-        self.assertEqual(result["timeframes"]["ltf"], "1D")
-        self.assertEqual(result["data_mode"], "kite_historical")
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM stock_analyses").fetchone()[0], 1)
+        fixture_candles = [
+            {
+                "timestamp": f"2026-01-{(i % 28) + 1:02d}T09:15:00Z",
+                "open": 2400.0 + i,
+                "high": 2410.0 + i,
+                "low": 2390.0 + i,
+                "close": 2405.0 + i,
+                "volume": 100000 + i * 100,
+                "oi": 0,
+            }
+            for i in range(200)
+        ]
+        with patch.object(HistoryStore, "candles", return_value=fixture_candles):
+            result = stock_analysis(self.db, self.user_id, "RELIANCE", enhance_narrative=False)
+            self.assertEqual(result["symbol"], "RELIANCE")
+            self.assertEqual(result["timeframes"]["ltf"], "1D")
+            self.assertEqual(result["data_mode"], "kite_historical")
+            self.assertEqual(self.db.execute("SELECT COUNT(*) FROM stock_analyses").fetchone()[0], 1)
 
     def test_model_catalog_exposes_free_and_paid_routes(self):
         catalog = provider_catalog()

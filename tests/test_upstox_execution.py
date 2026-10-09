@@ -20,6 +20,7 @@ class TestUpstoxExecution(unittest.TestCase):
                 exchange="NSE",
                 product="CNC",
                 price=2950.0,
+                instrument_token="NSE_EQ|INE002A01018",
             )
             self.assertEqual(res["order_id"], "UP-12345")
             self.assertEqual(res["broker"], "upstox")
@@ -31,6 +32,7 @@ class TestUpstoxExecution(unittest.TestCase):
             self.assertEqual(payload["product"], "D")
             self.assertEqual(payload["transaction_type"], "BUY")
             self.assertEqual(payload["order_type"], "LIMIT")
+            self.assertEqual(payload["instrument_token"], "NSE_EQ|INE002A01018")
 
     def test_upstox_adapter_reconcile_orders(self):
         adapter = UpstoxAdapter(access_token="test_token")
@@ -44,7 +46,7 @@ class TestUpstoxExecution(unittest.TestCase):
             self.assertEqual(orders[0]["order_id"], "UP-1")
 
     @patch("backend.execution.BROKER_ROUTING", "upstox")
-    @patch("backend.execution.UPSTOX_ACCESS_TOKEN", "valid_upstox_token")
+    @patch("backend.execution.UPSTOX_ORDER_ACCESS_TOKEN", "valid_upstox_order_token")
     def test_get_broker_adapter_routes_to_upstox(self):
         adapter = get_broker_adapter(user_id=1)
         self.assertIsInstance(adapter, UpstoxAdapter)

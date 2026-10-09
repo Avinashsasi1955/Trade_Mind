@@ -40,7 +40,7 @@ class UpstoxAdapter:
 
     def _request(self, path: str, params: Optional[Dict] = None, data: Optional[Dict] = None, method: str = "GET") -> Any:
         if not self.configured:
-            raise RuntimeError("Set UPSTOX_ACCESS_TOKEN before calling Upstox order APIs")
+            raise RuntimeError("UPSTOX_ORDER_ACCESS_TOKEN is missing or not configured before calling Upstox order APIs")
         url = f"{self.base_url}{path}"
         body = None
         if params and method == "GET":
@@ -114,15 +114,9 @@ class UpstoxAdapter:
 
         # Upstox product codes: D for delivery (CNC), I for intraday (MIS)
         prod = "I" if product.upper() in {"MIS", "INTRADAY", "I"} else "D"
-        if instrument_token:
-            instr_key = instrument_token
-        elif "|" in symbol:
-            instr_key = symbol
-        elif exchange.upper() in {"NFO", "BFO"} or bool(re.search(r"\d+(CE|PE)$", symbol.upper())) or symbol.upper().endswith("FUT"):
-            prefix = "BSE_FO" if exchange.upper() == "BFO" else "NSE_FO"
-            instr_key = f"{prefix}|{symbol.upper()}"
-        else:
-            instr_key = f"{exchange.upper()}_EQ|{symbol.upper()}"
+        if not instrument_token:
+            raise ValueError(f"Explicit Upstox instrument_token required for {symbol}; symbol-based key guessing is disabled")
+        instr_key = instrument_token
 
         payload = {
             "quantity": int(quantity),

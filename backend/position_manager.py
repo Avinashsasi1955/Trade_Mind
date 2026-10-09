@@ -36,6 +36,34 @@ IST = ZoneInfo("Asia/Kolkata")
 TRADE_BAR_SOURCES = ("zerodha_kite", "kite_gap_backfill", "upstox_v3", "upstox_rest_5m")
 
 
+
+def execute_exit(
+    engine,
+    audit_id: int,
+    price: Any = None,
+    reason: str = "",
+    exit_at: Optional[datetime] = None,
+    is_synthetic: bool = False,
+    exit_price: Any = None,
+    exit_reason: str = "",
+) -> bool:
+    """Module-level atomic exit writer: takes an existing engine to prevent per-exit connection allocations and password masking issues."""
+    final_price = exit_price if exit_price is not None else price
+    final_reason = exit_reason if exit_reason else reason
+    if final_price is None:
+        raise ValueError("price is required")
+    exit_time = exit_at or datetime.now(timezone.utc)
+    record_shadow_exit(
+        engine,
+        int(audit_id),
+        Decimal(str(final_price)) if not isinstance(final_price, Decimal) else final_price,
+        str(final_reason),
+        exit_at=exit_time,
+        is_synthetic=is_synthetic,
+    )
+    return True
+
+
 class PositionManager:
     def __init__(self, database_url: Optional[str] = None, redis_url: Optional[str] = None):
         self.database_url = database_url or DATABASE_URL or os.getenv("DATABASE_URL", "")
@@ -79,16 +107,14 @@ class PositionManager:
         is_synthetic: bool = False,
     ) -> bool:
         """Atomic exit writer: executes exit through the single exit authority."""
-        exit_time = exit_at or datetime.now(timezone.utc)
-        record_shadow_exit(
+        return execute_exit(
             self.engine,
-            int(audit_id),
-            exit_price,
-            exit_reason,
-            exit_at=exit_time,
+            audit_id=audit_id,
+            price=exit_price,
+            reason=exit_reason,
+            exit_at=exit_at,
             is_synthetic=is_synthetic,
         )
-        return True
 
     def is_force_flat_time(self, current_dt: datetime) -> bool:
         """Returns True if current time is at or past 15:15 IST (avoiding Zerodha RMS penalty)."""

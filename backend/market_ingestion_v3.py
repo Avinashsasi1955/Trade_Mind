@@ -151,9 +151,8 @@ class PostgresBarAggregator:
 
             if exit_reason:
                 try:
-                    from .position_manager import PositionManager
-                    pm = PositionManager(database_url=str(self.engine.url))
-                    pm.execute_exit(int(trade["id"]), price, exit_reason, exit_at=observed)
+                    from .position_manager import execute_exit
+                    execute_exit(self.engine, int(trade["id"]), price, exit_reason, exit_at=observed)
                 except Exception as exc:
                     logger.error("Failed to record instant exit breach for trade %s: %s", trade.get("id"), exc, exc_info=True)
             else:
@@ -236,16 +235,18 @@ class PostgresBarAggregator:
                     state = None
 
                 if state is None:
+                    ist_time = observed.astimezone(IST).time()
+                    is_session_open = time(9, 15) <= ist_time < time(9, 16)
                     prev_entry = self.prev_cumulative_volume.get(instrument)
                     if prev_entry is not None:
                         cached_date, cached_vol = prev_entry
                         if ist_date != cached_date or raw_vol < cached_vol:
-                            # New session or exchange counter reset: baseline resets to raw_vol
-                            baseline = raw_vol
+                            # New session or exchange counter reset
+                            baseline = 0 if is_session_open else raw_vol
                         else:
                             baseline = cached_vol
                     else:
-                        baseline = raw_vol
+                        baseline = 0 if is_session_open else raw_vol
                     cur_vol_record = max(cached_vol if (prev_entry and ist_date == prev_entry[0] and raw_vol >= prev_entry[1]) else 0, raw_vol)
                     self.prev_cumulative_volume[instrument] = (ist_date, cur_vol_record)
                     state = {

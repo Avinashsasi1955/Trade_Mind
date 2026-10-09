@@ -1,7 +1,7 @@
 """Approval-gated order-intent lifecycle with immutable event history."""
 import json
 import uuid
-from typing import Dict
+from typing import Dict, Optional
 
 from .config import (
     BROKER_ROUTING, KITE_API_KEY, LIVE_ELIGIBLE, LIVE_TRADING_ENABLED,
@@ -60,15 +60,47 @@ def approve_intent(db,user_id:int,intent_id:int)->Dict:
 def get_broker_adapter(user_id: int):
     """Return active broker adapter (Upstox or Zerodha) based on configuration and active sessions."""
     routing = BROKER_ROUTING.lower()
-    upstox_token = UPSTOX_ORDER_ACCESS_TOKEN or UPSTOX_ACCESS_TOKEN
     if routing == "upstox":
-        return UpstoxAdapter(UPSTOX_API_KEY, upstox_token, UPSTOX_API_SECRET)
+        if not UPSTOX_ORDER_ACCESS_TOKEN:
+            raise ValueError("UPSTOX_ORDER_ACCESS_TOKEN is missing. Daily interactive write token is required for Upstox order execution.")
+        return UpstoxAdapter(UPSTOX_API_KEY, UPSTOX_ORDER_ACCESS_TOKEN, UPSTOX_API_SECRET)
     if routing == "zerodha":
         return ZerodhaAdapter(KITE_API_KEY, access_token(user_id))
     # Auto routing:
-    if upstox_token and not (KITE_API_KEY and access_token(user_id)):
-        return UpstoxAdapter(UPSTOX_API_KEY, upstox_token, UPSTOX_API_SECRET)
+    if UPSTOX_ORDER_ACCESS_TOKEN and not (KITE_API_KEY and access_token(user_id)):
+        return UpstoxAdapter(UPSTOX_API_KEY, UPSTOX_ORDER_ACCESS_TOKEN, UPSTOX_API_SECRET)
     return ZerodhaAdapter(KITE_API_KEY, access_token(user_id))
+
+
+def lookup_upstox_provider_key(symbol: str, exchange: str = "NSE") -> Optional[str]:
+    """Look up exact provider_key from instrument_provider_keys for provider='upstox_v3'."""
+    from sqlalchemy import create_engine, text
+    from .config import DATABASE_URL
+    if not DATABASE_URL:
+        return None
+    try:
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT k.provider_key
+                    FROM instrument_provider_keys k
+                    JOIN instrument_master i ON i.id = k.instrument_id
+                    WHERE k.provider = 'upstox_v3'
+                      AND k.is_active
+                      AND i.is_active
+                      AND UPPER(i.symbol) = UPPER(:symbol)
+                      AND UPPER(i.exchange) = UPPER(:exchange)
+                    ORDER BY k.last_synced_at DESC NULLS LAST
+                    LIMIT 1
+                """),
+                {"symbol": symbol.strip().upper(), "exchange": exchange.strip().upper()}
+            ).fetchone()
+            if row and row[0]:
+                return str(row[0])
+    except Exception:
+        pass
+    return None
 
 
 def submit_intent(db, user_id: int, intent_id: int) -> Dict:
@@ -88,7 +120,16 @@ def submit_intent(db, user_id: int, intent_id: int) -> Dict:
     adapter = get_broker_adapter(user_id)
     if not adapter.configured:
         raise ValueError("Broker session is not configured")
-    result = adapter.place_order(row["symbol"], row["transaction_type"], row["quantity"], row["order_type"], row["exchange"], row["product"], row["limit_price"])
+    kwargs = {}
+    if isinstance(adapter, UpstoxAdapter):
+        provider_key = lookup_upstox_provider_key(row["symbol"], row["exchange"])
+        if not provider_key:
+            raise ValueError(
+                f"Missing Upstox provider_key in instrument_provider_keys for {row['exchange']}:{row['symbol']}. "
+                "Order intent rejected to prevent broker rejection."
+            )
+        kwargs["instrument_token"] = provider_key
+    result = adapter.place_order(row["symbol"], row["transaction_type"], row["quantity"], row["order_type"], row["exchange"], row["product"], row["limit_price"], **kwargs)
     stamp = now_iso()
     broker_id = str(result.get("order_id", ""))
     db.execute("UPDATE order_intents SET status='SUBMITTED',broker_order_id=?,submitted_at=?,updated_at=? WHERE id=?", (broker_id, stamp, stamp, intent_id))
