@@ -9,12 +9,14 @@ that optional production dependencies such as broker OI reconciliation are ready
 """
 import json
 import os
+import subprocess
 from decimal import Decimal
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from .trade_quality import quality_feedback, score_trade
 
 IST=ZoneInfo("Asia/Kolkata")
@@ -390,6 +392,26 @@ def open_session(engine,session_date: date = None) -> Dict:
     return {"session_date":day.isoformat(),"status":"STARTED","completed_sessions":int(completed),"target":90,"orders_allowed":False}
 
 
+def get_code_version() -> str:
+    """Retrieve the current Git commit hash or configured version string."""
+    env_ver = os.getenv("NIVESH_CODE_VERSION") or os.getenv("GIT_COMMIT_HASH")
+    if env_ver:
+        return env_ver.strip()
+    try:
+        repo_root = Path(__file__).resolve().parent.parent
+        res = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        if res:
+            return res
+    except Exception:
+        pass
+    return "unknown"
+
+
 def _persist_daily_log(engine, today: Dict, completed: int, effective_completed: int) -> None:
     """Materialise the daily validation state for dashboards and spreadsheets.
 
@@ -397,64 +419,119 @@ def _persist_daily_log(engine, today: Dict, completed: int, effective_completed:
     live_market_bars, shadow_predictions, market_data_gaps, and
     shadow_execution_audits.
     """
-    metrics=today.get("metrics") or {}
-    pnl=today.get("paper_pnl") or {}
-    mistakes=(pnl.get("mistake_analysis") or {})
+    code_version = get_code_version()
+    today["code_version"] = code_version
+    metrics = today.get("metrics") or {}
+    if isinstance(metrics, dict):
+        metrics["code_version"] = code_version
+    pnl = today.get("paper_pnl") or {}
+    mistakes = (pnl.get("mistake_analysis") or {})
+
     with engine.begin() as connection:
-        connection.execute(text("""
-            INSERT INTO shadow_session_daily_log(
-                session_date,status,valid,completed_sessions,effective_completed_sessions,
-                live_one_minute_buckets,live_five_minute_buckets,live_instruments_seen,
-                repaired_one_minute_bars,repaired_five_minute_bars,predictions,trades_taken,
-                closed_trades,win_rate_pct,net_pnl,rejection_reasons,warnings,mistakes,metrics
-            ) VALUES (
-                :session_date,:status,:valid,:completed_sessions,:effective_completed_sessions,
-                :live_one_minute_buckets,:live_five_minute_buckets,:live_instruments_seen,
-                :repaired_one_minute_bars,:repaired_five_minute_bars,:predictions,:trades_taken,
-                :closed_trades,:win_rate_pct,:net_pnl,CAST(:rejection_reasons AS jsonb),
-                CAST(:warnings AS jsonb),CAST(:mistakes AS jsonb),CAST(:metrics AS jsonb)
-            )
-            ON CONFLICT(session_date) DO UPDATE SET
-                status=EXCLUDED.status,
-                valid=EXCLUDED.valid,
-                completed_sessions=EXCLUDED.completed_sessions,
-                effective_completed_sessions=EXCLUDED.effective_completed_sessions,
-                live_one_minute_buckets=EXCLUDED.live_one_minute_buckets,
-                live_five_minute_buckets=EXCLUDED.live_five_minute_buckets,
-                live_instruments_seen=EXCLUDED.live_instruments_seen,
-                repaired_one_minute_bars=EXCLUDED.repaired_one_minute_bars,
-                repaired_five_minute_bars=EXCLUDED.repaired_five_minute_bars,
-                predictions=EXCLUDED.predictions,
-                trades_taken=EXCLUDED.trades_taken,
-                closed_trades=EXCLUDED.closed_trades,
-                win_rate_pct=EXCLUDED.win_rate_pct,
-                net_pnl=EXCLUDED.net_pnl,
-                rejection_reasons=EXCLUDED.rejection_reasons,
-                warnings=EXCLUDED.warnings,
-                mistakes=EXCLUDED.mistakes,
-                metrics=EXCLUDED.metrics,
-                updated_at=CURRENT_TIMESTAMP
-        """),{
-            "session_date":today.get("session_date"),
-            "status":today.get("status"),
-            "valid":bool(today.get("eligible")),
-            "completed_sessions":int(completed or 0),
-            "effective_completed_sessions":int(effective_completed or 0),
-            "live_one_minute_buckets":int(metrics.get("one_minute_buckets") or 0),
-            "live_five_minute_buckets":int(metrics.get("five_minute_buckets") or 0),
-            "live_instruments_seen":int(metrics.get("instruments_seen") or 0),
-            "repaired_one_minute_bars":int(metrics.get("repaired_one_minute_bars") or 0),
-            "repaired_five_minute_bars":int(metrics.get("repaired_five_minute_bars") or 0),
-            "predictions":int(metrics.get("predictions") or 0),
-            "trades_taken":int(pnl.get("closed_trades") or 0)+int(pnl.get("open_trades") or 0),
-            "closed_trades":int(pnl.get("closed_trades") or 0),
-            "win_rate_pct":Decimal(str(pnl.get("win_rate_pct") or 0)),
-            "net_pnl":Decimal(str(pnl.get("net_marked_pnl") or 0)),
-            "rejection_reasons":json.dumps(today.get("rejection_reasons") or []),
-            "warnings":json.dumps(today.get("warnings") or []),
-            "mistakes":json.dumps(mistakes,default=str),
-            "metrics":json.dumps(metrics,default=str),
-        })
+        has_code_col = False
+        try:
+            inspector = inspect(connection)
+            cols = {c["name"] for c in inspector.get_columns("shadow_session_daily_log")}
+            has_code_col = "code_version" in cols
+        except Exception:
+            pass
+
+        params = {
+            "session_date": today.get("session_date"),
+            "status": today.get("status"),
+            "valid": bool(today.get("eligible")),
+            "completed_sessions": int(completed or 0),
+            "effective_completed_sessions": int(effective_completed or 0),
+            "live_one_minute_buckets": int(metrics.get("one_minute_buckets") or 0),
+            "live_five_minute_buckets": int(metrics.get("five_minute_buckets") or 0),
+            "live_instruments_seen": int(metrics.get("instruments_seen") or 0),
+            "repaired_one_minute_bars": int(metrics.get("repaired_one_minute_bars") or 0),
+            "repaired_five_minute_bars": int(metrics.get("repaired_five_minute_bars") or 0),
+            "predictions": int(metrics.get("predictions") or 0),
+            "trades_taken": int(pnl.get("closed_trades") or 0) + int(pnl.get("open_trades") or 0),
+            "closed_trades": int(pnl.get("closed_trades") or 0),
+            "win_rate_pct": Decimal(str(pnl.get("win_rate_pct") or 0)),
+            "net_pnl": Decimal(str(pnl.get("net_marked_pnl") or 0)),
+            "rejection_reasons": json.dumps(today.get("rejection_reasons") or []),
+            "warnings": json.dumps(today.get("warnings") or []),
+            "mistakes": json.dumps(mistakes, default=str),
+            "metrics": json.dumps(metrics, default=str),
+            "code_version": code_version,
+        }
+
+        if has_code_col:
+            connection.execute(text("""
+                INSERT INTO shadow_session_daily_log(
+                    session_date,status,valid,completed_sessions,effective_completed_sessions,
+                    live_one_minute_buckets,live_five_minute_buckets,live_instruments_seen,
+                    repaired_one_minute_bars,repaired_five_minute_bars,predictions,trades_taken,
+                    closed_trades,win_rate_pct,net_pnl,rejection_reasons,warnings,mistakes,metrics,
+                    code_version
+                ) VALUES (
+                    :session_date,:status,:valid,:completed_sessions,:effective_completed_sessions,
+                    :live_one_minute_buckets,:live_five_minute_buckets,:live_instruments_seen,
+                    :repaired_one_minute_bars,:repaired_five_minute_bars,:predictions,:trades_taken,
+                    :closed_trades,:win_rate_pct,:net_pnl,CAST(:rejection_reasons AS jsonb),
+                    CAST(:warnings AS jsonb),CAST(:mistakes AS jsonb),CAST(:metrics AS jsonb),
+                    :code_version
+                )
+                ON CONFLICT(session_date) DO UPDATE SET
+                    status=EXCLUDED.status,
+                    valid=EXCLUDED.valid,
+                    completed_sessions=EXCLUDED.completed_sessions,
+                    effective_completed_sessions=EXCLUDED.effective_completed_sessions,
+                    live_one_minute_buckets=EXCLUDED.live_one_minute_buckets,
+                    live_five_minute_buckets=EXCLUDED.live_five_minute_buckets,
+                    live_instruments_seen=EXCLUDED.live_instruments_seen,
+                    repaired_one_minute_bars=EXCLUDED.repaired_one_minute_bars,
+                    repaired_five_minute_bars=EXCLUDED.repaired_five_minute_bars,
+                    predictions=EXCLUDED.predictions,
+                    trades_taken=EXCLUDED.trades_taken,
+                    closed_trades=EXCLUDED.closed_trades,
+                    win_rate_pct=EXCLUDED.win_rate_pct,
+                    net_pnl=EXCLUDED.net_pnl,
+                    rejection_reasons=EXCLUDED.rejection_reasons,
+                    warnings=EXCLUDED.warnings,
+                    mistakes=EXCLUDED.mistakes,
+                    metrics=EXCLUDED.metrics,
+                    code_version=EXCLUDED.code_version,
+                    updated_at=CURRENT_TIMESTAMP
+            """), params)
+        else:
+            connection.execute(text("""
+                INSERT INTO shadow_session_daily_log(
+                    session_date,status,valid,completed_sessions,effective_completed_sessions,
+                    live_one_minute_buckets,live_five_minute_buckets,live_instruments_seen,
+                    repaired_one_minute_bars,repaired_five_minute_bars,predictions,trades_taken,
+                    closed_trades,win_rate_pct,net_pnl,rejection_reasons,warnings,mistakes,metrics
+                ) VALUES (
+                    :session_date,:status,:valid,:completed_sessions,:effective_completed_sessions,
+                    :live_one_minute_buckets,:live_five_minute_buckets,:live_instruments_seen,
+                    :repaired_one_minute_bars,:repaired_five_minute_bars,:predictions,:trades_taken,
+                    :closed_trades,:win_rate_pct,:net_pnl,CAST(:rejection_reasons AS jsonb),
+                    CAST(:warnings AS jsonb),CAST(:mistakes AS jsonb),CAST(:metrics AS jsonb)
+                )
+                ON CONFLICT(session_date) DO UPDATE SET
+                    status=EXCLUDED.status,
+                    valid=EXCLUDED.valid,
+                    completed_sessions=EXCLUDED.completed_sessions,
+                    effective_completed_sessions=EXCLUDED.effective_completed_sessions,
+                    live_one_minute_buckets=EXCLUDED.live_one_minute_buckets,
+                    live_five_minute_buckets=EXCLUDED.live_five_minute_buckets,
+                    live_instruments_seen=EXCLUDED.live_instruments_seen,
+                    repaired_one_minute_bars=EXCLUDED.repaired_one_minute_bars,
+                    repaired_five_minute_bars=EXCLUDED.repaired_five_minute_bars,
+                    predictions=EXCLUDED.predictions,
+                    trades_taken=EXCLUDED.trades_taken,
+                    closed_trades=EXCLUDED.closed_trades,
+                    win_rate_pct=EXCLUDED.win_rate_pct,
+                    net_pnl=EXCLUDED.net_pnl,
+                    rejection_reasons=EXCLUDED.rejection_reasons,
+                    warnings=EXCLUDED.warnings,
+                    mistakes=EXCLUDED.mistakes,
+                    metrics=EXCLUDED.metrics,
+                    updated_at=CURRENT_TIMESTAMP
+            """), params)
 
 
 def finalize_session(engine,session_date: date = None) -> Dict:

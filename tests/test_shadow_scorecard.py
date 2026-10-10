@@ -304,8 +304,8 @@ class TestShadowScorecard(unittest.TestCase):
         cr = compute_cost_realism(trades)
         self.assertEqual(cr["fills_analyzed"], 2)
         self.assertEqual(cr["avg_assumed_slippage_points"], 0.10)
-        self.assertEqual(cr["avg_realised_slippage_points"], 0.275)
-        self.assertEqual(cr["slippage_drag_points"], 0.175)
+        self.assertEqual(cr["avg_realised_slippage_points"], 0.20)
+        self.assertEqual(cr["slippage_drag_points"], 0.10)
 
     def test_layer_attribution_fidelity_pass_and_fail(self):
         """Test layer veto attribution with passing vs failing fidelity check."""

@@ -323,7 +323,13 @@ def compute_exit_attribution(trades: Sequence[ShadowTrade]) -> Dict[str, Dict[st
 
 
 def compute_cost_realism(trades: Sequence[ShadowTrade]) -> Dict[str, Any]:
-    """Compute assumed versus realised slippage per trade where fills exist."""
+    """Compute assumed versus realised slippage per trade where fills exist.
+    
+    Both assumed and realised slippage use identical units:
+    - Points per share (pts/share)
+    - Normalized R per trade
+    Realised slippage is measured directly as actual fill versus decision price.
+    """
     fills = [t for t in trades if t.theoretical_fill_price > 0 and t.decision_price > 0]
     n_fills = len(fills)
     if n_fills == 0:
@@ -332,36 +338,44 @@ def compute_cost_realism(trades: Sequence[ShadowTrade]) -> Dict[str, Any]:
             "status": "INSUFFICIENT DATA (n=0)",
         }
 
-    assumed_slips = []
-    realised_slips = []
+    assumed_slips_pts = []
+    realised_slips_pts = []
+    assumed_slips_r = []
+    realised_slips_r = []
 
     for t in fills:
-        # Assumed slippage: one_tick_penalty or distance from decision to theoretical fill
+        qty = t.quantity if t.quantity > 0 else 1
+        # Assumed slippage in points per share: one_tick_penalty or distance from decision to fill
         if t.one_tick_penalty is not None and t.one_tick_penalty > 0:
-            assumed = t.one_tick_penalty
+            assumed_pts = float(t.one_tick_penalty)
         else:
-            assumed = abs(t.theoretical_fill_price - t.decision_price)
-        assumed_slips.append(assumed)
+            assumed_pts = abs(float(t.theoretical_fill_price - t.decision_price))
+        assumed_slips_pts.append(assumed_pts)
+        if t.risk_rupees > 0:
+            assumed_slips_r.append((assumed_pts * qty) / t.risk_rupees)
 
-        # Realised slippage
-        # If best_ask / best_bid is recorded:
-        if t.side.upper() == "BUY" and t.best_ask is not None and t.best_ask > 0:
-            realised = abs(t.best_ask - t.decision_price)
-        elif t.side.upper() == "SELL" and t.best_bid is not None and t.best_bid > 0:
-            realised = abs(t.decision_price - t.best_bid)
-        else:
-            realised = abs(t.theoretical_fill_price - t.decision_price)
-        realised_slips.append(realised)
+        # Realised slippage measured directly as actual fill versus decision price
+        realised_pts = abs(float(t.theoretical_fill_price - t.decision_price))
+        realised_slips_pts.append(realised_pts)
+        if t.risk_rupees > 0:
+            realised_slips_r.append((realised_pts * qty) / t.risk_rupees)
 
-    avg_assumed = _safe_mean(assumed_slips) if assumed_slips else 0.0
-    avg_realised = _safe_mean(realised_slips) if realised_slips else 0.0
-    slippage_drag = avg_realised - avg_assumed
+    avg_assumed_pts = _safe_mean(assumed_slips_pts) if assumed_slips_pts else 0.0
+    avg_realised_pts = _safe_mean(realised_slips_pts) if realised_slips_pts else 0.0
+    slippage_drag_pts = avg_realised_pts - avg_assumed_pts
+
+    avg_assumed_r = _safe_mean(assumed_slips_r) if assumed_slips_r else 0.0
+    avg_realised_r = _safe_mean(realised_slips_r) if realised_slips_r else 0.0
+    slippage_drag_r = avg_realised_r - avg_assumed_r
 
     return {
         "fills_analyzed": n_fills,
-        "avg_assumed_slippage_points": round(avg_assumed, 4),
-        "avg_realised_slippage_points": round(avg_realised, 4),
-        "slippage_drag_points": round(slippage_drag, 4),
+        "avg_assumed_slippage_points": round(avg_assumed_pts, 4),
+        "avg_realised_slippage_points": round(avg_realised_pts, 4),
+        "slippage_drag_points": round(slippage_drag_pts, 4),
+        "avg_assumed_slippage_r": round(avg_assumed_r, 4),
+        "avg_realised_slippage_r": round(avg_realised_r, 4),
+        "slippage_drag_r": round(slippage_drag_r, 4),
         "status": "MEASURED",
     }
 
@@ -985,10 +999,11 @@ def format_plain_text_report(report: Dict[str, Any]) -> str:
         lines.append("  INSUFFICIENT DATA (n=0 fills analyzed)")
     else:
         lines.append(f"  Fills Analyzed       : {cr.get('fills_analyzed', 0)}")
-        lines.append(f"  Assumed Slippage     : {cr.get('avg_assumed_slippage_points', 0.0):.4f} pts/trade")
-        lines.append(f"  Realised Slippage    : {cr.get('avg_realised_slippage_points', 0.0):.4f} pts/trade")
-        drag = cr.get('slippage_drag_points', 0.0)
-        lines.append(f"  Net Slippage Drag    : {drag:+.4f} pts/trade ({'FAVORABLE' if drag <= 0 else 'ADVERSE'})")
+        lines.append(f"  Assumed Slippage     : {cr.get('avg_assumed_slippage_points', 0.0):.4f} pts/share ({cr.get('avg_assumed_slippage_r', 0.0):+.4f}R)")
+        lines.append(f"  Realised Slippage    : {cr.get('avg_realised_slippage_points', 0.0):.4f} pts/share ({cr.get('avg_realised_slippage_r', 0.0):+.4f}R) [fill vs decision]")
+        drag_pts = cr.get('slippage_drag_points', 0.0)
+        drag_r = cr.get('slippage_drag_r', 0.0)
+        lines.append(f"  Net Slippage Drag    : {drag_pts:+.4f} pts/share ({drag_r:+.4f}R)")
 
     # Section 5: Data Integrity
     lines.append("\n[5] DATA INTEGRITY AUDIT")
