@@ -263,29 +263,35 @@ class TestPhase3LabelsAndSplits(unittest.TestCase):
             LabelBuilder.create_tables(conn)
 
             base_time = datetime(2026, 6, 1, 9, 15, 0)
-            bars = self._generate_synthetic_bars(base_time, count=15, start_price=100.0, trend=0.2)
+            bars = self._generate_synthetic_bars(base_time, count=25, start_price=100.0, trend=0.5)
             labels = self.builder.build_labels_for_series("NSE", "TCS", bars, min_future_bars=2)
-            self.assertEqual(len(labels), 13)
+            self.assertEqual(len(labels), 23)
 
             saved_count = LabelBuilder.save_labels(conn, labels)
-            self.assertEqual(saved_count, 13)
+            self.assertEqual(saved_count, 23)
 
             loaded_all = LabelBuilder.load_labels(conn, exchange="NSE", symbol="TCS", include_censored=True)
-            self.assertEqual(len(loaded_all), 13)
+            self.assertEqual(len(loaded_all), 23)
             self.assertIn("exit_date", loaded_all[0])
 
             loaded_uncensored = LabelBuilder.load_labels(conn, exchange="NSE", symbol="TCS", include_censored=False)
             self.assertEqual(len(loaded_uncensored), 7)
+            self.assertIn("hit_1r_first_long", loaded_all[0])
+            self.assertIn("max_favourable_r_long", loaded_all[0])
+            self.assertIn("max_adverse_r_long", loaded_all[0])
             conn.close()
 
             # 2. Test via SQLAlchemy Engine (used by Postgres/SQLAlchemy in production) with bound parameters
             sa_engine = create_engine(f"sqlite:///{db_path}")
             loaded_sa = LabelBuilder.load_labels(sa_engine, exchange="NSE", symbol="TCS", include_censored=True)
-            self.assertEqual(len(loaded_sa), 13)
+            self.assertEqual(len(loaded_sa), 23)
+            self.assertIn("hit_1r_first_short", loaded_sa[0])
+            self.assertIn("max_favourable_r_short", loaded_sa[0])
+            self.assertIn("max_adverse_r_short", loaded_sa[0])
 
             # Idempotent upsert via SQLAlchemy
             saved_sa = LabelBuilder.save_labels(sa_engine, labels)
-            self.assertEqual(saved_sa, 13)
+            self.assertEqual(saved_sa, 23)
             sa_engine.dispose()
         finally:
             if os.path.exists(db_path):
@@ -304,6 +310,75 @@ class TestPhase3LabelsAndSplits(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             self.builder.build_labels_for_series("NSE", "INFY", [{"timestamp": "2026-06-01T09:15:00", "close": 100.0}], min_future_bars=5)
+
+    def test_continuous_series_no_false_gap_exit(self):
+        """On a series where every bar opens at previous close, GAP_DOWN_STOP and GAP_UP_STOP must NOT appear."""
+        from backend.position_manager import replay_trade_walk_forward
+        trade_long = {
+            "entry": 1000.0,
+            "theoretical_fill_price": 1000.0,
+            "stop_loss_price": 990.0,
+            "take_profit_price": 1030.0,
+            "side": "BUY",
+            "quantity": 1,
+            "estimated_fees": 20.0,
+            "signal_at": "2026-06-01T09:15:00+05:30",
+            "trade_mode": "INTRADAY",
+        }
+        # Bar 0: reaches +1.2R (triggers breakeven candidate), closes at 1005.0
+        # Bar 1: opens at 1005.0 (exact previous close, zero gap!)
+        bars = [
+            {"bar_time": "2026-06-01T09:15:00+05:30", "open": 1000.0, "high": 1012.0, "low": 999.0, "close": 1005.0, "volume": 100},
+            {"bar_time": "2026-06-01T09:16:00+05:30", "open": 1005.0, "high": 1006.0, "low": 1004.0, "close": 1005.0, "volume": 100},
+        ]
+        res = replay_trade_walk_forward(trade_long, bars)
+        self.assertNotEqual(res["exit_reason"], "GAP_DOWN_STOP")
+
+        # Intra-bar spike and pullback: trailing stop breached on Bar 0 pulls back to 1015 (< trailing stop 1020)
+        # Bar 1 opens at 1015 (exact previous close). Must exit as TRAILING_STOP, not GAP_DOWN_STOP.
+        trade_trail = {
+            "entry": 1000.0,
+            "theoretical_fill_price": 1000.0,
+            "stop_loss_price": 990.0,
+            "take_profit_price": 1030.0,
+            "side": "BUY",
+            "quantity": 100,
+            "estimated_fees": 0.0,
+            "signal_at": "2026-06-01T09:15:00+05:30",
+            "trade_mode": "INTRADAY",
+        }
+        bars_trail = [
+            {"bar_time": "2026-06-01T09:15:00+05:30", "open": 1000.0, "high": 1025.0, "low": 999.0, "close": 1015.0, "volume": 100},
+            {"bar_time": "2026-06-01T09:16:00+05:30", "open": 1015.0, "high": 1018.0, "low": 1014.0, "close": 1016.0, "volume": 100},
+        ]
+        res_trail = replay_trade_walk_forward(trade_trail, bars_trail)
+        self.assertEqual(res_trail["exit_reason"], "TRAILING_STOP")
+
+    def test_hit_1r_first_and_excursion_tracking(self):
+        """hit_1r_first is 1 if favourable excursion reaches +1R before -1R, else 0, with max excursions."""
+        base_time = datetime(2026, 6, 1, 9, 30, 0)
+        entry_bar = {
+            "timestamp": base_time.isoformat(),
+            "close": 100.0,
+            "atr": 1.0,  # Long R = max(1.5, 0.6) = 1.5. +1R is 101.6, -1R is 98.6
+        }
+
+        # Case A: High reaches +1.5R (102.5) before Low touches -1R (low is 99.8)
+        future_a = [
+            {"timestamp": (base_time + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 102.5, "low": 99.8, "close": 102.0},
+        ]
+        sim_a = self.builder.simulate_candidate(entry_bar, future_a, side="BUY")
+        self.assertEqual(sim_a["hit_1r_first"], 1)
+        self.assertGreaterEqual(sim_a["max_favourable_r"], 1.0)
+        self.assertGreater(sim_a["max_adverse_r"], -1.0)
+
+        # Case B: Low drops to 98.0 (< 98.6, reaching -1R) before high reaches +1R (high is 100.2)
+        future_b = [
+            {"timestamp": (base_time + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 100.2, "low": 98.0, "close": 98.2},
+        ]
+        sim_b = self.builder.simulate_candidate(entry_bar, future_b, side="BUY")
+        self.assertEqual(sim_b["hit_1r_first"], 0)
+        self.assertLessEqual(sim_b["max_adverse_r"], -1.0)
 
     def test_purged_group_time_series_split_by_trading_day(self):
         """PurgedGroupTimeSeriesSplit must group by trading day and enforce purge buffers."""

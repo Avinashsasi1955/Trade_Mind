@@ -233,14 +233,14 @@ class TestPositionManagerProfitHarvestIntegration(unittest.TestCase):
             "stop_loss_price": Decimal("90.0"),
             "take_profit_price": Decimal("115.0"),
             "quantity": 10,
-            "signal_at": datetime.now(timezone.utc),
+            "signal_at": datetime(2026, 6, 1, 4, 30, 0, tzinfo=timezone.utc),
             "trade_mode": "INTRADAY",
             "improvement_note": "{}",
             "exchange": "NSE",
         }
 
         self.pm.get_latest_price = MagicMock(return_value=(Decimal("107.5"), "zerodha_kite"))
-        watermark = datetime.now(timezone.utc)
+        watermark = datetime(2026, 6, 1, 4, 45, 0, tzinfo=timezone.utc)
         eval_res = self.pm.evaluate_position(pos, watermark)
 
         self.assertIsNotNone(eval_res)
@@ -327,7 +327,7 @@ class TestPositionManagerProfitHarvestIntegration(unittest.TestCase):
             "stop_loss_price": Decimal("90.0"),
             "take_profit_price": Decimal("115.0"),
             "quantity": 10,
-            "signal_at": datetime.now(timezone.utc),
+            "signal_at": datetime(2026, 6, 1, 4, 30, 0, tzinfo=timezone.utc),
             "trade_mode": "INTRADAY",
             "improvement_note": "{}",
             "exchange": "NSE",
@@ -348,7 +348,7 @@ class TestPositionManagerProfitHarvestIntegration(unittest.TestCase):
             "components": {},
             "reasons": ["vwap cross", "rsi rollover"],
         }):
-            watermark = datetime.now(timezone.utc)
+            watermark = datetime(2026, 6, 1, 4, 45, 0, tzinfo=timezone.utc)
             eval_res = self.pm.evaluate_position(pos, watermark)
 
             self.assertIsNotNone(eval_res)

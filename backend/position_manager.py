@@ -1852,6 +1852,7 @@ def replay_trade_walk_forward(
 
     target_dist = abs(take_profit - entry) if take_profit else (r_points * Decimal("1.5"))
     fee_buffer = ((fees * Decimal("2.5")) + (Decimal("2") * Decimal(str(tick_size)) * quantity)) / max(Decimal("1"), quantity)
+    fee_buffer = min(fee_buffer, Decimal("0.25") * r_points)
 
     running_sl_reason = "STOP_LOSS"
     pending_market_exit: Optional[str] = None
@@ -1859,6 +1860,12 @@ def replay_trade_walk_forward(
     exit_price: Optional[Decimal] = None
     exit_reason: Optional[str] = None
     harvest_stop: Optional[Decimal] = None
+    prev_close: Optional[Decimal] = None
+
+    hit_1r_first: int = 0
+    barrier_decided: bool = False
+    max_favourable_r: Decimal = Decimal("0.0")
+    max_adverse_r: Decimal = Decimal("0.0")
 
     # Determine start timestamp for elapsed seconds
     start_time: Optional[datetime] = None
@@ -1925,6 +1932,52 @@ def replay_trade_walk_forward(
         elapsed_seconds = (b_dt - start_time).total_seconds() if (b_dt and start_time) else (i * 60.0)
 
         # -------------------------------------------------------------
+        # IN-BAR EXCURSION & FIRST-BARRIER (±1R) TRACKING
+        # -------------------------------------------------------------
+        if side == "BUY":
+            bar_fav_r = max(Decimal("0.0"), (b_high - entry) / r_points)
+            bar_adv_r = min(Decimal("0.0"), (b_low - entry) / r_points)
+            max_favourable_r = max(max_favourable_r, bar_fav_r)
+            max_adverse_r = min(max_adverse_r, bar_adv_r)
+
+            if not barrier_decided:
+                plus_hit = (b_high >= entry + r_points)
+                minus_hit = (b_low <= entry - r_points)
+                if plus_hit and minus_hit:
+                    if b_open >= entry + r_points:
+                        hit_1r_first = 1
+                    else:
+                        hit_1r_first = 0
+                    barrier_decided = True
+                elif plus_hit:
+                    hit_1r_first = 1
+                    barrier_decided = True
+                elif minus_hit:
+                    hit_1r_first = 0
+                    barrier_decided = True
+        else:
+            bar_fav_r = max(Decimal("0.0"), (entry - b_low) / r_points)
+            bar_adv_r = min(Decimal("0.0"), (entry - b_high) / r_points)
+            max_favourable_r = max(max_favourable_r, bar_fav_r)
+            max_adverse_r = min(max_adverse_r, bar_adv_r)
+
+            if not barrier_decided:
+                plus_hit = (b_low <= entry - r_points)
+                minus_hit = (b_high >= entry + r_points)
+                if plus_hit and minus_hit:
+                    if b_open <= entry - r_points:
+                        hit_1r_first = 1
+                    else:
+                        hit_1r_first = 0
+                    barrier_decided = True
+                elif plus_hit:
+                    hit_1r_first = 1
+                    barrier_decided = True
+                elif minus_hit:
+                    hit_1r_first = 0
+                    barrier_decided = True
+
+        # -------------------------------------------------------------
         # STEP 1: IN-BAR CHECK OF PRIOR STOPS & TARGETS (BEFORE THIS BAR)
         # -------------------------------------------------------------
         if pending_market_exit is not None:
@@ -1934,9 +1987,10 @@ def replay_trade_walk_forward(
 
         # Check existing stop loss and take profit against current bar's range
         if side == "BUY":
+            is_gap_down = (prev_close is not None and prev_close > running_sl and b_open < running_sl and b_open < prev_close)
             if running_sl is not None and b_open <= running_sl:
                 exit_price = b_open
-                exit_reason = "GAP_DOWN_STOP"
+                exit_reason = "GAP_DOWN_STOP" if is_gap_down else running_sl_reason
                 break
             elif running_sl is not None and b_low <= running_sl:
                 exit_price = running_sl
@@ -1951,9 +2005,10 @@ def replay_trade_walk_forward(
                 exit_reason = "TAKE_PROFIT"
                 break
         else:  # SELL
+            is_gap_up = (prev_close is not None and prev_close < running_sl and b_open >= running_sl and b_open > prev_close)
             if running_sl is not None and b_open >= running_sl:
                 exit_price = b_open
-                exit_reason = "GAP_UP_STOP"
+                exit_reason = "GAP_UP_STOP" if is_gap_up else running_sl_reason
                 break
             elif running_sl is not None and b_high >= running_sl:
                 exit_price = running_sl
@@ -2104,22 +2159,34 @@ def replay_trade_walk_forward(
         candidates = [p for p in (running_sl, profit_lock_price, breakeven_price, trailing_stop_price, harvest_stop if harvest_enabled else None) if p is not None]
         if candidates:
             next_sl = max(candidates) if side == "BUY" else min(candidates)
+            new_reason = running_sl_reason
+            if harvest_stop and next_sl == harvest_stop:
+                new_reason = "PROFIT_HARVEST_STOP"
+            elif profit_lock_price and ((side == "BUY" and next_sl >= profit_lock_price) or (side == "SELL" and next_sl <= profit_lock_price)):
+                new_reason = "TRAILING_STOP"
+            elif breakeven_price and ((side == "BUY" and next_sl >= breakeven_price) or (side == "SELL" and next_sl <= breakeven_price)):
+                new_reason = "BREAKEVEN_STOP"
+            elif trailing_stop_price and ((side == "BUY" and next_sl >= trailing_stop_price) or (side == "SELL" and next_sl <= trailing_stop_price)):
+                new_reason = "TRAILING_STOP"
+
+            # Check if this newly ratcheted stop was breached intra-bar (close pulled back beyond stop)
+            if side == "BUY" and b_close <= next_sl:
+                exit_price = next_sl
+                exit_reason = new_reason
+                break
+            elif side == "SELL" and b_close >= next_sl:
+                exit_price = next_sl
+                exit_reason = new_reason
+                break
+
             if side == "BUY" and (running_sl is None or next_sl > running_sl):
                 running_sl = next_sl
-                if harvest_stop and running_sl == harvest_stop:
-                    running_sl_reason = "PROFIT_HARVEST_STOP"
-                elif profit_lock_price and running_sl >= profit_lock_price:
-                    running_sl_reason = "TRAILING_STOP"
-                elif breakeven_price and running_sl >= breakeven_price:
-                    running_sl_reason = "BREAKEVEN_STOP"
+                running_sl_reason = new_reason
             elif side == "SELL" and (running_sl is None or next_sl < running_sl):
                 running_sl = next_sl
-                if harvest_stop and running_sl == harvest_stop:
-                    running_sl_reason = "PROFIT_HARVEST_STOP"
-                elif profit_lock_price and running_sl <= profit_lock_price:
-                    running_sl_reason = "TRAILING_STOP"
-                elif breakeven_price and running_sl <= breakeven_price:
-                    running_sl_reason = "BREAKEVEN_STOP"
+                running_sl_reason = new_reason
+
+        prev_close = b_close
 
     exit_bar_time = None
     if exit_price is None:
@@ -2155,7 +2222,11 @@ def replay_trade_walk_forward(
         "net_pnl": float(net_pnl),
         "realized_r": round(realized_r, 4),
         "max_favorable": float(best_favourable),
+        "hit_1r_first": int(hit_1r_first),
+        "max_favourable_r": round(float(max_favourable_r), 4),
+        "max_adverse_r": round(float(max_adverse_r), 4),
         "exit_time": str(exit_bar_time) if exit_bar_time else None,
         "exit_date": exit_date_str,
     }
+
 

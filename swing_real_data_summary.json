@@ -1,0 +1,54 @@
+{
+  "symbols_count": 200,
+  "total_labels": 210015,
+  "directions": {
+    "BUY": {
+      "total_count": 95810,
+      "positive_count": 18187,
+      "positive_rate_pct": 18.98,
+      "hit_1r_first_count": 33120,
+      "hit_1r_first_rate_pct": 34.57,
+      "censored_count": 43955,
+      "censored_share_pct": 45.88,
+      "mean_r_net": 0.0086,
+      "median_r_net": -0.0246,
+      "exit_reasons": {
+        "STOP_LOSS": 27262,
+        "HOLDING_LIMIT_EXIT": 43955,
+        "TAKE_PROFIT": 18187,
+        "BREAKEVEN_STOP": 3577,
+        "GAP_DOWN_STOP": 2829
+      },
+      "counts_by_year": {
+        "2023": 25405,
+        "2024": 26641,
+        "2025": 29603,
+        "2026": 14161
+      }
+    },
+    "SELL": {
+      "total_count": 114205,
+      "positive_count": 18389,
+      "positive_rate_pct": 16.1,
+      "hit_1r_first_count": 35945,
+      "hit_1r_first_rate_pct": 31.47,
+      "censored_count": 46717,
+      "censored_share_pct": 40.91,
+      "mean_r_net": -0.0678,
+      "median_r_net": -0.1712,
+      "exit_reasons": {
+        "HOLDING_LIMIT_EXIT": 46717,
+        "BREAKEVEN_STOP": 4913,
+        "TAKE_PROFIT": 18389,
+        "STOP_LOSS": 40135,
+        "GAP_UP_STOP": 4051
+      },
+      "counts_by_year": {
+        "2023": 36013,
+        "2024": 33070,
+        "2025": 30790,
+        "2026": 14332
+      }
+    }
+  }
+}

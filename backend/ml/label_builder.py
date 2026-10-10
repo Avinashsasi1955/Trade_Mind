@@ -34,6 +34,12 @@ CREATE TABLE IF NOT EXISTS exit_aware_labels (
     entry_price REAL NOT NULL,
     y_long INTEGER NOT NULL,
     y_short INTEGER NOT NULL,
+    hit_1r_first_long INTEGER NOT NULL DEFAULT 0,
+    hit_1r_first_short INTEGER NOT NULL DEFAULT 0,
+    max_favourable_r_long REAL NOT NULL DEFAULT 0.0,
+    max_favourable_r_short REAL NOT NULL DEFAULT 0.0,
+    max_adverse_r_long REAL NOT NULL DEFAULT 0.0,
+    max_adverse_r_short REAL NOT NULL DEFAULT 0.0,
     r_net REAL NOT NULL,
     r_net_long REAL NOT NULL,
     r_net_short REAL NOT NULL,
@@ -72,6 +78,12 @@ class ExitAwareLabel:
     exit_price_short: float
     net_pnl_long: float
     net_pnl_short: float
+    hit_1r_first_long: int = 0
+    hit_1r_first_short: int = 0
+    max_favourable_r_long: float = 0.0
+    max_favourable_r_short: float = 0.0
+    max_adverse_r_long: float = 0.0
+    max_adverse_r_short: float = 0.0
     censored: bool = False
     censored_reason: Optional[str] = None
     created_at: str = ""
@@ -318,6 +330,9 @@ class LabelBuilder:
             "net_pnl": net_pnl,
             "fee_amount": fee_amount,
             "y": y_label,
+            "hit_1r_first": int(replay_res.get("hit_1r_first", 0)),
+            "max_favourable_r": float(replay_res.get("max_favourable_r", 0.0)),
+            "max_adverse_r": float(replay_res.get("max_adverse_r", 0.0)),
             "censored": is_censored,
             "censored_reason": censored_reason,
         }
@@ -346,24 +361,48 @@ class LabelBuilder:
         norm_bars = [self._normalize_bar(b) for b in bars]
         n_bars = len(norm_bars)
 
-        # Pre-compute rolling 14-bar ATR for risk-level calculation
+        # Pre-compute ATR:
+        # Intraday mode: matches _chart_strategy_gate (10-period 5m candle range sum((high - low))/10)
+        # Swing mode: matches swing_risk.py (14-period True Range on daily candles)
         rolling_atr: List[float] = []
-        tr_list = []
-        for i in range(n_bars):
-            if i == 0:
-                tr = norm_bars[i]["high"] - norm_bars[i]["low"]
-            else:
-                prev_c = norm_bars[i - 1]["close"]
-                tr = max(
-                    norm_bars[i]["high"] - norm_bars[i]["low"],
-                    abs(norm_bars[i]["high"] - prev_c),
-                    abs(norm_bars[i]["low"] - prev_c),
-                )
-            tr_list.append(tr)
-            if len(tr_list) >= 14:
-                rolling_atr.append(sum(tr_list[-14:]) / 14.0)
-            else:
-                rolling_atr.append(sum(tr_list) / len(tr_list))
+        if self.trade_mode == "INTRADAY":
+            closed_5m: List[Dict[str, float]] = []
+            curr_5m_bars: List[Dict[str, Any]] = []
+            curr_bucket: Optional[int] = None
+            for b in norm_bars:
+                b_min = b["dt"].minute
+                b_idx = (b_min // 5) * 5
+                if curr_bucket is not None and b_idx != curr_bucket:
+                    if len(curr_5m_bars) >= 5 or (curr_5m_bars and curr_5m_bars[0].get("interval") != "1minute"):
+                        h_5m = max(x["high"] for x in curr_5m_bars)
+                        l_5m = min(x["low"] for x in curr_5m_bars)
+                        closed_5m.append({"high": h_5m, "low": l_5m, "range": h_5m - l_5m})
+                    curr_5m_bars = []
+                curr_bucket = b_idx
+                curr_5m_bars.append(b)
+
+                if len(closed_5m) >= 10:
+                    atr_val = sum(x["range"] for x in closed_5m[-10:]) / 10.0
+                elif closed_5m:
+                    atr_val = sum(x["range"] for x in closed_5m) / len(closed_5m)
+                else:
+                    atr_val = b["close"] * self.sl_pct
+                rolling_atr.append(float(atr_val))
+        else:
+            tr_list = []
+            for i in range(n_bars):
+                if i == 0:
+                    tr = norm_bars[i]["high"] - norm_bars[i]["low"]
+                else:
+                    prev_c = norm_bars[i - 1]["close"]
+                    tr = max(
+                        norm_bars[i]["high"] - norm_bars[i]["low"],
+                        abs(norm_bars[i]["high"] - prev_c),
+                        abs(norm_bars[i]["low"] - prev_c),
+                    )
+                tr_list.append(tr)
+                subset = tr_list[-14:]
+                rolling_atr.append(sum(subset) / len(subset))
 
         labels: List[ExitAwareLabel] = []
 
@@ -437,6 +476,12 @@ class LabelBuilder:
                 entry_price=entry_long,
                 y_long=sim_long["y"],
                 y_short=sim_short["y"],
+                hit_1r_first_long=sim_long.get("hit_1r_first", 0),
+                hit_1r_first_short=sim_short.get("hit_1r_first", 0),
+                max_favourable_r_long=sim_long.get("max_favourable_r", 0.0),
+                max_favourable_r_short=sim_short.get("max_favourable_r", 0.0),
+                max_adverse_r_long=sim_long.get("max_adverse_r", 0.0),
+                max_adverse_r_short=sim_short.get("max_adverse_r", 0.0),
                 r_net=sim_long["realized_r"],
                 r_net_long=sim_long["realized_r"],
                 r_net_short=sim_short["realized_r"],
@@ -490,15 +535,24 @@ class LabelBuilder:
             query = """
                 INSERT INTO exit_aware_labels (
                     exchange, symbol, timestamp, trade_date, entry_price,
-                    y_long, y_short, r_net, r_net_long, r_net_short,
+                    y_long, y_short, hit_1r_first_long, hit_1r_first_short,
+                    max_favourable_r_long, max_favourable_r_short,
+                    max_adverse_r_long, max_adverse_r_short,
+                    r_net, r_net_long, r_net_short,
                     exit_reason_long, exit_reason_short, exit_price_long, exit_price_short,
                     net_pnl_long, net_pnl_short, censored, censored_reason, created_at, exit_date
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(exchange, symbol, timestamp) DO UPDATE SET
                     trade_date = excluded.trade_date,
                     entry_price = excluded.entry_price,
                     y_long = excluded.y_long,
                     y_short = excluded.y_short,
+                    hit_1r_first_long = excluded.hit_1r_first_long,
+                    hit_1r_first_short = excluded.hit_1r_first_short,
+                    max_favourable_r_long = excluded.max_favourable_r_long,
+                    max_favourable_r_short = excluded.max_favourable_r_short,
+                    max_adverse_r_long = excluded.max_adverse_r_long,
+                    max_adverse_r_short = excluded.max_adverse_r_short,
                     r_net = excluded.r_net,
                     r_net_long = excluded.r_net_long,
                     r_net_short = excluded.r_net_short,
@@ -516,7 +570,10 @@ class LabelBuilder:
             rows = [
                 (
                     lbl.exchange, lbl.symbol, lbl.timestamp, lbl.trade_date, lbl.entry_price,
-                    lbl.y_long, lbl.y_short, lbl.r_net, lbl.r_net_long, lbl.r_net_short,
+                    lbl.y_long, lbl.y_short, lbl.hit_1r_first_long, lbl.hit_1r_first_short,
+                    lbl.max_favourable_r_long, lbl.max_favourable_r_short,
+                    lbl.max_adverse_r_long, lbl.max_adverse_r_short,
+                    lbl.r_net, lbl.r_net_long, lbl.r_net_short,
                     lbl.exit_reason_long, lbl.exit_reason_short, lbl.exit_price_long, lbl.exit_price_short,
                     lbl.net_pnl_long, lbl.net_pnl_short, 1 if lbl.censored else 0, lbl.censored_reason, lbl.created_at,
                     lbl.exit_date
@@ -532,12 +589,18 @@ class LabelBuilder:
         sql_stmt = text("""
             INSERT INTO exit_aware_labels (
                 exchange, symbol, timestamp, trade_date, entry_price,
-                y_long, y_short, r_net, r_net_long, r_net_short,
+                y_long, y_short, hit_1r_first_long, hit_1r_first_short,
+                max_favourable_r_long, max_favourable_r_short,
+                max_adverse_r_long, max_adverse_r_short,
+                r_net, r_net_long, r_net_short,
                 exit_reason_long, exit_reason_short, exit_price_long, exit_price_short,
                 net_pnl_long, net_pnl_short, censored, censored_reason, created_at, exit_date
             ) VALUES (
                 :exchange, :symbol, :timestamp, :trade_date, :entry_price,
-                :y_long, :y_short, :r_net, :r_net_long, :r_net_short,
+                :y_long, :y_short, :hit_1r_first_long, :hit_1r_first_short,
+                :max_favourable_r_long, :max_favourable_r_short,
+                :max_adverse_r_long, :max_adverse_r_short,
+                :r_net, :r_net_long, :r_net_short,
                 :exit_reason_long, :exit_reason_short, :exit_price_long, :exit_price_short,
                 :net_pnl_long, :net_pnl_short, :censored, :censored_reason, :created_at, :exit_date
             )
@@ -546,6 +609,12 @@ class LabelBuilder:
                 entry_price = excluded.entry_price,
                 y_long = excluded.y_long,
                 y_short = excluded.y_short,
+                hit_1r_first_long = excluded.hit_1r_first_long,
+                hit_1r_first_short = excluded.hit_1r_first_short,
+                max_favourable_r_long = excluded.max_favourable_r_long,
+                max_favourable_r_short = excluded.max_favourable_r_short,
+                max_adverse_r_long = excluded.max_adverse_r_long,
+                max_adverse_r_short = excluded.max_adverse_r_short,
                 r_net = excluded.r_net,
                 r_net_long = excluded.r_net_long,
                 r_net_short = excluded.r_net_short,
