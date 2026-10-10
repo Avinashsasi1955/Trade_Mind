@@ -51,14 +51,29 @@ def run_smoke_test() -> int:
         print("  [OK] backend.ml.validation_engine shadow functions resolved")
         from scripts.shadow_scorecard import generate_full_scorecard
         print("  [OK] scripts.shadow_scorecard.generate_full_scorecard resolved")
-        from scripts.shadow_health_check import check_calendar
-        print("  [OK] scripts.shadow_health_check.check_calendar resolved")
+        from scripts.shadow_health_check import check_calendar, check_provider, check_upstox_token
+        print("  [OK] scripts.shadow_health_check helpers resolved")
     except Exception as e:
         print(f"  [FAIL] Import error: {e}")
         errors.append(f"Import failed: {e}")
 
-    # 2. Database Connection
-    print("\n[2] CHECKING DATABASE CONNECTIVITY & AUDIT TABLES")
+    # Provider & Credential Alignment
+    print("\n[2] CHECKING PROVIDER & CREDENTIAL ALIGNMENT")
+    print("-" * 78)
+    try:
+        active_provider, prov_ok, prov_msg = check_provider()
+        print(f"  Active Provider: {active_provider}")
+        if not prov_ok:
+            print(f"  [FAIL] {prov_msg}")
+            errors.append(prov_msg)
+        else:
+            print(f"  [OK] Provider alignment verified ({active_provider})")
+    except Exception as e:
+        print(f"  [FAIL] Provider check error: {e}")
+        errors.append(f"Provider check error: {e}")
+
+    # 3. Database Connection
+    print("\n[3] CHECKING DATABASE CONNECTIVITY & AUDIT TABLES")
     print("-" * 78)
     db_url = None
     engine = None

@@ -30,10 +30,20 @@ import sys
 import urllib.error
 import urllib.request
 from datetime import date, datetime, time, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, inspect, text
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    import backend.config
+except Exception:
+    pass
 
 IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_OPEN = time(9, 15, 0)
@@ -180,12 +190,12 @@ def check_required_processes() -> Dict[str, Dict[str, Any]]:
 
 def check_upstox_token() -> Dict[str, Any]:
     """
-    Validate UPSTOX_ACCESS_TOKEN:
-      - Print only length (hide secret)
-      - Make one read-only Upstox profile call
-      - Report: valid, expired, or missing
+    Validate UPSTOX_ACCESS_TOKEN or UPSTOX_ANALYTICS_TOKEN with one read-only
+    market-data LTP call for NIFTY 50 (compatible with both trading and analytics tokens).
+    Reports: VALID, EXPIRED, FORBIDDEN, or MISSING, with HTTP status code.
+    Never prints or exposes the token.
     """
-    token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+    token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip() or os.getenv("UPSTOX_ANALYTICS_TOKEN", "").strip()
     if not token:
         try:
             from backend.config import UPSTOX_ACCESS_TOKEN
@@ -196,14 +206,18 @@ def check_upstox_token() -> Dict[str, Any]:
     if not token:
         return {
             "status": "MISSING",
+            "http_status": None,
             "length": 0,
             "valid": False,
-            "message": "UPSTOX_ACCESS_TOKEN is not set",
+            "message": "UPSTOX_ACCESS_TOKEN / UPSTOX_ANALYTICS_TOKEN is not set",
         }
 
     token_len = len(token)
+    import urllib.parse
+    instrument_key = urllib.parse.quote("NSE_INDEX|Nifty 50")
+    url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={instrument_key}"
     req = urllib.request.Request(
-        "https://api.upstox.com/v2/user/profile",
+        url,
         headers={
             "Accept": "application/json",
             "Authorization": f"Bearer {token}",
@@ -214,36 +228,67 @@ def check_upstox_token() -> Dict[str, Any]:
 
     try:
         with urllib.request.urlopen(req, timeout=4) as resp:
+            http_code = resp.getcode()
             data = json.loads(resp.read().decode("utf-8"))
-            user_data = data.get("data", {})
-            user_name = user_data.get("user_name") or user_data.get("user_id") or "Active User"
+            if data.get("status") in ("success", "ok"):
+                return {
+                    "status": "VALID",
+                    "http_status": http_code,
+                    "length": token_len,
+                    "valid": True,
+                    "message": f"Market-data call successful (HTTP {http_code})",
+                }
             return {
-                "status": "VALID",
-                "length": token_len,
-                "valid": True,
-                "message": f"Token valid (authenticated as {user_name})",
-            }
-    except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403}:
-            return {
-                "status": "EXPIRED",
+                "status": "INVALID",
+                "http_status": http_code,
                 "length": token_len,
                 "valid": False,
-                "message": f"Token expired or unauthorized (HTTP {exc.code})",
+                "message": f"API response status not ok (HTTP {http_code})",
             }
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            status_label = "EXPIRED"
+        elif exc.code == 403:
+            status_label = "FORBIDDEN"
+        else:
+            status_label = f"HTTP_{exc.code}"
         return {
-            "status": f"HTTP_ERROR_{exc.code}",
+            "status": status_label,
+            "http_status": exc.code,
             "length": token_len,
             "valid": False,
-            "message": f"Upstox API returned HTTP {exc.code}",
+            "message": f"Market-data request rejected with HTTP {exc.code}",
         }
     except Exception as exc:
         return {
             "status": "UNREACHABLE",
+            "http_status": None,
             "length": token_len,
             "valid": False,
             "message": f"Connection error: {exc}",
         }
+
+
+def check_provider() -> Tuple[str, bool, str]:
+    """
+    Validate active market data provider.
+    Fails clearly if NIVESH_MARKET_DATA_PROVIDER is not 'upstox' while only an Upstox token is set.
+    """
+    provider = os.getenv("NIVESH_MARKET_DATA_PROVIDER", "").strip().lower()
+    if not provider:
+        try:
+            from backend.config import MARKET_DATA_PROVIDER
+            provider = MARKET_DATA_PROVIDER.lower()
+        except Exception:
+            provider = "zerodha"
+
+    has_upstox = bool(os.getenv("UPSTOX_ACCESS_TOKEN", "").strip() or os.getenv("UPSTOX_ANALYTICS_TOKEN", "").strip())
+    has_kite = bool(os.getenv("KITE_ACCESS_TOKEN", "").strip())
+
+    if has_upstox and not has_kite and provider != "upstox":
+        return provider, False, f"Provider mismatch: only Upstox token is configured, but NIVESH_MARKET_DATA_PROVIDER is '{provider}' (must be 'upstox')"
+
+    return provider, True, f"Active provider '{provider}' matches credentials"
 
 
 def check_stream_and_ticks(redis_url: str, now_ist: datetime) -> Tuple[bool, Optional[datetime], Optional[float], Dict[str, Any]]:
@@ -344,10 +389,13 @@ def run_health_check(
     is_market_open = cal["is_market_open_now"]
     is_trading_day = cal["is_trading_day"]
 
+    active_provider, prov_ok, prov_msg = check_provider()
+
     print("=" * 78)
     print("             SHADOW TRADING PIPELINE HEALTH CHECK")
     print("=" * 78)
     print(f"  Check Timestamp : {now_ist.isoformat()}")
+    print(f"  Active Provider : {active_provider}")
     print(f"  Trading Day     : {'YES' if is_trading_day else 'NO'} ({cal['session_status']})")
     print(f"  Market Session  : {'[LIVE - MARKET IS OPEN]' if is_market_open else '[CLOSED / OFF-MARKET]'}")
     print(f"  Schedule Source : {cal['source']} (Hours: {cal['opens_at']} - {cal['closes_at']} IST)")
@@ -380,16 +428,23 @@ def run_health_check(
         for pf in process_failures:
             stale_items.append(pf)
 
-    # 3. Upstox Token Check
-    print("\n[2] BROKER TOKEN VALIDATION (UPSTOX_ACCESS_TOKEN)")
+    # 3. Provider & Upstox Token Check
+    print("\n[2] BROKER TOKEN & PROVIDER VALIDATION")
     print("-" * 78)
+    prov_tag = "[PASS]" if prov_ok else "[FAIL]"
+    print(f"  {prov_tag} Provider Config : {active_provider}")
+    if not prov_ok:
+        print(f"         Configuration  : {prov_msg}")
+        stale_items.append(prov_msg)
+
     token_info = check_upstox_token()
     token_len_msg = f"(length: {token_info['length']})" if token_info["length"] > 0 else "(length: 0)"
+    http_str = f"[HTTP {token_info['http_status']}]" if token_info["http_status"] is not None else "[HTTP None]"
     status_tag = "[PASS]" if token_info["valid"] else "[FAIL]"
-    print(f"  {status_tag} Token Status   : {token_info['status']} {token_len_msg}")
+    print(f"  {status_tag} Token Status   : {token_info['status']} {http_str} {token_len_msg}")
     print(f"         Verification   : {token_info['message']}")
     if is_market_open and not token_info["valid"]:
-        stale_items.append(f"Broker token invalid: {token_info['status']} - {token_info['message']}")
+        stale_items.append(f"Broker token invalid: {token_info['status']} {http_str} - {token_info['message']}")
 
     # 4. Stream & Redis status
     print("\n[3] STREAM & BROKER CONNECTION STATE")

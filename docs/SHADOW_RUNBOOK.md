@@ -1,179 +1,145 @@
-# Shadow-Trading Operational Runbook (Phase 7a)
+# Shadow-Trading Operational Runbook (Phase 7b)
 
-This runbook documents the exact procedures, commands, and operational sequences to manage the paper-only shadow trading pipeline in TradeMind.
+This runbook documents the procedures, commands, launchers, and verification steps for operating the paper-only shadow trading pipeline in TradeMind.
 
 ---
 
 ## 1. Paper-Only Safety Guarantees
 
-Before starting any service, verify that both execution fuses remain locked:
+Before launching any component, verify that all execution fuses remain locked:
 
-| Setting / Flag | Required Value | Actual Current Value | Purpose |
-| :--- | :--- | :--- | :--- |
-| `NIVESH_LIVE_TRADING_ENABLED` | `0` | `0` | Disables broker order submission in `backend/execution.py` |
-| `LIVE_ELIGIBLE` | `FALSE` | `FALSE` | Safety interlock in `backend/live_inference.py:194` and `backend/tasks/worker.py:185` |
-| `UPSTOX_ORDER_ACCESS_TOKEN` | `""` (empty) | `""` (empty) | Interactive write token required for order placement |
+| Setting / Flag | Required Value | Purpose |
+| :--- | :--- | :--- |
+| `NIVESH_LIVE_TRADING_ENABLED` | `0` | Disables broker order submission in `backend/execution.py` |
+| `LIVE_ELIGIBLE` | `FALSE` | Safety interlock in `backend/live_inference.py:194` and `backend/tasks/worker.py:185` |
+| `UPSTOX_ORDER_ACCESS_TOKEN` | `""` (empty) | Interactive write token required for order placement |
+| `NIVESH_MARKET_DATA_PROVIDER` | `upstox` | Must match configured Upstox market data stream credentials |
 
-> **Safety Interlock:** `LivePaperInference.__init__` in `backend/live_inference.py` raises `RuntimeError("Live-paper inference requires both execution fuses locked")` if either `LIVE_ELIGIBLE != "FALSE"` or `NIVESH_LIVE_TRADING_ENABLED != "0"`. No live order can be submitted from the shadow pipeline.
+> **Safety Interlock:** `scripts/start_shadow.sh`, `backend/live_inference.py:194`, `backend/tasks/worker.py:185`, and `backend/live_stream_service.py:32` all refuse to start and raise `RuntimeError("Live-paper inference requires both execution fuses locked")` if either `LIVE_ELIGIBLE != "FALSE"` or `NIVESH_LIVE_TRADING_ENABLED != "0"`.
 
 ---
 
-## 2. Component Startup Sequence
+## 2. One-Command Launcher & Process Management
 
-Start components strictly in the following order:
-
-```
-[1. Redis] ──> [2. PostgreSQL Database] ──> [3. Live Stream Service] ──> [4. Celery Worker] ──> [5. Celery Beat]
-```
-
-### Component 1: Redis Server
-Redis acts as the message broker for Celery and the real-time cache for live ticks (`nivesh:ticks:*`).
+### Automated Start: `scripts/start_shadow.sh`
+Starts Redis (if needed), Live Stream Service, Celery Worker, and Celery Beat in strict sequential order. Each background daemon is wrapped with `caffeinate -dimsu` to prevent macOS system, disk, and display sleep during market hours:
 
 ```bash
-# Start Redis (system service or daemon)
-brew services start redis
-# Or start directly:
-redis-server --daemonize yes
-
-# Verification:
-redis-cli ping
-# Expected output: PONG
+./scripts/start_shadow.sh
 ```
 
-### Component 2: PostgreSQL Database
-Houses audit trails (`shadow_execution_audits`, `trade_candidate_audits`, `shadow_session_daily_log`, `exchange_trading_calendar`).
+**Verification:**
+- Logs written to `logs/stream.log`, `logs/worker.log`, and `logs/beat.log`.
+- Active PIDs saved in `logs/stream.pid`, `logs/worker.pid`, and `logs/beat.pid`.
+- Confirms `LIVE_ELIGIBLE == FALSE` and `NIVESH_LIVE_TRADING_ENABLED == 0` before starting any process.
+
+### Automated Stop: `scripts/stop_shadow.sh`
+Gracefully signals and terminates beat scheduler, worker, stream service, and associated caffeinate wrappers:
 
 ```bash
-# Start PostgreSQL (local service)
-brew services start postgresql@14
-
-# Verification:
-python3 -c "from sqlalchemy import create_engine, text; eng = create_engine('postgresql+psycopg2://avinash@localhost:5432/nivesh_v3_staging'); print(eng.connect().execute(text('SELECT 1')).scalar())"
-# Expected output: 1
-```
-
-### Component 3: Live Market Stream Service
-Maintains the WebSocket market data feed (Upstox/Kite), builds 1m and 5m candle aggregates, and updates tick cache.
-
-```bash
-# Ensure log directory exists
-mkdir -p logs reports
-
-# Foreground execution (for debugging):
-.venv/bin/python -m backend.live_stream_service
-
-# Background daemon execution:
-nohup .venv/bin/python -m backend.live_stream_service > logs/stream.log 2>&1 &
-
-# Verification:
-ps aux | grep backend.live_stream_service | grep -v grep
-```
-
-### Component 4: Celery Worker
-Executes periodic paper inference, bar repair, position defense, and news ingestion tasks.
-
-```bash
-# Foreground execution:
-.venv/bin/celery -A backend.tasks.worker:celery_app worker --loglevel=INFO --concurrency=1 --prefetch-multiplier=1
-
-# Background daemon execution:
-nohup .venv/bin/celery -A backend.tasks.worker:celery_app worker --loglevel=INFO --concurrency=1 --prefetch-multiplier=1 > logs/worker.log 2>&1 &
-
-# Verification:
-.venv/bin/celery -A backend.tasks.worker:celery_app status
-```
-
-### Component 5: Celery Beat Scheduler
-Dispatches scheduled cron tasks (pre-market readiness, 5-minute live paper inference, eod reporting).
-
-```bash
-# Foreground execution:
-.venv/bin/celery -A backend.tasks.worker:celery_app beat --loglevel=INFO
-
-# Background daemon execution:
-nohup .venv/bin/celery -A backend.tasks.worker:celery_app beat --loglevel=INFO > logs/beat.log 2>&1 &
-
-# Verification:
-ps aux | grep "celery.*beat" | grep -v grep
+./scripts/stop_shadow.sh
 ```
 
 ---
 
-## 3. Pre-Open Checklist (Run before 09:15 IST)
+## 3. Pre-Open Checklist (Run Daily: 08:30 – 09:00 IST)
 
-Execute these checks every morning between **08:30 and 09:00 IST**:
-
-### Step 1: Upstox Daily Interactive Token
-Obtain the daily market data token from Upstox and export it in the shell environment:
+### Step 1: Upstox Token Configuration
+Set the daily interactive access token or verify that `UPSTOX_ANALYTICS_TOKEN` is present:
 ```bash
-export UPSTOX_ACCESS_TOKEN="<your_daily_upstox_token>"
+export UPSTOX_ACCESS_TOKEN="<your_token>"
 ```
 
-### Step 2: Run Pipeline Smoke Test
-Confirms wiring, Redis, Postgres, calendar row, and verifies dry-run inference writes zero rows:
+### Step 2: Pipeline Smoke Test
+Validates imports, database connectivity, Redis ping, calendar row, provider alignment, and verifies that inference dry-run writes zero rows:
 ```bash
 python3 scripts/shadow_smoke_test.py
 ```
 *Expected verdict:* `SMOKE TEST RESULT: [PASS] All shadow pipeline wiring verified!`
 
-### Step 3: Run Start-Up Health Check
-Verifies exchange calendar session status, required processes, and tests Upstox token validity:
+### Step 3: Start-Up Health Check
+Validates calendar hours, tests Upstox token using read-only market-data LTP call (`GET /v2/market-quote/ltp?instrument_key=NSE_INDEX|Nifty 50`), and inspects process state:
 ```bash
 python3 scripts/shadow_health_check.py
 ```
 *Verification criteria:*
+- `Active Provider: upstox`
 - `Trading Day: YES (OPEN)`
-- `Schedule Source: NSE_REGULAR_SESSION (Hours: 09:15:00 - 15:30:00 IST)`
-- `Required Processes: [RUNNING]` for Stream, Worker, and Beat
-- `Token Status: [PASS] VALID (length: > 0)`
+- `Token Status: [PASS] VALID [HTTP 200]`
+- `Provider Config: [PASS] upstox`
+
+### Step 4: Launch Pipeline
+```bash
+./scripts/start_shadow.sh
+```
 
 ---
 
-## 4. End-of-Day Routine (Run after 15:30 IST)
+## 4. First-Session Watch List (Monday 09:15 – 10:15 IST)
 
-Perform these steps after market close between **15:35 and 16:00 IST**:
+During the first hour of trading, verify that each milestone occurs in real time:
 
-### Step 1: Run Post-Market Health Check
-Verifies today's session summary row and checks for any WebSocket gaps:
+### 1. Live Ticks Arriving (09:15:05+ IST)
+Check that WebSocket ticks are populating the Redis timestamp cache:
+```bash
+python3 -c "import redis; r = redis.Redis(); print('Cached instruments:', len(r.hgetall('nivesh:ticks:timestamp')))"
+```
+*Expected:* Count increases to subscribed symbol limit (50–100+ instruments) within seconds of market open.
+
+### 2. Forming & Completed Bars Appearing (09:16:00+ and 09:20:00+ IST)
+Verify that `PostgresBarAggregator` closes 1-minute and 5-minute bars with source `upstox_v3`:
+```bash
+psql -d nivesh_v3_staging -c "
+SELECT interval, source, COUNT(*), MAX(bar_time) AS latest_bar
+FROM live_market_bars
+WHERE bar_time >= CURRENT_DATE
+GROUP BY interval, source;
+"
+```
+*Expected:* Rows appear for `1minute` (from 09:16 IST) and `5minute` (from 09:20 IST) with `source = 'upstox_v3'`.
+
+### 3. First Candidate Audit Recorded (09:20:00+ IST)
+Check candidate selection evaluations from `LivePaperInference`:
+```bash
+psql -d nivesh_v3_staging -c "
+SELECT observed_at, symbol, side, signal_probability, gate_passed, rejection_reason
+FROM trade_candidate_audits
+ORDER BY observed_at DESC
+LIMIT 5;
+"
+```
+*Expected:* Entries appear every 5 minutes showing candidate symbols, probability scores, and gate pass/rejection reasons.
+
+### 4. Daily Session Log Status (09:20:00+ IST)
+Inspect the active session state tracked in `shadow_session_daily_log`:
+```bash
+psql -d nivesh_v3_staging -c "
+SELECT session_date, status, valid, trades_taken, updated_at
+FROM shadow_session_daily_log
+WHERE session_date = CURRENT_DATE;
+"
+```
+*Expected:* Row exists for today's date with status `WAITING` (until full minimum bucket and trade evidence thresholds are met).
+
+---
+
+## 5. End-of-Day Routine (Run Daily: 15:35 – 16:00 IST)
+
+### Step 1: Health Check Review
 ```bash
 python3 scripts/shadow_health_check.py
 ```
 
-### Step 2: Generate Shadow Statistical Scorecard
-Computes sample counts, win rate, payoff ratio, profit factor, bootstrap 95% CI expectancy, and evaluates promotion gates:
+### Step 2: Generate Statistical Scorecard
 ```bash
 python3 scripts/shadow_scorecard.py \
   --since 2026-06-01 \
-  --json reports/scorecard_$(date +%Y-%m-%d).json
-```
+  --json reports/scorecard_$(date +%Y-%m-%d).json > reports/scorecard_$(date +%Y-%m-%d).txt
 
-### Step 3: Save and Archive Scorecard
-Save a plain-text copy of the scorecard for audit history:
-```bash
-python3 scripts/shadow_scorecard.py --since 2026-06-01 > reports/scorecard_$(date +%Y-%m-%d).txt
 cat reports/scorecard_$(date +%Y-%m-%d).txt
 ```
 
----
-
-## 5. Shutdown Routine
-
-To gracefully stop all background shadow processes:
-
+### Step 3: Stop Shadow Pipeline
 ```bash
-# 1. Stop Celery Beat scheduler
-pkill -f "celery.*beat"
-
-# 2. Stop Celery Worker gracefully (allows active tasks to finish)
-pkill -TERM -f "celery.*worker"
-
-# 3. Stop Live Stream Service
-pkill -f "backend.live_stream_service"
-
-# 4. Verify all trading processes are terminated
-ps aux | grep -E "celery|live_stream_service" | grep -v grep
-
-# 5. Optional: Stop local Redis / PostgreSQL if stopping local development environment
-# brew services stop redis
-# brew services stop postgresql@14
+./scripts/stop_shadow.sh
 ```
