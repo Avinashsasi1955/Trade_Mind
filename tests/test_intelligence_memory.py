@@ -46,7 +46,7 @@ class TestIntelligenceMemory(unittest.TestCase):
         self.assertIsNone(trap)
 
         # 2. Record a trap (Wilder ASI sweep at 24850)
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime(2026, 6, 1, 9, 30, 0, tzinfo=timezone.utc)
         record = record_session_trap(
             self.conn,
             symbol="NIFTY",

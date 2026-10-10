@@ -9,7 +9,7 @@ from backend.candle_sanitizer import BarInvariantValidator, TickSanitizer
 class TestCandleSanitizer(unittest.TestCase):
     def setUp(self):
         self.sanitizer = TickSanitizer(equity_jump_threshold=0.03, option_jump_threshold=0.20, max_stale_seconds=3.0)
-        self.now = datetime.now(timezone.utc)
+        self.now = datetime(2026, 6, 1, 9, 30, 0, tzinfo=timezone.utc)
 
     def test_non_positive_price(self):
         valid, reason = self.sanitizer.validate_tick(1, Decimal("0"), self.now, 100)

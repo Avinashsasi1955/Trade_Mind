@@ -1,0 +1,2538 @@
+{
+  "top200_symbols": [
+    {
+      "symbol": "HDFCBANK",
+      "avg_daily_traded_value": 24908340179.819027
+    },
+    {
+      "symbol": "RELIANCE",
+      "avg_daily_traded_value": 18722378667.2252
+    },
+    {
+      "symbol": "ICICIBANK",
+      "avg_daily_traded_value": 18086895989.2332
+    },
+    {
+      "symbol": "BHARTIARTL",
+      "avg_daily_traded_value": 14898243107.082996
+    },
+    {
+      "symbol": "INFY",
+      "avg_daily_traded_value": 14636426828.702024
+    },
+    {
+      "symbol": "BSE",
+      "avg_daily_traded_value": 13234085846.166397
+    },
+    {
+      "symbol": "SBIN",
+      "avg_daily_traded_value": 12274073357.576519
+    },
+    {
+      "symbol": "ETERNAL",
+      "avg_daily_traded_value": 11551421085.88842
+    },
+    {
+      "symbol": "TCS",
+      "avg_daily_traded_value": 9890470002.139677
+    },
+    {
+      "symbol": "M&M",
+      "avg_daily_traded_value": 8888915512.192713
+    },
+    {
+      "symbol": "LT",
+      "avg_daily_traded_value": 8568497889.576923
+    },
+    {
+      "symbol": "AXISBANK",
+      "avg_daily_traded_value": 8494137270.360729
+    },
+    {
+      "symbol": "VEDL",
+      "avg_daily_traded_value": 8284614107.102226
+    },
+    {
+      "symbol": "BAJFINANCE",
+      "avg_daily_traded_value": 7828909654.804656
+    },
+    {
+      "symbol": "IDEA",
+      "avg_daily_traded_value": 7654274336.138826
+    },
+    {
+      "symbol": "INDIGO",
+      "avg_daily_traded_value": 7633936704.950202
+    },
+    {
+      "symbol": "HINDCOPPER",
+      "avg_daily_traded_value": 7569379729.804615
+    },
+    {
+      "symbol": "MCX",
+      "avg_daily_traded_value": 7199898832.7821865
+    },
+    {
+      "symbol": "KOTAKBANK",
+      "avg_daily_traded_value": 6996103564.705871
+    },
+    {
+      "symbol": "NETWEB",
+      "avg_daily_traded_value": 6972565266.2712555
+    },
+    {
+      "symbol": "DIXON",
+      "avg_daily_traded_value": 6519666871.831984
+    },
+    {
+      "symbol": "BEL",
+      "avg_daily_traded_value": 6373307648.641498
+    },
+    {
+      "symbol": "ITC",
+      "avg_daily_traded_value": 6255312810.621053
+    },
+    {
+      "symbol": "MARUTI",
+      "avg_daily_traded_value": 6248454842.421053
+    },
+    {
+      "symbol": "KAYNES",
+      "avg_daily_traded_value": 6054835601.507287
+    },
+    {
+      "symbol": "ADANIPOWER",
+      "avg_daily_traded_value": 6005704119.689797
+    },
+    {
+      "symbol": "WAAREEENER",
+      "avg_daily_traded_value": 5995272022.204453
+    },
+    {
+      "symbol": "SHRIRAMFIN",
+      "avg_daily_traded_value": 5953442230.435223
+    },
+    {
+      "symbol": "HAL",
+      "avg_daily_traded_value": 5448101421.745344
+    },
+    {
+      "symbol": "TATASTEEL",
+      "avg_daily_traded_value": 5238159837.869028
+    },
+    {
+      "symbol": "HINDALCO",
+      "avg_daily_traded_value": 5108056744.773887
+    },
+    {
+      "symbol": "HCLTECH",
+      "avg_daily_traded_value": 4734972380.988259
+    },
+    {
+      "symbol": "TRENT",
+      "avg_daily_traded_value": 4734550689.159514
+    },
+    {
+      "symbol": "SUNPHARMA",
+      "avg_daily_traded_value": 4621977190.038866
+    },
+    {
+      "symbol": "PAYTM",
+      "avg_daily_traded_value": 4429575694.726923
+    },
+    {
+      "symbol": "SWIGGY",
+      "avg_daily_traded_value": 4383478924.307693
+    },
+    {
+      "symbol": "HINDZINC",
+      "avg_daily_traded_value": 4299612497.0151825
+    },
+    {
+      "symbol": "HINDUNILVR",
+      "avg_daily_traded_value": 4059580094.776923
+    },
+    {
+      "symbol": "COFORGE",
+      "avg_daily_traded_value": 4013023435.65668
+    },
+    {
+      "symbol": "NATIONALUM",
+      "avg_daily_traded_value": 3976976361.316356
+    },
+    {
+      "symbol": "SUZLON",
+      "avg_daily_traded_value": 3957239616.632146
+    },
+    {
+      "symbol": "COALINDIA",
+      "avg_daily_traded_value": 3949241884.1587043
+    },
+    {
+      "symbol": "ADANIENT",
+      "avg_daily_traded_value": 3941330881.84332
+    },
+    {
+      "symbol": "TITAN",
+      "avg_daily_traded_value": 3893956873.482996
+    },
+    {
+      "symbol": "JIOFIN",
+      "avg_daily_traded_value": 3845537893.550729
+    },
+    {
+      "symbol": "GRSE",
+      "avg_daily_traded_value": 3803604571.923077
+    },
+    {
+      "symbol": "NTPC",
+      "avg_daily_traded_value": 3780852817.4633603
+    },
+    {
+      "symbol": "MAZDOCK",
+      "avg_daily_traded_value": 3746222389.5615387
+    },
+    {
+      "symbol": "ADANIGREEN",
+      "avg_daily_traded_value": 3703484638.4265184
+    },
+    {
+      "symbol": "HEROMOTOCO",
+      "avg_daily_traded_value": 3700949080.423482
+    },
+    {
+      "symbol": "ONGC",
+      "avg_daily_traded_value": 3691087024.249595
+    },
+    {
+      "symbol": "POWERGRID",
+      "avg_daily_traded_value": 3658222374.0979757
+    },
+    {
+      "symbol": "POWERINDIA",
+      "avg_daily_traded_value": 3630487756.874494
+    },
+    {
+      "symbol": "EICHERMOT",
+      "avg_daily_traded_value": 3629995815.5242915
+    },
+    {
+      "symbol": "MTARTECH",
+      "avg_daily_traded_value": 3606239684.540408
+    },
+    {
+      "symbol": "BHEL",
+      "avg_daily_traded_value": 3562257057.9354253
+    },
+    {
+      "symbol": "ADANIPORTS",
+      "avg_daily_traded_value": 3548311126.6190286
+    },
+    {
+      "symbol": "CANBK",
+      "avg_daily_traded_value": 3534747317.8530364
+    },
+    {
+      "symbol": "BAJAJ-AUTO",
+      "avg_daily_traded_value": 3406773593.242915
+    },
+    {
+      "symbol": "APOLLO",
+      "avg_daily_traded_value": 3364611084.0445747
+    },
+    {
+      "symbol": "ULTRACEMCO",
+      "avg_daily_traded_value": 3358037231.728745
+    },
+    {
+      "symbol": "WIPRO",
+      "avg_daily_traded_value": 3304076523.044251
+    },
+    {
+      "symbol": "PERSISTENT",
+      "avg_daily_traded_value": 3264923024.377328
+    },
+    {
+      "symbol": "ASIANPAINT",
+      "avg_daily_traded_value": 3217153900.8753037
+    },
+    {
+      "symbol": "INDUSINDBK",
+      "avg_daily_traded_value": 3209521148.851417
+    },
+    {
+      "symbol": "TECHM",
+      "avg_daily_traded_value": 3201814267.725911
+    },
+    {
+      "symbol": "MAXHEALTH",
+      "avg_daily_traded_value": 3193841340.290688
+    },
+    {
+      "symbol": "GMDCLTD",
+      "avg_daily_traded_value": 3156956729.250405
+    },
+    {
+      "symbol": "SAIL",
+      "avg_daily_traded_value": 3148539834.269312
+    },
+    {
+      "symbol": "APOLLOHOSP",
+      "avg_daily_traded_value": 3106944021.082996
+    },
+    {
+      "symbol": "ASHOKLEY",
+      "avg_daily_traded_value": 3104655878.8128743
+    },
+    {
+      "symbol": "TVSMOTOR",
+      "avg_daily_traded_value": 3058683175.9566803
+    },
+    {
+      "symbol": "VBL",
+      "avg_daily_traded_value": 2990595241.9295545
+    },
+    {
+      "symbol": "CDSL",
+      "avg_daily_traded_value": 2977614096.7497973
+    },
+    {
+      "symbol": "HFCL",
+      "avg_daily_traded_value": 2894909827.713684
+    },
+    {
+      "symbol": "BPCL",
+      "avg_daily_traded_value": 2854952047.639676
+    },
+    {
+      "symbol": "CHOLAFIN",
+      "avg_daily_traded_value": 2845543855.233603
+    },
+    {
+      "symbol": "POLYCAB",
+      "avg_daily_traded_value": 2817350535.7530365
+    },
+    {
+      "symbol": "SAMMAANCAP",
+      "avg_daily_traded_value": 2809271988.8877735
+    },
+    {
+      "symbol": "TEJASNET",
+      "avg_daily_traded_value": 2796528223.5580974
+    },
+    {
+      "symbol": "POLICYBZR",
+      "avg_daily_traded_value": 2793876676.5068827
+    },
+    {
+      "symbol": "INDUSTOWER",
+      "avg_daily_traded_value": 2782575154.3012147
+    },
+    {
+      "symbol": "GODFRYPHLP",
+      "avg_daily_traded_value": 2764030676.783806
+    },
+    {
+      "symbol": "PFC",
+      "avg_daily_traded_value": 2737756233.6054654
+    },
+    {
+      "symbol": "BANKBARODA",
+      "avg_daily_traded_value": 2707416795.9404454
+    },
+    {
+      "symbol": "AMBER",
+      "avg_daily_traded_value": 2701603073.785425
+    },
+    {
+      "symbol": "CUMMINSIND",
+      "avg_daily_traded_value": 2628234083.4587045
+    },
+    {
+      "symbol": "HDFCAMC",
+      "avg_daily_traded_value": 2622013513.2704453
+    },
+    {
+      "symbol": "GVT&D",
+      "avg_daily_traded_value": 2580862547.7591095
+    },
+    {
+      "symbol": "ANGELONE",
+      "avg_daily_traded_value": 2576703502.600162
+    },
+    {
+      "symbol": "RBLBANK",
+      "avg_daily_traded_value": 2566725283.0454655
+    },
+    {
+      "symbol": "DATAPATTNS",
+      "avg_daily_traded_value": 2542996035.48502
+    },
+    {
+      "symbol": "KALYANKJIL",
+      "avg_daily_traded_value": 2539288906.887652
+    },
+    {
+      "symbol": "RECLTD",
+      "avg_daily_traded_value": 2513200354.3168015
+    },
+    {
+      "symbol": "FEDERALBNK",
+      "avg_daily_traded_value": 2510889933.5306883
+    },
+    {
+      "symbol": "CGPOWER",
+      "avg_daily_traded_value": 2481740236.7617407
+    },
+    {
+      "symbol": "ATHERENERG",
+      "avg_daily_traded_value": 2455022968.6433196
+    },
+    {
+      "symbol": "HSCL",
+      "avg_daily_traded_value": 2443209154.7659917
+    },
+    {
+      "symbol": "MUTHOOTFIN",
+      "avg_daily_traded_value": 2412642149.5497975
+    },
+    {
+      "symbol": "HINDPETRO",
+      "avg_daily_traded_value": 2410787720.808907
+    },
+    {
+      "symbol": "BDL",
+      "avg_daily_traded_value": 2389532592.008907
+    },
+    {
+      "symbol": "ADANIENSOL",
+      "avg_daily_traded_value": 2378750317.919231
+    },
+    {
+      "symbol": "DRREDDY",
+      "avg_daily_traded_value": 2365826063.262753
+    },
+    {
+      "symbol": "UNIONBANK",
+      "avg_daily_traded_value": 2336511508.3614573
+    },
+    {
+      "symbol": "DIVISLAB",
+      "avg_daily_traded_value": 2334327092.3157897
+    },
+    {
+      "symbol": "AUBANK",
+      "avg_daily_traded_value": 2333572770.012551
+    },
+    {
+      "symbol": "CIPLA",
+      "avg_daily_traded_value": 2327095825.044534
+    },
+    {
+      "symbol": "RVNL",
+      "avg_daily_traded_value": 2321819266.849919
+    },
+    {
+      "symbol": "MOTHERSON",
+      "avg_daily_traded_value": 2311209910.487449
+    },
+    {
+      "symbol": "HDFCLIFE",
+      "avg_daily_traded_value": 2275545746.324494
+    },
+    {
+      "symbol": "IDFCFIRSTB",
+      "avg_daily_traded_value": 2270020958.379231
+    },
+    {
+      "symbol": "FORCEMOT",
+      "avg_daily_traded_value": 2269574371.7611337
+    },
+    {
+      "symbol": "BAJAJFINSV",
+      "avg_daily_traded_value": 2232522146.517409
+    },
+    {
+      "symbol": "VMM",
+      "avg_daily_traded_value": 2220702154.728664
+    },
+    {
+      "symbol": "YESBANK",
+      "avg_daily_traded_value": 2199571255.125749
+    },
+    {
+      "symbol": "SOLARINDS",
+      "avg_daily_traded_value": 2196838757.6072874
+    },
+    {
+      "symbol": "COCHINSHIP",
+      "avg_daily_traded_value": 2195955845.95749
+    },
+    {
+      "symbol": "TATAPOWER",
+      "avg_daily_traded_value": 2186953032.889474
+    },
+    {
+      "symbol": "DMART",
+      "avg_daily_traded_value": 2183533842.002834
+    },
+    {
+      "symbol": "ATGL",
+      "avg_daily_traded_value": 2182430282.212146
+    },
+    {
+      "symbol": "DLF",
+      "avg_daily_traded_value": 2181431741.7190285
+    },
+    {
+      "symbol": "IOC",
+      "avg_daily_traded_value": 2179390222.0663967
+    },
+    {
+      "symbol": "PNB",
+      "avg_daily_traded_value": 2165643773.81336
+    },
+    {
+      "symbol": "LUPIN",
+      "avg_daily_traded_value": 2153465841.8036437
+    },
+    {
+      "symbol": "CUPID",
+      "avg_daily_traded_value": 2145377926.667328
+    },
+    {
+      "symbol": "LAURUSLABS",
+      "avg_daily_traded_value": 2131738356.7534413
+    },
+    {
+      "symbol": "CHENNPETRO",
+      "avg_daily_traded_value": 2126620767.8789473
+    },
+    {
+      "symbol": "TATAINVEST",
+      "avg_daily_traded_value": 2108398144.5574899
+    },
+    {
+      "symbol": "BRITANNIA",
+      "avg_daily_traded_value": 2098096068.7651823
+    },
+    {
+      "symbol": "PGEL",
+      "avg_daily_traded_value": 2073737672.6034412
+    },
+    {
+      "symbol": "GRASIM",
+      "avg_daily_traded_value": 2043958968.3497975
+    },
+    {
+      "symbol": "ENRIN",
+      "avg_daily_traded_value": 2025810980.0466943
+    },
+    {
+      "symbol": "ABB",
+      "avg_daily_traded_value": 2024668099.7364373
+    },
+    {
+      "symbol": "WOCKPHARMA",
+      "avg_daily_traded_value": 1999290759.9842105
+    },
+    {
+      "symbol": "SBILIFE",
+      "avg_daily_traded_value": 1999273937.4983807
+    },
+    {
+      "symbol": "HYUNDAI",
+      "avg_daily_traded_value": 1994614699.4445343
+    },
+    {
+      "symbol": "JSWSTEEL",
+      "avg_daily_traded_value": 1982383409.5050607
+    },
+    {
+      "symbol": "JPPOWER",
+      "avg_daily_traded_value": 1965154347.8802834
+    },
+    {
+      "symbol": "ANANTRAJ",
+      "avg_daily_traded_value": 1962572043.5445344
+    },
+    {
+      "symbol": "FORTIS",
+      "avg_daily_traded_value": 1962085271.4694333
+    },
+    {
+      "symbol": "INDHOTEL",
+      "avg_daily_traded_value": 1946517667.5659919
+    },
+    {
+      "symbol": "NMDC",
+      "avg_daily_traded_value": 1939999537.3445344
+    },
+    {
+      "symbol": "HBLENGINE",
+      "avg_daily_traded_value": 1934589145.5060728
+    },
+    {
+      "symbol": "BHARATFORG",
+      "avg_daily_traded_value": 1932065202.688664
+    },
+    {
+      "symbol": "NAUKRI",
+      "avg_daily_traded_value": 1914305351.4568825
+    },
+    {
+      "symbol": "LODHA",
+      "avg_daily_traded_value": 1890929494.665182
+    },
+    {
+      "symbol": "NESTLEIND",
+      "avg_daily_traded_value": 1867478820.3044534
+    },
+    {
+      "symbol": "LTF",
+      "avg_daily_traded_value": 1865787169.7003238
+    },
+    {
+      "symbol": "IFCI",
+      "avg_daily_traded_value": 1861967735.0419433
+    },
+    {
+      "symbol": "UPL",
+      "avg_daily_traded_value": 1849886039.097166
+    },
+    {
+      "symbol": "GAIL",
+      "avg_daily_traded_value": 1831589534.2049797
+    },
+    {
+      "symbol": "OIL",
+      "avg_daily_traded_value": 1817469774.6574898
+    },
+    {
+      "symbol": "SCI",
+      "avg_daily_traded_value": 1789932380.7348583
+    },
+    {
+      "symbol": "INDIANB",
+      "avg_daily_traded_value": 1770882025.0263157
+    },
+    {
+      "symbol": "ABCAPITAL",
+      "avg_daily_traded_value": 1744660162.418664
+    },
+    {
+      "symbol": "GLENMARK",
+      "avg_daily_traded_value": 1722555793.262753
+    },
+    {
+      "symbol": "SAGILITY",
+      "avg_daily_traded_value": 1720693625.0338056
+    },
+    {
+      "symbol": "AUROPHARMA",
+      "avg_daily_traded_value": 1720149256.2388663
+    },
+    {
+      "symbol": "NYKAA",
+      "avg_daily_traded_value": 1699493634.6164777
+    },
+    {
+      "symbol": "OFSS",
+      "avg_daily_traded_value": 1684205390.8360324
+    },
+    {
+      "symbol": "GODREJPROP",
+      "avg_daily_traded_value": 1665563990.4935222
+    },
+    {
+      "symbol": "JSWENERGY",
+      "avg_daily_traded_value": 1655539080.9303644
+    },
+    {
+      "symbol": "TATACONSUM",
+      "avg_daily_traded_value": 1644616144.1558704
+    },
+    {
+      "symbol": "MRPL",
+      "avg_daily_traded_value": 1629428966.8793523
+    },
+    {
+      "symbol": "GODREJCP",
+      "avg_daily_traded_value": 1621183848.1995952
+    },
+    {
+      "symbol": "JINDALSTEL",
+      "avg_daily_traded_value": 1618772674.0091093
+    },
+    {
+      "symbol": "BANDHANBNK",
+      "avg_daily_traded_value": 1618078663.3174088
+    },
+    {
+      "symbol": "GMRAIRPORT",
+      "avg_daily_traded_value": 1614011014.032267
+    },
+    {
+      "symbol": "ZEEL",
+      "avg_daily_traded_value": 1605393335.5793118
+    },
+    {
+      "symbol": "IEX",
+      "avg_daily_traded_value": 1590348350.75
+    },
+    {
+      "symbol": "REDINGTON",
+      "avg_daily_traded_value": 1561330366.2170446
+    },
+    {
+      "symbol": "PREMIERENE",
+      "avg_daily_traded_value": 1555741479.1093118
+    },
+    {
+      "symbol": "IRFC",
+      "avg_daily_traded_value": 1516238608.269838
+    },
+    {
+      "symbol": "VOLTAS",
+      "avg_daily_traded_value": 1480709214.7502024
+    },
+    {
+      "symbol": "IDBI",
+      "avg_daily_traded_value": 1462324519.00583
+    },
+    {
+      "symbol": "TORNTPHARM",
+      "avg_daily_traded_value": 1462062576.1611335
+    },
+    {
+      "symbol": "KEI",
+      "avg_daily_traded_value": 1451631107.6287448
+    },
+    {
+      "symbol": "SIEMENS",
+      "avg_daily_traded_value": 1432682760.905668
+    },
+    {
+      "symbol": "MPHASIS",
+      "avg_daily_traded_value": 1423994991.1866398
+    },
+    {
+      "symbol": "MARICO",
+      "avg_daily_traded_value": 1421902645.7342105
+    },
+    {
+      "symbol": "CARTRADE",
+      "avg_daily_traded_value": 1416864414.5813766
+    },
+    {
+      "symbol": "TATAELXSI",
+      "avg_daily_traded_value": 1413838369.3481781
+    },
+    {
+      "symbol": "SYRMA",
+      "avg_daily_traded_value": 1409858546.90668
+    },
+    {
+      "symbol": "PARAS",
+      "avg_daily_traded_value": 1408533519.3147774
+    },
+    {
+      "symbol": "BIOCON",
+      "avg_daily_traded_value": 1406204193.0959513
+    },
+    {
+      "symbol": "PNBHOUSING",
+      "avg_daily_traded_value": 1402752738.1356275
+    },
+    {
+      "symbol": "BELRISE",
+      "avg_daily_traded_value": 1398157308.9837246
+    },
+    {
+      "symbol": "TARIL",
+      "avg_daily_traded_value": 1396578114.1918623
+    },
+    {
+      "symbol": "SRF",
+      "avg_daily_traded_value": 1394686135.7295547
+    },
+    {
+      "symbol": "UNITDSPR",
+      "avg_daily_traded_value": 1393274149.3902833
+    },
+    {
+      "symbol": "BANKINDIA",
+      "avg_daily_traded_value": 1392922368.4340081
+    },
+    {
+      "symbol": "NEWGEN",
+      "avg_daily_traded_value": 1371526149.9107287
+    },
+    {
+      "symbol": "SONACOMS",
+      "avg_daily_traded_value": 1345830352.4898787
+    },
+    {
+      "symbol": "AMBUJACEM",
+      "avg_daily_traded_value": 1340991545.9139676
+    },
+    {
+      "symbol": "NHPC",
+      "avg_daily_traded_value": 1314342709.0441296
+    },
+    {
+      "symbol": "BOSCHLTD",
+      "avg_daily_traded_value": 1299544355.4251013
+    },
+    {
+      "symbol": "HDBFS",
+      "avg_daily_traded_value": 1293168772.8695474
+    },
+    {
+      "symbol": "DELHIVERY",
+      "avg_daily_traded_value": 1282970370.7155871
+    },
+    {
+      "symbol": "HAVELLS",
+      "avg_daily_traded_value": 1270349321.1497977
+    },
+    {
+      "symbol": "LICI",
+      "avg_daily_traded_value": 1269602212.1647773
+    }
+  ],
+  "corporate_actions": {
+    "total_moves_over_20pct": 77,
+    "moves_by_year": {
+      "2023": 12,
+      "2024": 35,
+      "2025": 22,
+      "2026": 8
+    },
+    "top_20_moves": [
+      {
+        "symbol": "GVT&D",
+        "date": "2025-01-06",
+        "prev_close": 442.65,
+        "open": 2025.05,
+        "close": 2008.9,
+        "move_pct": 353.83485824014457,
+        "abs_move_pct": 353.83485824014457,
+        "year": 2025
+      },
+      {
+        "symbol": "CUPID",
+        "date": "2024-10-28",
+        "prev_close": 933.1,
+        "open": 70.1,
+        "close": 74.06,
+        "move_pct": -92.06301575393849,
+        "abs_move_pct": 92.06301575393849,
+        "year": 2024
+      },
+      {
+        "symbol": "NESTLEIND",
+        "date": "2024-01-05",
+        "prev_close": 27116.4,
+        "open": 2754.0,
+        "close": 2666.4,
+        "move_pct": -90.1668363057043,
+        "abs_move_pct": 90.1668363057043,
+        "year": 2024
+      },
+      {
+        "symbol": "ANGELONE",
+        "date": "2026-02-26",
+        "prev_close": 2489.9,
+        "open": 251.0,
+        "close": 246.5,
+        "move_pct": -90.10000401622555,
+        "abs_move_pct": 90.10000401622555,
+        "year": 2026
+      },
+      {
+        "symbol": "PGEL",
+        "date": "2024-07-10",
+        "prev_close": 3999.9,
+        "open": 404.15,
+        "close": 396.9,
+        "move_pct": -90.07725193129829,
+        "abs_move_pct": 90.07725193129829,
+        "year": 2024
+      },
+      {
+        "symbol": "BAJFINANCE",
+        "date": "2025-06-16",
+        "prev_close": 9331.0,
+        "open": 956.0,
+        "close": 938.0,
+        "move_pct": -89.94748687171793,
+        "abs_move_pct": 89.94748687171793,
+        "year": 2025
+      },
+      {
+        "symbol": "TATAINVEST",
+        "date": "2025-10-14",
+        "prev_close": 9922.0,
+        "open": 1042.0,
+        "close": 1035.0,
+        "move_pct": -89.56863535577504,
+        "abs_move_pct": 89.56863535577504,
+        "year": 2025
+      },
+      {
+        "symbol": "APOLLO",
+        "date": "2023-05-04",
+        "prev_close": 330.0,
+        "open": 33.5,
+        "close": 34.65,
+        "move_pct": -89.5,
+        "abs_move_pct": 89.5,
+        "year": 2023
+      },
+      {
+        "symbol": "SHRIRAMFIN",
+        "date": "2025-01-10",
+        "prev_close": 2809.85,
+        "open": 566.0,
+        "close": 532.0,
+        "move_pct": -81.06660497891347,
+        "abs_move_pct": 81.06660497891347,
+        "year": 2025
+      },
+      {
+        "symbol": "KOTAKBANK",
+        "date": "2026-01-14",
+        "prev_close": 2132.6,
+        "open": 426.0,
+        "close": 421.0,
+        "move_pct": -80.25883897589796,
+        "abs_move_pct": 80.25883897589796,
+        "year": 2026
+      },
+      {
+        "symbol": "NAUKRI",
+        "date": "2025-05-07",
+        "prev_close": 6984.5,
+        "open": 1387.5,
+        "close": 1385.0,
+        "move_pct": -80.17037726394159,
+        "abs_move_pct": 80.17037726394159,
+        "year": 2025
+      },
+      {
+        "symbol": "DRREDDY",
+        "date": "2024-10-28",
+        "prev_close": 6514.7,
+        "open": 1320.0,
+        "close": 1311.5,
+        "move_pct": -79.86860484749873,
+        "abs_move_pct": 79.86860484749873,
+        "year": 2024
+      },
+      {
+        "symbol": "MCX",
+        "date": "2026-01-02",
+        "prev_close": 10989.0,
+        "open": 2230.0,
+        "close": 2216.0,
+        "move_pct": -79.83437983437983,
+        "abs_move_pct": 79.83437983437983,
+        "year": 2026
+      },
+      {
+        "symbol": "COFORGE",
+        "date": "2025-06-04",
+        "prev_close": 8499.0,
+        "open": 1719.0,
+        "close": 1724.5,
+        "move_pct": -79.70937757383221,
+        "abs_move_pct": 79.70937757383221,
+        "year": 2025
+      },
+      {
+        "symbol": "CANBK",
+        "date": "2024-05-15",
+        "prev_close": 566.55,
+        "open": 116.25,
+        "close": 119.0,
+        "move_pct": -78.99567558026652,
+        "abs_move_pct": 78.99567558026652,
+        "year": 2024
+      },
+      {
+        "symbol": "CUPID",
+        "date": "2026-03-09",
+        "prev_close": 402.2,
+        "open": 82.0,
+        "close": 91.6,
+        "move_pct": -77.22526106414719,
+        "abs_move_pct": 77.22526106414719,
+        "year": 2026
+      },
+      {
+        "symbol": "ADANIPOWER",
+        "date": "2025-09-22",
+        "prev_close": 709.4,
+        "open": 148.2,
+        "close": 170.25,
+        "move_pct": -76.00084578517057,
+        "abs_move_pct": 76.00084578517057,
+        "year": 2025
+      },
+      {
+        "symbol": "TARIL",
+        "date": "2024-05-06",
+        "prev_close": 347.8,
+        "open": 649.8,
+        "close": 606.45,
+        "move_pct": 74.36745255894192,
+        "abs_move_pct": 74.36745255894192,
+        "year": 2024
+      },
+      {
+        "symbol": "NMDC",
+        "date": "2024-12-27",
+        "prev_close": 214.45,
+        "open": 71.84,
+        "close": 69.32,
+        "move_pct": -67.67544882256936,
+        "abs_move_pct": 67.67544882256936,
+        "year": 2024
+      },
+      {
+        "symbol": "BSE",
+        "date": "2025-05-23",
+        "prev_close": 6996.5,
+        "open": 2358.0,
+        "close": 2448.0,
+        "move_pct": -65.01107696705496,
+        "abs_move_pct": 65.01107696705496,
+        "year": 2025
+      }
+    ],
+    "excluded_entries_count": 750
+  },
+  "baseline_all_entries": {
+    "LONG": {
+      "overall": {
+        "count": 90359,
+        "pos_count": 20333,
+        "pos_rate": 22.5,
+        "hit_1r_first_count": 31691,
+        "hit_1r_first_rate": 35.07,
+        "censored_count": 732,
+        "censored_rate": 0.81,
+        "mean_gross_r": 0.0661,
+        "median_gross_r": -0.0297,
+        "mean_net_r": 0.0214,
+        "median_net_r": -0.0698,
+        "exit_reasons": {
+          "STOP_LOSS": 25827,
+          "HOLDING_LIMIT_EXIT": 43654,
+          "TAKE_PROFIT": 17957,
+          "GAP_DOWN_STOP": 2189,
+          "TRUNCATED_SERIES": 732
+        }
+      },
+      "by_year": {
+        "2023": {
+          "count": 23793,
+          "pos_count": 5819,
+          "pos_rate": 24.46,
+          "hit_1r_first_count": 8776,
+          "hit_1r_first_rate": 36.88,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": 0.1678,
+          "median_gross_r": 0.1104,
+          "mean_net_r": 0.1199,
+          "median_net_r": 0.069,
+          "exit_reasons": {
+            "STOP_LOSS": 5649,
+            "HOLDING_LIMIT_EXIT": 12638,
+            "TAKE_PROFIT": 5135,
+            "GAP_DOWN_STOP": 371
+          }
+        },
+        "2024": {
+          "count": 24312,
+          "pos_count": 5204,
+          "pos_rate": 21.41,
+          "hit_1r_first_count": 8265,
+          "hit_1r_first_rate": 34.0,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": 0.0253,
+          "median_gross_r": -0.0826,
+          "mean_net_r": -0.0157,
+          "median_net_r": -0.121,
+          "exit_reasons": {
+            "GAP_DOWN_STOP": 510,
+            "STOP_LOSS": 7556,
+            "HOLDING_LIMIT_EXIT": 11667,
+            "TAKE_PROFIT": 4579
+          }
+        },
+        "2025": {
+          "count": 28492,
+          "pos_count": 6016,
+          "pos_rate": 21.11,
+          "hit_1r_first_count": 9827,
+          "hit_1r_first_rate": 34.49,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": 0.0342,
+          "median_gross_r": -0.0619,
+          "mean_net_r": -0.0124,
+          "median_net_r": -0.1036,
+          "exit_reasons": {
+            "STOP_LOSS": 8278,
+            "GAP_DOWN_STOP": 760,
+            "HOLDING_LIMIT_EXIT": 14126,
+            "TAKE_PROFIT": 5328
+          }
+        },
+        "2026": {
+          "count": 13762,
+          "pos_count": 3294,
+          "pos_rate": 23.94,
+          "hit_1r_first_count": 4823,
+          "hit_1r_first_rate": 35.05,
+          "censored_count": 732,
+          "censored_rate": 5.32,
+          "mean_gross_r": 0.0285,
+          "median_gross_r": -0.1322,
+          "mean_net_r": -0.0131,
+          "median_net_r": -0.1703,
+          "exit_reasons": {
+            "GAP_DOWN_STOP": 548,
+            "STOP_LOSS": 4344,
+            "HOLDING_LIMIT_EXIT": 5223,
+            "TAKE_PROFIT": 2915,
+            "TRUNCATED_SERIES": 732
+          }
+        }
+      },
+      "by_regime": {
+        "ABOVE_200D": {
+          "count": 67201,
+          "pos_count": 14696,
+          "pos_rate": 21.87,
+          "hit_1r_first_count": 23039,
+          "hit_1r_first_rate": 34.28,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": 0.0709,
+          "median_gross_r": -0.017,
+          "mean_net_r": 0.0247,
+          "median_net_r": -0.0595,
+          "exit_reasons": {
+            "STOP_LOSS": 18497,
+            "HOLDING_LIMIT_EXIT": 34263,
+            "TAKE_PROFIT": 13034,
+            "GAP_DOWN_STOP": 1407
+          }
+        },
+        "BELOW_200D": {
+          "count": 23156,
+          "pos_count": 5637,
+          "pos_rate": 24.34,
+          "hit_1r_first_count": 8652,
+          "hit_1r_first_rate": 37.36,
+          "censored_count": 732,
+          "censored_rate": 3.16,
+          "mean_gross_r": 0.0524,
+          "median_gross_r": -0.0693,
+          "mean_net_r": 0.0122,
+          "median_net_r": -0.1078,
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 9391,
+            "STOP_LOSS": 7328,
+            "TAKE_PROFIT": 4923,
+            "GAP_DOWN_STOP": 782,
+            "TRUNCATED_SERIES": 732
+          }
+        }
+      },
+      "by_year_and_regime": {
+        "2023": {
+          "ABOVE_200D": {
+            "count": 21122,
+            "pos_count": 5169,
+            "pos_rate": 24.47,
+            "hit_1r_first_count": 7761,
+            "hit_1r_first_rate": 36.74,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.1742,
+            "median_gross_r": 0.1108,
+            "mean_net_r": 0.1263,
+            "median_net_r": 0.0696,
+            "exit_reasons": {
+              "STOP_LOSS": 4824,
+              "HOLDING_LIMIT_EXIT": 11373,
+              "TAKE_PROFIT": 4594,
+              "GAP_DOWN_STOP": 331
+            }
+          },
+          "BELOW_200D": {
+            "count": 2671,
+            "pos_count": 650,
+            "pos_rate": 24.34,
+            "hit_1r_first_count": 1015,
+            "hit_1r_first_rate": 38.0,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.117,
+            "median_gross_r": 0.103,
+            "mean_net_r": 0.0694,
+            "median_net_r": 0.0572,
+            "exit_reasons": {
+              "HOLDING_LIMIT_EXIT": 1265,
+              "STOP_LOSS": 825,
+              "TAKE_PROFIT": 541,
+              "GAP_DOWN_STOP": 40
+            }
+          }
+        },
+        "2024": {
+          "ABOVE_200D": {
+            "count": 22685,
+            "pos_count": 4711,
+            "pos_rate": 20.77,
+            "hit_1r_first_count": 7501,
+            "hit_1r_first_rate": 33.07,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.0136,
+            "median_gross_r": -0.0979,
+            "mean_net_r": -0.027,
+            "median_net_r": -0.1338,
+            "exit_reasons": {
+              "GAP_DOWN_STOP": 473,
+              "STOP_LOSS": 7097,
+              "HOLDING_LIMIT_EXIT": 10966,
+              "TAKE_PROFIT": 4149
+            }
+          },
+          "BELOW_200D": {
+            "count": 1627,
+            "pos_count": 493,
+            "pos_rate": 30.3,
+            "hit_1r_first_count": 764,
+            "hit_1r_first_rate": 46.96,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.1885,
+            "median_gross_r": 0.1846,
+            "mean_net_r": 0.1421,
+            "median_net_r": 0.137,
+            "exit_reasons": {
+              "TAKE_PROFIT": 430,
+              "HOLDING_LIMIT_EXIT": 701,
+              "STOP_LOSS": 459,
+              "GAP_DOWN_STOP": 37
+            }
+          }
+        },
+        "2025": {
+          "ABOVE_200D": {
+            "count": 19176,
+            "pos_count": 3997,
+            "pos_rate": 20.84,
+            "hit_1r_first_count": 6536,
+            "hit_1r_first_rate": 34.08,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.0727,
+            "median_gross_r": -0.0077,
+            "mean_net_r": 0.0212,
+            "median_net_r": -0.0546,
+            "exit_reasons": {
+              "STOP_LOSS": 4928,
+              "HOLDING_LIMIT_EXIT": 10347,
+              "TAKE_PROFIT": 3546,
+              "GAP_DOWN_STOP": 355
+            }
+          },
+          "BELOW_200D": {
+            "count": 9316,
+            "pos_count": 2019,
+            "pos_rate": 21.67,
+            "hit_1r_first_count": 3291,
+            "hit_1r_first_rate": 35.33,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": -0.0449,
+            "median_gross_r": -0.2323,
+            "mean_net_r": -0.0814,
+            "median_net_r": -0.2653,
+            "exit_reasons": {
+              "STOP_LOSS": 3350,
+              "GAP_DOWN_STOP": 405,
+              "HOLDING_LIMIT_EXIT": 3779,
+              "TAKE_PROFIT": 1782
+            }
+          }
+        },
+        "2026": {
+          "ABOVE_200D": {
+            "count": 4218,
+            "pos_count": 819,
+            "pos_rate": 19.42,
+            "hit_1r_first_count": 1241,
+            "hit_1r_first_rate": 29.42,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": -0.1464,
+            "median_gross_r": -0.4969,
+            "mean_net_r": -0.1903,
+            "median_net_r": -0.5314,
+            "exit_reasons": {
+              "GAP_DOWN_STOP": 248,
+              "STOP_LOSS": 1648,
+              "HOLDING_LIMIT_EXIT": 1577,
+              "TAKE_PROFIT": 745
+            }
+          },
+          "BELOW_200D": {
+            "count": 9542,
+            "pos_count": 2475,
+            "pos_rate": 25.94,
+            "hit_1r_first_count": 3582,
+            "hit_1r_first_rate": 37.54,
+            "censored_count": 732,
+            "censored_rate": 7.67,
+            "mean_gross_r": 0.1061,
+            "median_gross_r": -0.0215,
+            "mean_net_r": 0.0655,
+            "median_net_r": -0.0604,
+            "exit_reasons": {
+              "TAKE_PROFIT": 2170,
+              "STOP_LOSS": 2694,
+              "GAP_DOWN_STOP": 300,
+              "HOLDING_LIMIT_EXIT": 3646,
+              "TRUNCATED_SERIES": 732
+            }
+          }
+        }
+      }
+    },
+    "SHORT": {
+      "overall": {
+        "count": 109366,
+        "pos_count": 20063,
+        "pos_rate": 18.34,
+        "hit_1r_first_count": 33606,
+        "hit_1r_first_rate": 30.73,
+        "censored_count": 1015,
+        "censored_rate": 0.93,
+        "mean_gross_r": -0.0802,
+        "median_gross_r": -0.246,
+        "mean_net_r": -0.1006,
+        "median_net_r": -0.2636,
+        "exit_reasons": {
+          "HOLDING_LIMIT_EXIT": 47605,
+          "TAKE_PROFIT": 17306,
+          "STOP_LOSS": 39925,
+          "GAP_UP_STOP": 3515,
+          "TRUNCATED_SERIES": 1015
+        }
+      },
+      "by_year": {
+        "2023": {
+          "count": 33737,
+          "pos_count": 4598,
+          "pos_rate": 13.63,
+          "hit_1r_first_count": 8448,
+          "hit_1r_first_rate": 25.04,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": -0.2234,
+          "median_gross_r": -0.4943,
+          "mean_net_r": -0.2454,
+          "median_net_r": -0.5141,
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 14423,
+            "TAKE_PROFIT": 3905,
+            "STOP_LOSS": 14284,
+            "GAP_UP_STOP": 1125
+          }
+        },
+        "2024": {
+          "count": 30437,
+          "pos_count": 6534,
+          "pos_rate": 21.47,
+          "hit_1r_first_count": 10442,
+          "hit_1r_first_rate": 34.31,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": -0.0278,
+          "median_gross_r": -0.1831,
+          "mean_net_r": -0.0466,
+          "median_net_r": -0.2007,
+          "exit_reasons": {
+            "TAKE_PROFIT": 5757,
+            "HOLDING_LIMIT_EXIT": 13042,
+            "STOP_LOSS": 10569,
+            "GAP_UP_STOP": 1069
+          }
+        },
+        "2025": {
+          "count": 30745,
+          "pos_count": 5886,
+          "pos_rate": 19.14,
+          "hit_1r_first_count": 9843,
+          "hit_1r_first_rate": 32.01,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": -0.0271,
+          "median_gross_r": -0.1561,
+          "mean_net_r": -0.0481,
+          "median_net_r": -0.1757,
+          "exit_reasons": {
+            "STOP_LOSS": 10462,
+            "HOLDING_LIMIT_EXIT": 14413,
+            "GAP_UP_STOP": 859,
+            "TAKE_PROFIT": 5011
+          }
+        },
+        "2026": {
+          "count": 14447,
+          "pos_count": 3045,
+          "pos_rate": 21.08,
+          "hit_1r_first_count": 4873,
+          "hit_1r_first_rate": 33.73,
+          "censored_count": 1015,
+          "censored_rate": 7.03,
+          "mean_gross_r": 0.0311,
+          "median_gross_r": -0.0406,
+          "mean_net_r": 0.0122,
+          "median_net_r": -0.0592,
+          "exit_reasons": {
+            "TAKE_PROFIT": 2633,
+            "HOLDING_LIMIT_EXIT": 5727,
+            "STOP_LOSS": 4610,
+            "TRUNCATED_SERIES": 1015,
+            "GAP_UP_STOP": 462
+          }
+        }
+      },
+      "by_regime": {
+        "ABOVE_200D": {
+          "count": 89810,
+          "pos_count": 16031,
+          "pos_rate": 17.85,
+          "hit_1r_first_count": 27116,
+          "hit_1r_first_rate": 30.19,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": -0.1009,
+          "median_gross_r": -0.2741,
+          "mean_net_r": -0.1219,
+          "median_net_r": -0.2927,
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 39739,
+            "TAKE_PROFIT": 13787,
+            "STOP_LOSS": 33391,
+            "GAP_UP_STOP": 2893
+          }
+        },
+        "BELOW_200D": {
+          "count": 19555,
+          "pos_count": 4031,
+          "pos_rate": 20.61,
+          "hit_1r_first_count": 6489,
+          "hit_1r_first_rate": 33.18,
+          "censored_count": 1015,
+          "censored_rate": 5.19,
+          "mean_gross_r": 0.0149,
+          "median_gross_r": -0.1104,
+          "mean_net_r": -0.0028,
+          "median_net_r": -0.1256,
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 7865,
+            "STOP_LOSS": 6534,
+            "GAP_UP_STOP": 622,
+            "TAKE_PROFIT": 3519,
+            "TRUNCATED_SERIES": 1015
+          }
+        }
+      },
+      "by_year_and_regime": {
+        "2023": {
+          "ABOVE_200D": {
+            "count": 31979,
+            "pos_count": 4303,
+            "pos_rate": 13.46,
+            "hit_1r_first_count": 7912,
+            "hit_1r_first_rate": 24.74,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": -0.2342,
+            "median_gross_r": -0.5327,
+            "mean_net_r": -0.2563,
+            "median_net_r": -0.552,
+            "exit_reasons": {
+              "HOLDING_LIMIT_EXIT": 13443,
+              "TAKE_PROFIT": 3665,
+              "STOP_LOSS": 13797,
+              "GAP_UP_STOP": 1074
+            }
+          },
+          "BELOW_200D": {
+            "count": 1758,
+            "pos_count": 295,
+            "pos_rate": 16.78,
+            "hit_1r_first_count": 536,
+            "hit_1r_first_rate": 30.49,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": -0.0264,
+            "median_gross_r": -0.1184,
+            "mean_net_r": -0.0457,
+            "median_net_r": -0.1333,
+            "exit_reasons": {
+              "HOLDING_LIMIT_EXIT": 980,
+              "STOP_LOSS": 487,
+              "GAP_UP_STOP": 51,
+              "TAKE_PROFIT": 240
+            }
+          }
+        },
+        "2024": {
+          "ABOVE_200D": {
+            "count": 29670,
+            "pos_count": 6407,
+            "pos_rate": 21.59,
+            "hit_1r_first_count": 10245,
+            "hit_1r_first_rate": 34.53,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": -0.0244,
+            "median_gross_r": -0.1775,
+            "mean_net_r": -0.0432,
+            "median_net_r": -0.195,
+            "exit_reasons": {
+              "TAKE_PROFIT": 5669,
+              "HOLDING_LIMIT_EXIT": 12693,
+              "STOP_LOSS": 10252,
+              "GAP_UP_STOP": 1056
+            }
+          },
+          "BELOW_200D": {
+            "count": 767,
+            "pos_count": 127,
+            "pos_rate": 16.56,
+            "hit_1r_first_count": 197,
+            "hit_1r_first_rate": 25.68,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": -0.1617,
+            "median_gross_r": -0.4499,
+            "mean_net_r": -0.179,
+            "median_net_r": -0.4596,
+            "exit_reasons": {
+              "STOP_LOSS": 317,
+              "HOLDING_LIMIT_EXIT": 349,
+              "TAKE_PROFIT": 88,
+              "GAP_UP_STOP": 13
+            }
+          }
+        },
+        "2025": {
+          "ABOVE_200D": {
+            "count": 23410,
+            "pos_count": 3824,
+            "pos_rate": 16.33,
+            "hit_1r_first_count": 6821,
+            "hit_1r_first_rate": 29.14,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": -0.0838,
+            "median_gross_r": -0.1932,
+            "mean_net_r": -0.1062,
+            "median_net_r": -0.213,
+            "exit_reasons": {
+              "HOLDING_LIMIT_EXIT": 11563,
+              "STOP_LOSS": 8107,
+              "TAKE_PROFIT": 3121,
+              "GAP_UP_STOP": 619
+            }
+          },
+          "BELOW_200D": {
+            "count": 7335,
+            "pos_count": 2062,
+            "pos_rate": 28.11,
+            "hit_1r_first_count": 3022,
+            "hit_1r_first_rate": 41.2,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.1539,
+            "median_gross_r": -0.0013,
+            "mean_net_r": 0.137,
+            "median_net_r": -0.015,
+            "exit_reasons": {
+              "STOP_LOSS": 2355,
+              "HOLDING_LIMIT_EXIT": 2850,
+              "GAP_UP_STOP": 240,
+              "TAKE_PROFIT": 1890
+            }
+          }
+        },
+        "2026": {
+          "ABOVE_200D": {
+            "count": 4751,
+            "pos_count": 1497,
+            "pos_rate": 31.51,
+            "hit_1r_first_count": 2138,
+            "hit_1r_first_rate": 45.0,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.2348,
+            "median_gross_r": 0.2179,
+            "mean_net_r": 0.2141,
+            "median_net_r": 0.2003,
+            "exit_reasons": {
+              "TAKE_PROFIT": 1332,
+              "HOLDING_LIMIT_EXIT": 2040,
+              "STOP_LOSS": 1235,
+              "GAP_UP_STOP": 144
+            }
+          },
+          "BELOW_200D": {
+            "count": 9695,
+            "pos_count": 1547,
+            "pos_rate": 15.96,
+            "hit_1r_first_count": 2734,
+            "hit_1r_first_rate": 28.2,
+            "censored_count": 1015,
+            "censored_rate": 10.47,
+            "mean_gross_r": -0.0689,
+            "median_gross_r": -0.1607,
+            "mean_net_r": -0.0868,
+            "median_net_r": -0.1747,
+            "exit_reasons": {
+              "HOLDING_LIMIT_EXIT": 3686,
+              "TAKE_PROFIT": 1301,
+              "STOP_LOSS": 3375,
+              "TRUNCATED_SERIES": 1015,
+              "GAP_UP_STOP": 318
+            }
+          }
+        }
+      }
+    },
+    "COMBINED": {
+      "overall": {
+        "count": 199725,
+        "pos_count": 40396,
+        "pos_rate": 20.23,
+        "hit_1r_first_count": 65297,
+        "hit_1r_first_rate": 32.69,
+        "censored_count": 1747,
+        "censored_rate": 0.87,
+        "mean_gross_r": -0.014,
+        "median_gross_r": -0.137,
+        "mean_net_r": -0.0454,
+        "median_net_r": -0.1662,
+        "exit_reasons": {
+          "STOP_LOSS": 65752,
+          "HOLDING_LIMIT_EXIT": 91259,
+          "TAKE_PROFIT": 35263,
+          "GAP_UP_STOP": 3515,
+          "GAP_DOWN_STOP": 2189,
+          "TRUNCATED_SERIES": 1747
+        }
+      },
+      "by_year": {
+        "2023": {
+          "count": 57530,
+          "pos_count": 10417,
+          "pos_rate": 18.11,
+          "hit_1r_first_count": 17224,
+          "hit_1r_first_rate": 29.94,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": -0.0616,
+          "median_gross_r": -0.1905,
+          "mean_net_r": -0.0943,
+          "median_net_r": -0.2215,
+          "exit_reasons": {
+            "STOP_LOSS": 19933,
+            "HOLDING_LIMIT_EXIT": 27061,
+            "TAKE_PROFIT": 9040,
+            "GAP_UP_STOP": 1125,
+            "GAP_DOWN_STOP": 371
+          }
+        },
+        "2024": {
+          "count": 54749,
+          "pos_count": 11738,
+          "pos_rate": 21.44,
+          "hit_1r_first_count": 18707,
+          "hit_1r_first_rate": 34.17,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": -0.0042,
+          "median_gross_r": -0.1349,
+          "mean_net_r": -0.0329,
+          "median_net_r": -0.1609,
+          "exit_reasons": {
+            "TAKE_PROFIT": 10336,
+            "GAP_DOWN_STOP": 510,
+            "STOP_LOSS": 18125,
+            "HOLDING_LIMIT_EXIT": 24709,
+            "GAP_UP_STOP": 1069
+          }
+        },
+        "2025": {
+          "count": 59237,
+          "pos_count": 11902,
+          "pos_rate": 20.09,
+          "hit_1r_first_count": 19670,
+          "hit_1r_first_rate": 33.21,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": 0.0024,
+          "median_gross_r": -0.1073,
+          "mean_net_r": -0.0309,
+          "median_net_r": -0.1379,
+          "exit_reasons": {
+            "STOP_LOSS": 18740,
+            "GAP_DOWN_STOP": 760,
+            "HOLDING_LIMIT_EXIT": 28539,
+            "TAKE_PROFIT": 10339,
+            "GAP_UP_STOP": 859
+          }
+        },
+        "2026": {
+          "count": 28209,
+          "pos_count": 6339,
+          "pos_rate": 22.47,
+          "hit_1r_first_count": 9696,
+          "hit_1r_first_rate": 34.37,
+          "censored_count": 1747,
+          "censored_rate": 6.19,
+          "mean_gross_r": 0.0299,
+          "median_gross_r": -0.0867,
+          "mean_net_r": -0.0001,
+          "median_net_r": -0.1139,
+          "exit_reasons": {
+            "GAP_DOWN_STOP": 548,
+            "TAKE_PROFIT": 5548,
+            "STOP_LOSS": 8954,
+            "HOLDING_LIMIT_EXIT": 10950,
+            "TRUNCATED_SERIES": 1747,
+            "GAP_UP_STOP": 462
+          }
+        }
+      },
+      "by_regime": {
+        "ABOVE_200D": {
+          "count": 157011,
+          "pos_count": 30727,
+          "pos_rate": 19.57,
+          "hit_1r_first_count": 50155,
+          "hit_1r_first_rate": 31.94,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": -0.0274,
+          "median_gross_r": -0.1492,
+          "mean_net_r": -0.0592,
+          "median_net_r": -0.1776,
+          "exit_reasons": {
+            "STOP_LOSS": 51888,
+            "HOLDING_LIMIT_EXIT": 74002,
+            "TAKE_PROFIT": 26821,
+            "GAP_UP_STOP": 2893,
+            "GAP_DOWN_STOP": 1407
+          }
+        },
+        "BELOW_200D": {
+          "count": 42711,
+          "pos_count": 9668,
+          "pos_rate": 22.64,
+          "hit_1r_first_count": 15141,
+          "hit_1r_first_rate": 35.45,
+          "censored_count": 1747,
+          "censored_rate": 4.09,
+          "mean_gross_r": 0.0352,
+          "median_gross_r": -0.0882,
+          "mean_net_r": 0.0054,
+          "median_net_r": -0.1151,
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 17256,
+            "STOP_LOSS": 13862,
+            "TAKE_PROFIT": 8442,
+            "GAP_DOWN_STOP": 782,
+            "GAP_UP_STOP": 622,
+            "TRUNCATED_SERIES": 1747
+          }
+        }
+      }
+    }
+  },
+  "non_overlapping_entries": {
+    "LONG": {
+      "overall": {
+        "count": 14328,
+        "pos_count": 3321,
+        "pos_rate": 23.18,
+        "hit_1r_first_count": 5118,
+        "hit_1r_first_rate": 35.72,
+        "censored_count": 117,
+        "censored_rate": 0.82,
+        "mean_gross_r": 0.0988,
+        "median_gross_r": 0.0201,
+        "mean_net_r": 0.0561,
+        "median_net_r": -0.0167,
+        "exit_reasons": {
+          "STOP_LOSS": 3782,
+          "TAKE_PROFIT": 2925,
+          "HOLDING_LIMIT_EXIT": 7160,
+          "GAP_DOWN_STOP": 344,
+          "TRUNCATED_SERIES": 117
+        }
+      },
+      "by_year": {
+        "2023": {
+          "count": 3749,
+          "pos_count": 911,
+          "pos_rate": 24.3,
+          "hit_1r_first_count": 1362,
+          "hit_1r_first_rate": 36.33,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": 0.1816,
+          "median_gross_r": 0.1352,
+          "mean_net_r": 0.1362,
+          "median_net_r": 0.0963,
+          "exit_reasons": {
+            "STOP_LOSS": 837,
+            "TAKE_PROFIT": 788,
+            "HOLDING_LIMIT_EXIT": 2066,
+            "GAP_DOWN_STOP": 58
+          }
+        },
+        "2024": {
+          "count": 3945,
+          "pos_count": 883,
+          "pos_rate": 22.38,
+          "hit_1r_first_count": 1390,
+          "hit_1r_first_rate": 35.23,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": 0.0759,
+          "median_gross_r": -0.005,
+          "mean_net_r": 0.0366,
+          "median_net_r": -0.0359,
+          "exit_reasons": {
+            "GAP_DOWN_STOP": 80,
+            "STOP_LOSS": 1095,
+            "HOLDING_LIMIT_EXIT": 1999,
+            "TAKE_PROFIT": 771
+          }
+        },
+        "2025": {
+          "count": 4413,
+          "pos_count": 1042,
+          "pos_rate": 23.61,
+          "hit_1r_first_count": 1625,
+          "hit_1r_first_rate": 36.82,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": 0.1036,
+          "median_gross_r": 0.0174,
+          "mean_net_r": 0.059,
+          "median_net_r": -0.0218,
+          "exit_reasons": {
+            "STOP_LOSS": 1142,
+            "HOLDING_LIMIT_EXIT": 2212,
+            "TAKE_PROFIT": 938,
+            "GAP_DOWN_STOP": 121
+          }
+        },
+        "2026": {
+          "count": 2221,
+          "pos_count": 485,
+          "pos_rate": 21.84,
+          "hit_1r_first_count": 741,
+          "hit_1r_first_rate": 33.36,
+          "censored_count": 117,
+          "censored_rate": 5.27,
+          "mean_gross_r": -0.0095,
+          "median_gross_r": -0.191,
+          "mean_net_r": -0.0501,
+          "median_net_r": -0.2278,
+          "exit_reasons": {
+            "STOP_LOSS": 708,
+            "HOLDING_LIMIT_EXIT": 883,
+            "TAKE_PROFIT": 428,
+            "GAP_DOWN_STOP": 85,
+            "TRUNCATED_SERIES": 117
+          }
+        }
+      },
+      "by_regime": {
+        "ABOVE_200D": {
+          "count": 10631,
+          "pos_count": 2377,
+          "pos_rate": 22.36,
+          "hit_1r_first_count": 3685,
+          "hit_1r_first_rate": 34.66,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": 0.1048,
+          "median_gross_r": 0.0436,
+          "mean_net_r": 0.0608,
+          "median_net_r": 0.0022,
+          "exit_reasons": {
+            "STOP_LOSS": 2716,
+            "TAKE_PROFIT": 2076,
+            "HOLDING_LIMIT_EXIT": 5636,
+            "GAP_DOWN_STOP": 203
+          }
+        },
+        "BELOW_200D": {
+          "count": 3697,
+          "pos_count": 944,
+          "pos_rate": 25.53,
+          "hit_1r_first_count": 1433,
+          "hit_1r_first_rate": 38.76,
+          "censored_count": 117,
+          "censored_rate": 3.16,
+          "mean_gross_r": 0.0817,
+          "median_gross_r": -0.0366,
+          "mean_net_r": 0.0426,
+          "median_net_r": -0.0768,
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 1524,
+            "TAKE_PROFIT": 849,
+            "STOP_LOSS": 1066,
+            "GAP_DOWN_STOP": 141,
+            "TRUNCATED_SERIES": 117
+          }
+        }
+      },
+      "by_year_and_regime": {
+        "2023": {
+          "ABOVE_200D": {
+            "count": 3313,
+            "pos_count": 802,
+            "pos_rate": 24.21,
+            "hit_1r_first_count": 1192,
+            "hit_1r_first_rate": 35.98,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.1922,
+            "median_gross_r": 0.1511,
+            "mean_net_r": 0.147,
+            "median_net_r": 0.107,
+            "exit_reasons": {
+              "STOP_LOSS": 700,
+              "TAKE_PROFIT": 692,
+              "HOLDING_LIMIT_EXIT": 1869,
+              "GAP_DOWN_STOP": 52
+            }
+          },
+          "BELOW_200D": {
+            "count": 436,
+            "pos_count": 109,
+            "pos_rate": 25.0,
+            "hit_1r_first_count": 170,
+            "hit_1r_first_rate": 38.99,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.1011,
+            "median_gross_r": 0.0,
+            "mean_net_r": 0.0546,
+            "median_net_r": -0.0288,
+            "exit_reasons": {
+              "HOLDING_LIMIT_EXIT": 197,
+              "TAKE_PROFIT": 96,
+              "STOP_LOSS": 137,
+              "GAP_DOWN_STOP": 6
+            }
+          }
+        },
+        "2024": {
+          "ABOVE_200D": {
+            "count": 3725,
+            "pos_count": 823,
+            "pos_rate": 22.09,
+            "hit_1r_first_count": 1292,
+            "hit_1r_first_rate": 34.68,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.0747,
+            "median_gross_r": -0.012,
+            "mean_net_r": 0.0357,
+            "median_net_r": -0.0383,
+            "exit_reasons": {
+              "GAP_DOWN_STOP": 72,
+              "STOP_LOSS": 1028,
+              "HOLDING_LIMIT_EXIT": 1909,
+              "TAKE_PROFIT": 716
+            }
+          },
+          "BELOW_200D": {
+            "count": 220,
+            "pos_count": 60,
+            "pos_rate": 27.27,
+            "hit_1r_first_count": 98,
+            "hit_1r_first_rate": 44.55,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.0954,
+            "median_gross_r": 0.074,
+            "mean_net_r": 0.0511,
+            "median_net_r": 0.028,
+            "exit_reasons": {
+              "HOLDING_LIMIT_EXIT": 90,
+              "TAKE_PROFIT": 55,
+              "STOP_LOSS": 67,
+              "GAP_DOWN_STOP": 8
+            }
+          }
+        },
+        "2025": {
+          "ABOVE_200D": {
+            "count": 2854,
+            "pos_count": 604,
+            "pos_rate": 21.16,
+            "hit_1r_first_count": 971,
+            "hit_1r_first_rate": 34.02,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.107,
+            "median_gross_r": 0.0392,
+            "mean_net_r": 0.0577,
+            "median_net_r": -0.0059,
+            "exit_reasons": {
+              "STOP_LOSS": 678,
+              "HOLDING_LIMIT_EXIT": 1595,
+              "TAKE_PROFIT": 536,
+              "GAP_DOWN_STOP": 45
+            }
+          },
+          "BELOW_200D": {
+            "count": 1559,
+            "pos_count": 438,
+            "pos_rate": 28.09,
+            "hit_1r_first_count": 654,
+            "hit_1r_first_rate": 41.95,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.0974,
+            "median_gross_r": -0.0247,
+            "mean_net_r": 0.0613,
+            "median_net_r": -0.0578,
+            "exit_reasons": {
+              "STOP_LOSS": 464,
+              "HOLDING_LIMIT_EXIT": 617,
+              "TAKE_PROFIT": 402,
+              "GAP_DOWN_STOP": 76
+            }
+          }
+        },
+        "2026": {
+          "ABOVE_200D": {
+            "count": 739,
+            "pos_count": 148,
+            "pos_rate": 20.03,
+            "hit_1r_first_count": 230,
+            "hit_1r_first_rate": 31.12,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": -0.1438,
+            "median_gross_r": -0.5498,
+            "mean_net_r": -0.1873,
+            "median_net_r": -0.5768,
+            "exit_reasons": {
+              "STOP_LOSS": 310,
+              "HOLDING_LIMIT_EXIT": 263,
+              "GAP_DOWN_STOP": 34,
+              "TAKE_PROFIT": 132
+            }
+          },
+          "BELOW_200D": {
+            "count": 1482,
+            "pos_count": 337,
+            "pos_rate": 22.74,
+            "hit_1r_first_count": 511,
+            "hit_1r_first_rate": 34.48,
+            "censored_count": 117,
+            "censored_rate": 7.89,
+            "mean_gross_r": 0.0575,
+            "median_gross_r": -0.0826,
+            "mean_net_r": 0.0182,
+            "median_net_r": -0.1141,
+            "exit_reasons": {
+              "TAKE_PROFIT": 296,
+              "GAP_DOWN_STOP": 51,
+              "STOP_LOSS": 398,
+              "HOLDING_LIMIT_EXIT": 620,
+              "TRUNCATED_SERIES": 117
+            }
+          }
+        }
+      }
+    },
+    "SHORT": {
+      "overall": {
+        "count": 17417,
+        "pos_count": 3333,
+        "pos_rate": 19.14,
+        "hit_1r_first_count": 5394,
+        "hit_1r_first_rate": 30.97,
+        "censored_count": 124,
+        "censored_rate": 0.71,
+        "mean_gross_r": -0.0663,
+        "median_gross_r": -0.2307,
+        "mean_net_r": -0.0862,
+        "median_net_r": -0.25,
+        "exit_reasons": {
+          "HOLDING_LIMIT_EXIT": 7595,
+          "STOP_LOSS": 6227,
+          "TAKE_PROFIT": 2890,
+          "GAP_UP_STOP": 581,
+          "TRUNCATED_SERIES": 124
+        }
+      },
+      "by_year": {
+        "2023": {
+          "count": 5438,
+          "pos_count": 830,
+          "pos_rate": 15.26,
+          "hit_1r_first_count": 1454,
+          "hit_1r_first_rate": 26.74,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": -0.1884,
+          "median_gross_r": -0.4366,
+          "mean_net_r": -0.21,
+          "median_net_r": -0.4534,
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 2308,
+            "STOP_LOSS": 2209,
+            "TAKE_PROFIT": 725,
+            "GAP_UP_STOP": 196
+          }
+        },
+        "2024": {
+          "count": 4858,
+          "pos_count": 1052,
+          "pos_rate": 21.66,
+          "hit_1r_first_count": 1632,
+          "hit_1r_first_rate": 33.59,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": -0.0251,
+          "median_gross_r": -0.184,
+          "mean_net_r": -0.0432,
+          "median_net_r": -0.1983,
+          "exit_reasons": {
+            "TAKE_PROFIT": 912,
+            "HOLDING_LIMIT_EXIT": 2097,
+            "STOP_LOSS": 1685,
+            "GAP_UP_STOP": 164
+          }
+        },
+        "2025": {
+          "count": 4797,
+          "pos_count": 943,
+          "pos_rate": 19.66,
+          "hit_1r_first_count": 1546,
+          "hit_1r_first_rate": 32.23,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": -0.0133,
+          "median_gross_r": -0.144,
+          "mean_net_r": -0.0337,
+          "median_net_r": -0.1616,
+          "exit_reasons": {
+            "STOP_LOSS": 1583,
+            "HOLDING_LIMIT_EXIT": 2267,
+            "GAP_UP_STOP": 139,
+            "TAKE_PROFIT": 808
+          }
+        },
+        "2026": {
+          "count": 2324,
+          "pos_count": 508,
+          "pos_rate": 21.86,
+          "hit_1r_first_count": 762,
+          "hit_1r_first_rate": 32.79,
+          "censored_count": 124,
+          "censored_rate": 5.34,
+          "mean_gross_r": 0.0238,
+          "median_gross_r": -0.0828,
+          "mean_net_r": 0.0055,
+          "median_net_r": -0.1003,
+          "exit_reasons": {
+            "TAKE_PROFIT": 445,
+            "HOLDING_LIMIT_EXIT": 923,
+            "STOP_LOSS": 750,
+            "TRUNCATED_SERIES": 124,
+            "GAP_UP_STOP": 82
+          }
+        }
+      },
+      "by_regime": {
+        "ABOVE_200D": {
+          "count": 14191,
+          "pos_count": 2664,
+          "pos_rate": 18.77,
+          "hit_1r_first_count": 4374,
+          "hit_1r_first_rate": 30.82,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": -0.0849,
+          "median_gross_r": -0.2591,
+          "mean_net_r": -0.1055,
+          "median_net_r": -0.2783,
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 6219,
+            "STOP_LOSS": 5189,
+            "TAKE_PROFIT": 2302,
+            "GAP_UP_STOP": 481
+          }
+        },
+        "BELOW_200D": {
+          "count": 3226,
+          "pos_count": 669,
+          "pos_rate": 20.74,
+          "hit_1r_first_count": 1020,
+          "hit_1r_first_rate": 31.62,
+          "censored_count": 124,
+          "censored_rate": 3.84,
+          "mean_gross_r": 0.0157,
+          "median_gross_r": -0.1145,
+          "mean_net_r": -0.0011,
+          "median_net_r": -0.1319,
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 1376,
+            "STOP_LOSS": 1038,
+            "GAP_UP_STOP": 100,
+            "TRUNCATED_SERIES": 124,
+            "TAKE_PROFIT": 588
+          }
+        }
+      },
+      "by_year_and_regime": {
+        "2023": {
+          "ABOVE_200D": {
+            "count": 5160,
+            "pos_count": 793,
+            "pos_rate": 15.37,
+            "hit_1r_first_count": 1387,
+            "hit_1r_first_rate": 26.88,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": -0.1955,
+            "median_gross_r": -0.4553,
+            "mean_net_r": -0.2174,
+            "median_net_r": -0.4727,
+            "exit_reasons": {
+              "HOLDING_LIMIT_EXIT": 2141,
+              "STOP_LOSS": 2138,
+              "TAKE_PROFIT": 691,
+              "GAP_UP_STOP": 190
+            }
+          },
+          "BELOW_200D": {
+            "count": 278,
+            "pos_count": 37,
+            "pos_rate": 13.31,
+            "hit_1r_first_count": 67,
+            "hit_1r_first_rate": 24.1,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": -0.0558,
+            "median_gross_r": -0.1286,
+            "mean_net_r": -0.074,
+            "median_net_r": -0.147,
+            "exit_reasons": {
+              "HOLDING_LIMIT_EXIT": 167,
+              "STOP_LOSS": 71,
+              "TAKE_PROFIT": 34,
+              "GAP_UP_STOP": 6
+            }
+          }
+        },
+        "2024": {
+          "ABOVE_200D": {
+            "count": 4710,
+            "pos_count": 1030,
+            "pos_rate": 21.87,
+            "hit_1r_first_count": 1596,
+            "hit_1r_first_rate": 33.89,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": -0.0214,
+            "median_gross_r": -0.1773,
+            "mean_net_r": -0.0396,
+            "median_net_r": -0.1926,
+            "exit_reasons": {
+              "TAKE_PROFIT": 895,
+              "HOLDING_LIMIT_EXIT": 2022,
+              "STOP_LOSS": 1630,
+              "GAP_UP_STOP": 163
+            }
+          },
+          "BELOW_200D": {
+            "count": 148,
+            "pos_count": 22,
+            "pos_rate": 14.86,
+            "hit_1r_first_count": 36,
+            "hit_1r_first_rate": 24.32,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": -0.1404,
+            "median_gross_r": -0.3342,
+            "mean_net_r": -0.1572,
+            "median_net_r": -0.3477,
+            "exit_reasons": {
+              "STOP_LOSS": 55,
+              "HOLDING_LIMIT_EXIT": 75,
+              "TAKE_PROFIT": 17,
+              "GAP_UP_STOP": 1
+            }
+          }
+        },
+        "2025": {
+          "ABOVE_200D": {
+            "count": 3561,
+            "pos_count": 605,
+            "pos_rate": 16.99,
+            "hit_1r_first_count": 1057,
+            "hit_1r_first_rate": 29.68,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": -0.0754,
+            "median_gross_r": -0.1953,
+            "mean_net_r": -0.0973,
+            "median_net_r": -0.2155,
+            "exit_reasons": {
+              "HOLDING_LIMIT_EXIT": 1738,
+              "STOP_LOSS": 1222,
+              "TAKE_PROFIT": 501,
+              "GAP_UP_STOP": 100
+            }
+          },
+          "BELOW_200D": {
+            "count": 1236,
+            "pos_count": 338,
+            "pos_rate": 27.35,
+            "hit_1r_first_count": 489,
+            "hit_1r_first_rate": 39.56,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.1655,
+            "median_gross_r": 0.0259,
+            "mean_net_r": 0.1496,
+            "median_net_r": 0.0175,
+            "exit_reasons": {
+              "STOP_LOSS": 361,
+              "HOLDING_LIMIT_EXIT": 529,
+              "GAP_UP_STOP": 39,
+              "TAKE_PROFIT": 307
+            }
+          }
+        },
+        "2026": {
+          "ABOVE_200D": {
+            "count": 760,
+            "pos_count": 236,
+            "pos_rate": 31.05,
+            "hit_1r_first_count": 334,
+            "hit_1r_first_rate": 43.95,
+            "censored_count": 0,
+            "censored_rate": 0.0,
+            "mean_gross_r": 0.2274,
+            "median_gross_r": 0.1881,
+            "mean_net_r": 0.2069,
+            "median_net_r": 0.1701,
+            "exit_reasons": {
+              "TAKE_PROFIT": 215,
+              "HOLDING_LIMIT_EXIT": 318,
+              "STOP_LOSS": 199,
+              "GAP_UP_STOP": 28
+            }
+          },
+          "BELOW_200D": {
+            "count": 1564,
+            "pos_count": 272,
+            "pos_rate": 17.39,
+            "hit_1r_first_count": 428,
+            "hit_1r_first_rate": 27.37,
+            "censored_count": 124,
+            "censored_rate": 7.93,
+            "mean_gross_r": -0.0752,
+            "median_gross_r": -0.1833,
+            "mean_net_r": -0.0924,
+            "median_net_r": -0.1978,
+            "exit_reasons": {
+              "HOLDING_LIMIT_EXIT": 605,
+              "STOP_LOSS": 551,
+              "TRUNCATED_SERIES": 124,
+              "TAKE_PROFIT": 230,
+              "GAP_UP_STOP": 54
+            }
+          }
+        }
+      }
+    },
+    "COMBINED": {
+      "overall": {
+        "count": 31745,
+        "pos_count": 6654,
+        "pos_rate": 20.96,
+        "hit_1r_first_count": 10512,
+        "hit_1r_first_rate": 33.11,
+        "censored_count": 241,
+        "censored_rate": 0.76,
+        "mean_gross_r": 0.0082,
+        "median_gross_r": -0.107,
+        "mean_net_r": -0.022,
+        "median_net_r": -0.1339,
+        "exit_reasons": {
+          "STOP_LOSS": 10009,
+          "TAKE_PROFIT": 5815,
+          "HOLDING_LIMIT_EXIT": 14755,
+          "GAP_DOWN_STOP": 344,
+          "TRUNCATED_SERIES": 241,
+          "GAP_UP_STOP": 581
+        }
+      },
+      "by_year": {
+        "2023": {
+          "count": 9187,
+          "pos_count": 1741,
+          "pos_rate": 18.95,
+          "hit_1r_first_count": 2816,
+          "hit_1r_first_rate": 30.65,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": -0.0374,
+          "median_gross_r": -0.1531,
+          "mean_net_r": -0.0687,
+          "median_net_r": -0.1837,
+          "exit_reasons": {
+            "STOP_LOSS": 3046,
+            "TAKE_PROFIT": 1513,
+            "HOLDING_LIMIT_EXIT": 4374,
+            "GAP_DOWN_STOP": 58,
+            "GAP_UP_STOP": 196
+          }
+        },
+        "2024": {
+          "count": 8803,
+          "pos_count": 1935,
+          "pos_rate": 21.98,
+          "hit_1r_first_count": 3022,
+          "hit_1r_first_rate": 34.33,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": 0.0202,
+          "median_gross_r": -0.0953,
+          "mean_net_r": -0.0075,
+          "median_net_r": -0.1224,
+          "exit_reasons": {
+            "GAP_DOWN_STOP": 80,
+            "STOP_LOSS": 2780,
+            "HOLDING_LIMIT_EXIT": 4096,
+            "TAKE_PROFIT": 1683,
+            "GAP_UP_STOP": 164
+          }
+        },
+        "2025": {
+          "count": 9210,
+          "pos_count": 1985,
+          "pos_rate": 21.55,
+          "hit_1r_first_count": 3171,
+          "hit_1r_first_rate": 34.43,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": 0.0427,
+          "median_gross_r": -0.0662,
+          "mean_net_r": 0.0107,
+          "median_net_r": -0.0934,
+          "exit_reasons": {
+            "STOP_LOSS": 2725,
+            "HOLDING_LIMIT_EXIT": 4479,
+            "TAKE_PROFIT": 1746,
+            "GAP_DOWN_STOP": 121,
+            "GAP_UP_STOP": 139
+          }
+        },
+        "2026": {
+          "count": 4545,
+          "pos_count": 993,
+          "pos_rate": 21.85,
+          "hit_1r_first_count": 1503,
+          "hit_1r_first_rate": 33.07,
+          "censored_count": 241,
+          "censored_rate": 5.3,
+          "mean_gross_r": 0.0075,
+          "median_gross_r": -0.1309,
+          "mean_net_r": -0.0217,
+          "median_net_r": -0.1596,
+          "exit_reasons": {
+            "STOP_LOSS": 1458,
+            "HOLDING_LIMIT_EXIT": 1806,
+            "TAKE_PROFIT": 873,
+            "GAP_DOWN_STOP": 85,
+            "TRUNCATED_SERIES": 241,
+            "GAP_UP_STOP": 82
+          }
+        }
+      },
+      "by_regime": {
+        "ABOVE_200D": {
+          "count": 24822,
+          "pos_count": 5041,
+          "pos_rate": 20.31,
+          "hit_1r_first_count": 8059,
+          "hit_1r_first_rate": 32.47,
+          "censored_count": 0,
+          "censored_rate": 0.0,
+          "mean_gross_r": -0.0037,
+          "median_gross_r": -0.1146,
+          "mean_net_r": -0.0343,
+          "median_net_r": -0.1436,
+          "exit_reasons": {
+            "STOP_LOSS": 7905,
+            "TAKE_PROFIT": 4378,
+            "HOLDING_LIMIT_EXIT": 11855,
+            "GAP_DOWN_STOP": 203,
+            "GAP_UP_STOP": 481
+          }
+        },
+        "BELOW_200D": {
+          "count": 6923,
+          "pos_count": 1613,
+          "pos_rate": 23.3,
+          "hit_1r_first_count": 2453,
+          "hit_1r_first_rate": 35.43,
+          "censored_count": 241,
+          "censored_rate": 3.48,
+          "mean_gross_r": 0.051,
+          "median_gross_r": -0.0799,
+          "mean_net_r": 0.0223,
+          "median_net_r": -0.1041,
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 2900,
+            "TAKE_PROFIT": 1437,
+            "STOP_LOSS": 2104,
+            "GAP_DOWN_STOP": 141,
+            "TRUNCATED_SERIES": 241,
+            "GAP_UP_STOP": 100
+          }
+        }
+      }
+    }
+  }
+}

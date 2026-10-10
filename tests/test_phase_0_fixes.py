@@ -60,7 +60,7 @@ class Phase0BlockerTests(unittest.TestCase):
             ]
         }
         with patch("backend.position_manager.record_shadow_exit") as mock_record_exit:
-            now_dt = datetime.now(timezone.utc)
+            now_dt = datetime(2026, 6, 1, 9, 30, 0, tzinfo=timezone.utc)
             # Price breaches stop loss (99.0 <= 100.0)
             agg.check_instant_exit_breach(1, Decimal("99.0"), now_dt)
             mock_record_exit.assert_called_once()

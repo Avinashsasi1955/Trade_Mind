@@ -708,7 +708,7 @@ class TestSwingStopsAndRisk(unittest.TestCase):
         """
         from datetime import datetime, timezone
         from backend.live_inference import LiveInferenceService
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime(2026, 6, 1, 9, 30, 0, tzinfo=timezone.utc)
 
         # Create service instance bound to test engine
         service = LiveInferenceService.__new__(LiveInferenceService)
@@ -788,7 +788,7 @@ class TestSwingStopsAndRisk(unittest.TestCase):
         """Test production method when trade_mode column is not present (pre-v3_17 schema)."""
         from datetime import datetime, timezone
         from backend.live_inference import LiveInferenceService
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime(2026, 6, 1, 9, 30, 0, tzinfo=timezone.utc)
 
         # Separate engine without trade_mode column
         from sqlalchemy import create_engine
@@ -845,7 +845,7 @@ class TestSwingStopsAndRisk(unittest.TestCase):
         """Test that LiveInferenceService._record_swing_rejection_audit logs at WARNING on SQL failure."""
         from datetime import datetime, timezone
         from backend.live_inference import LiveInferenceService
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime(2026, 6, 1, 9, 30, 0, tzinfo=timezone.utc)
 
         # Point engine to an empty in-memory engine where trade_candidate_audits table does not exist
         from sqlalchemy import create_engine
