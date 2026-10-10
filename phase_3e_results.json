@@ -1,0 +1,996 @@
+{
+  "universe_membership_table": {
+    "row_count": 0,
+    "columns": [
+      "exchange",
+      "symbol",
+      "valid_from",
+      "valid_to",
+      "status",
+      "source",
+      "created_at"
+    ],
+    "holds_point_in_time": false
+  },
+  "corporate_actions_report": {
+    "table_row_count": 12588,
+    "table_date_range": [
+      "2021-06-30",
+      "2026-06-30"
+    ],
+    "table_columns": [
+      [
+        "exchange",
+        "text"
+      ],
+      [
+        "symbol",
+        "text"
+      ],
+      [
+        "effective_date",
+        "date"
+      ],
+      [
+        "action_type",
+        "text"
+      ],
+      [
+        "ratio_from",
+        "numeric"
+      ],
+      [
+        "ratio_to",
+        "numeric"
+      ],
+      [
+        "cash_amount",
+        "numeric"
+      ],
+      [
+        "source",
+        "text"
+      ],
+      [
+        "created_at",
+        "timestamp with time zone"
+      ]
+    ],
+    "action_counts": {
+      "split": 265,
+      "bonus": 397,
+      "dividend": 11926
+    },
+    "matched_count": 11,
+    "unmatched_count": 66,
+    "excluded_entries_count": 0,
+    "matched_sample": [
+      {
+        "symbol": "BESTAGRO",
+        "date": "2026-01-16",
+        "move_pct": -93.17,
+        "corporate_action": "bonus",
+        "status": "matched_in_table"
+      },
+      {
+        "symbol": "DELPHIFX",
+        "date": "2026-02-13",
+        "move_pct": -92.68,
+        "corporate_action": "split",
+        "status": "matched_in_table"
+      },
+      {
+        "symbol": "HARDWYN",
+        "date": "2023-06-05",
+        "move_pct": -91.79,
+        "corporate_action": "bonus",
+        "status": "matched_in_table"
+      },
+      {
+        "symbol": "PAVNAIND",
+        "date": "2025-09-01",
+        "move_pct": -90.82,
+        "corporate_action": "split",
+        "status": "matched_in_table"
+      },
+      {
+        "symbol": "KAMDHENU",
+        "date": "2025-01-08",
+        "move_pct": -90.72,
+        "corporate_action": "split",
+        "status": "matched_in_table"
+      },
+      {
+        "symbol": "SPORTKING",
+        "date": "2024-09-13",
+        "move_pct": -90.63,
+        "corporate_action": "split",
+        "status": "matched_in_table"
+      },
+      {
+        "symbol": "AVROIND",
+        "date": "2026-05-05",
+        "move_pct": -90.53,
+        "corporate_action": "split",
+        "status": "matched_in_table"
+      },
+      {
+        "symbol": "ROLEXRINGS",
+        "date": "2025-10-17",
+        "move_pct": -90.5,
+        "corporate_action": "split",
+        "status": "matched_in_table"
+      },
+      {
+        "symbol": "IONEXCHANG",
+        "date": "2023-06-12",
+        "move_pct": -90.45,
+        "corporate_action": "split",
+        "status": "matched_in_table"
+      },
+      {
+        "symbol": "SIGACHI",
+        "date": "2023-10-09",
+        "move_pct": -90.34,
+        "corporate_action": "split",
+        "status": "matched_in_table"
+      }
+    ],
+    "unmatched_sample": [
+      {
+        "symbol": "KAUSHALYA",
+        "date": "2024-03-04",
+        "move_pct": 8883.33,
+        "corporate_action": "inferred",
+        "status": "unmatched_in_table"
+      },
+      {
+        "symbol": "DIACABS",
+        "date": "2024-09-30",
+        "move_pct": 3118.57,
+        "corporate_action": "inferred",
+        "status": "unmatched_in_table"
+      },
+      {
+        "symbol": "SUMEETINDS",
+        "date": "2025-07-03",
+        "move_pct": 2346.41,
+        "corporate_action": "inferred",
+        "status": "unmatched_in_table"
+      },
+      {
+        "symbol": "ELECTHERM",
+        "date": "2024-11-11",
+        "move_pct": 1052.91,
+        "corporate_action": "inferred",
+        "status": "unmatched_in_table"
+      },
+      {
+        "symbol": "CCCL",
+        "date": "2024-09-10",
+        "move_pct": 872.67,
+        "corporate_action": "inferred",
+        "status": "unmatched_in_table"
+      },
+      {
+        "symbol": "S&SPOWER",
+        "date": "2025-01-20",
+        "move_pct": 666.0,
+        "corporate_action": "inferred",
+        "status": "unmatched_in_table"
+      },
+      {
+        "symbol": "VERTOZ",
+        "date": "2025-07-14",
+        "move_pct": 621.66,
+        "corporate_action": "inferred",
+        "status": "unmatched_in_table"
+      },
+      {
+        "symbol": "JAIBALAJI",
+        "date": "2023-11-07",
+        "move_pct": 589.55,
+        "corporate_action": "inferred",
+        "status": "unmatched_in_table"
+      },
+      {
+        "symbol": "E2E",
+        "date": "2024-07-16",
+        "move_pct": 517.33,
+        "corporate_action": "inferred",
+        "status": "unmatched_in_table"
+      },
+      {
+        "symbol": "KAVDEFENCE",
+        "date": "2025-09-09",
+        "move_pct": 486.58,
+        "corporate_action": "inferred",
+        "status": "unmatched_in_table"
+      }
+    ]
+  },
+  "gate_rejections": {
+    "LONG": {
+      "ACCEPTED": 83530,
+      "SWING_REJECTED_STOP_CAP_EXCEEDED": 60824,
+      "SWING_REJECTED_ZERO_QUANTITY": 2903
+    },
+    "SHORT": {
+      "SWING_REJECTED_STOP_CAP_EXCEEDED": 45930,
+      "ACCEPTED": 98357,
+      "SWING_REJECTED_ZERO_QUANTITY": 2970
+    }
+  },
+  "baseline_all_entries": {
+    "LONG": {
+      "overall": {
+        "count": 83530,
+        "pos_count": 17176,
+        "pos_rate": 20.56,
+        "hit_1r_first_count": 27693,
+        "hit_1r_first_rate": 33.15,
+        "mean_gross_r": 0.0046,
+        "mean_net_r": -0.0411,
+        "median_net_r": -0.1183,
+        "ci_95": [
+          -0.08,
+          0.0
+        ],
+        "exit_reasons": {
+          "STOP_LOSS": 24845,
+          "GAP_DOWN_STOP": 1971,
+          "TAKE_PROFIT": 15049,
+          "HOLDING_LIMIT_EXIT": 41665
+        }
+      },
+      "by_year": {
+        "2023": {
+          "count": 25894,
+          "pos_count": 5854,
+          "pos_rate": 22.61,
+          "hit_1r_first_count": 8980,
+          "hit_1r_first_rate": 34.68,
+          "mean_gross_r": 0.1112,
+          "mean_net_r": 0.0622,
+          "median_net_r": 0.0057,
+          "ci_95": [
+            -0.002,
+            0.1249
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 6552,
+            "GAP_DOWN_STOP": 447,
+            "TAKE_PROFIT": 5128,
+            "HOLDING_LIMIT_EXIT": 13767
+          }
+        },
+        "2024": {
+          "count": 27688,
+          "pos_count": 5394,
+          "pos_rate": 19.48,
+          "hit_1r_first_count": 8813,
+          "hit_1r_first_rate": 31.83,
+          "mean_gross_r": -0.0554,
+          "mean_net_r": -0.0963,
+          "median_net_r": -0.205,
+          "ci_95": [
+            -0.1655,
+            -0.0233
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 13118,
+            "STOP_LOSS": 9222,
+            "TAKE_PROFIT": 4706,
+            "GAP_DOWN_STOP": 642
+          }
+        },
+        "2025": {
+          "count": 29948,
+          "pos_count": 5928,
+          "pos_rate": 19.79,
+          "hit_1r_first_count": 9900,
+          "hit_1r_first_rate": 33.06,
+          "mean_gross_r": -0.0321,
+          "mean_net_r": -0.0794,
+          "median_net_r": -0.1553,
+          "ci_95": [
+            -0.1459,
+            -0.0084
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 9071,
+            "GAP_DOWN_STOP": 882,
+            "HOLDING_LIMIT_EXIT": 14780,
+            "TAKE_PROFIT": 5215
+          }
+        }
+      },
+      "by_regime": {
+        "ABOVE_200D": {
+          "count": 68899,
+          "pos_count": 13825,
+          "pos_rate": 20.07,
+          "hit_1r_first_count": 22339,
+          "hit_1r_first_rate": 32.42,
+          "mean_gross_r": 0.0075,
+          "mean_net_r": -0.0393,
+          "median_net_r": -0.1095,
+          "ci_95": [
+            -0.0816,
+            0.0013
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 19729,
+            "GAP_DOWN_STOP": 1457,
+            "TAKE_PROFIT": 12142,
+            "HOLDING_LIMIT_EXIT": 35571
+          }
+        },
+        "BELOW_200D": {
+          "count": 14631,
+          "pos_count": 3351,
+          "pos_rate": 22.9,
+          "hit_1r_first_count": 5354,
+          "hit_1r_first_rate": 36.59,
+          "mean_gross_r": -0.0091,
+          "mean_net_r": -0.0497,
+          "median_net_r": -0.1774,
+          "ci_95": [
+            -0.1735,
+            0.0681
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 6094,
+            "STOP_LOSS": 5116,
+            "TAKE_PROFIT": 2907,
+            "GAP_DOWN_STOP": 514
+          }
+        }
+      }
+    },
+    "SHORT": {
+      "overall": {
+        "count": 98357,
+        "pos_count": 19178,
+        "pos_rate": 19.5,
+        "hit_1r_first_count": 31585,
+        "hit_1r_first_rate": 32.11,
+        "mean_gross_r": -0.027,
+        "mean_net_r": -0.048,
+        "median_net_r": -0.202,
+        "ci_95": [
+          -0.0808,
+          -0.0145
+        ],
+        "exit_reasons": {
+          "HOLDING_LIMIT_EXIT": 44261,
+          "TAKE_PROFIT": 16598,
+          "STOP_LOSS": 34603,
+          "GAP_UP_STOP": 2895
+        }
+      },
+      "by_year": {
+        "2023": {
+          "count": 34817,
+          "pos_count": 5155,
+          "pos_rate": 14.81,
+          "hit_1r_first_count": 9239,
+          "hit_1r_first_rate": 26.54,
+          "mean_gross_r": -0.1809,
+          "mean_net_r": -0.2036,
+          "median_net_r": -0.433,
+          "ci_95": [
+            -0.2576,
+            -0.1529
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 15012,
+            "TAKE_PROFIT": 4431,
+            "STOP_LOSS": 14266,
+            "GAP_UP_STOP": 1108
+          }
+        },
+        "2024": {
+          "count": 32884,
+          "pos_count": 7590,
+          "pos_rate": 23.08,
+          "hit_1r_first_count": 11873,
+          "hit_1r_first_rate": 36.11,
+          "mean_gross_r": 0.0412,
+          "mean_net_r": 0.0226,
+          "median_net_r": -0.1004,
+          "ci_95": [
+            -0.0306,
+            0.0766
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 10803,
+            "HOLDING_LIMIT_EXIT": 14453,
+            "TAKE_PROFIT": 6659,
+            "GAP_UP_STOP": 969
+          }
+        },
+        "2025": {
+          "count": 30656,
+          "pos_count": 6433,
+          "pos_rate": 20.98,
+          "hit_1r_first_count": 10473,
+          "hit_1r_first_rate": 34.16,
+          "mean_gross_r": 0.0746,
+          "mean_net_r": 0.0532,
+          "median_net_r": -0.0821,
+          "ci_95": [
+            -0.01,
+            0.1159
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 14796,
+            "STOP_LOSS": 9534,
+            "TAKE_PROFIT": 5508,
+            "GAP_UP_STOP": 818
+          }
+        }
+      },
+      "by_regime": {
+        "ABOVE_200D": {
+          "count": 88237,
+          "pos_count": 16650,
+          "pos_rate": 18.87,
+          "hit_1r_first_count": 27757,
+          "hit_1r_first_rate": 31.46,
+          "mean_gross_r": -0.0425,
+          "mean_net_r": -0.0638,
+          "median_net_r": -0.2177,
+          "ci_95": [
+            -0.0959,
+            -0.0298
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 39845,
+            "TAKE_PROFIT": 14341,
+            "STOP_LOSS": 31464,
+            "GAP_UP_STOP": 2587
+          }
+        },
+        "BELOW_200D": {
+          "count": 10120,
+          "pos_count": 2528,
+          "pos_rate": 24.98,
+          "hit_1r_first_count": 3828,
+          "hit_1r_first_rate": 37.83,
+          "mean_gross_r": 0.1083,
+          "mean_net_r": 0.0906,
+          "median_net_r": -0.0776,
+          "ci_95": [
+            -0.0485,
+            0.2269
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 4416,
+            "STOP_LOSS": 3139,
+            "TAKE_PROFIT": 2257,
+            "GAP_UP_STOP": 308
+          }
+        }
+      }
+    },
+    "COMBINED": {
+      "overall": {
+        "count": 181887,
+        "pos_count": 36354,
+        "pos_rate": 19.99,
+        "hit_1r_first_count": 59278,
+        "hit_1r_first_rate": 32.59,
+        "mean_gross_r": -0.0125,
+        "mean_net_r": -0.0448,
+        "median_net_r": -0.1603,
+        "ci_95": [
+          -0.0583,
+          -0.0316
+        ],
+        "exit_reasons": {
+          "STOP_LOSS": 59448,
+          "GAP_DOWN_STOP": 1971,
+          "TAKE_PROFIT": 31647,
+          "HOLDING_LIMIT_EXIT": 85926,
+          "GAP_UP_STOP": 2895
+        }
+      },
+      "by_year": {
+        "2023": {
+          "count": 60711,
+          "pos_count": 11009,
+          "pos_rate": 18.13,
+          "hit_1r_first_count": 18219,
+          "hit_1r_first_rate": 30.01,
+          "mean_gross_r": -0.0563,
+          "mean_net_r": -0.0902,
+          "median_net_r": -0.209,
+          "ci_95": [
+            -0.1088,
+            -0.0711
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 20818,
+            "GAP_DOWN_STOP": 447,
+            "TAKE_PROFIT": 9559,
+            "HOLDING_LIMIT_EXIT": 28779,
+            "GAP_UP_STOP": 1108
+          }
+        },
+        "2024": {
+          "count": 60572,
+          "pos_count": 12984,
+          "pos_rate": 21.44,
+          "hit_1r_first_count": 20686,
+          "hit_1r_first_rate": 34.15,
+          "mean_gross_r": -0.0029,
+          "mean_net_r": -0.0317,
+          "median_net_r": -0.1511,
+          "ci_95": [
+            -0.0545,
+            -0.0083
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 27571,
+            "STOP_LOSS": 20025,
+            "TAKE_PROFIT": 11365,
+            "GAP_UP_STOP": 969,
+            "GAP_DOWN_STOP": 642
+          }
+        },
+        "2025": {
+          "count": 60604,
+          "pos_count": 12361,
+          "pos_rate": 20.4,
+          "hit_1r_first_count": 20373,
+          "hit_1r_first_rate": 33.62,
+          "mean_gross_r": 0.0219,
+          "mean_net_r": -0.0123,
+          "median_net_r": -0.1173,
+          "ci_95": [
+            -0.0384,
+            0.0143
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 18605,
+            "GAP_DOWN_STOP": 882,
+            "HOLDING_LIMIT_EXIT": 29576,
+            "TAKE_PROFIT": 10723,
+            "GAP_UP_STOP": 818
+          }
+        }
+      },
+      "by_regime": {
+        "ABOVE_200D": {
+          "count": 157136,
+          "pos_count": 30475,
+          "pos_rate": 19.39,
+          "hit_1r_first_count": 50096,
+          "hit_1r_first_rate": 31.88,
+          "mean_gross_r": -0.0206,
+          "mean_net_r": -0.0531,
+          "median_net_r": -0.1645,
+          "ci_95": [
+            -0.0653,
+            -0.0406
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 51193,
+            "GAP_DOWN_STOP": 1457,
+            "TAKE_PROFIT": 26483,
+            "HOLDING_LIMIT_EXIT": 75416,
+            "GAP_UP_STOP": 2587
+          }
+        },
+        "BELOW_200D": {
+          "count": 24751,
+          "pos_count": 5879,
+          "pos_rate": 23.75,
+          "hit_1r_first_count": 9182,
+          "hit_1r_first_rate": 37.1,
+          "mean_gross_r": 0.0389,
+          "mean_net_r": 0.0077,
+          "median_net_r": -0.1271,
+          "ci_95": [
+            -0.0476,
+            0.0681
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 10510,
+            "STOP_LOSS": 8255,
+            "TAKE_PROFIT": 5164,
+            "GAP_DOWN_STOP": 514,
+            "GAP_UP_STOP": 308
+          }
+        }
+      }
+    }
+  },
+  "non_overlapping_entries": {
+    "LONG": {
+      "overall": {
+        "count": 13263,
+        "pos_count": 2901,
+        "pos_rate": 21.87,
+        "hit_1r_first_count": 4574,
+        "hit_1r_first_rate": 34.49,
+        "mean_gross_r": 0.0569,
+        "mean_net_r": 0.0132,
+        "median_net_r": -0.0393,
+        "ci_95": [
+          -0.042,
+          0.0684
+        ],
+        "exit_reasons": {
+          "STOP_LOSS": 3592,
+          "GAP_DOWN_STOP": 313,
+          "HOLDING_LIMIT_EXIT": 6799,
+          "TAKE_PROFIT": 2559
+        }
+      },
+      "by_year": {
+        "2023": {
+          "count": 4110,
+          "pos_count": 930,
+          "pos_rate": 22.63,
+          "hit_1r_first_count": 1427,
+          "hit_1r_first_rate": 34.72,
+          "mean_gross_r": 0.135,
+          "mean_net_r": 0.0886,
+          "median_net_r": 0.0541,
+          "ci_95": [
+            0.0157,
+            0.1674
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 989,
+            "GAP_DOWN_STOP": 67,
+            "HOLDING_LIMIT_EXIT": 2254,
+            "TAKE_PROFIT": 800
+          }
+        },
+        "2024": {
+          "count": 4488,
+          "pos_count": 923,
+          "pos_rate": 20.57,
+          "hit_1r_first_count": 1504,
+          "hit_1r_first_rate": 33.51,
+          "mean_gross_r": 0.0044,
+          "mean_net_r": -0.0348,
+          "median_net_r": -0.1111,
+          "ci_95": [
+            -0.133,
+            0.067
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 2230,
+            "STOP_LOSS": 1352,
+            "TAKE_PROFIT": 811,
+            "GAP_DOWN_STOP": 95
+          }
+        },
+        "2025": {
+          "count": 4665,
+          "pos_count": 1048,
+          "pos_rate": 22.47,
+          "hit_1r_first_count": 1643,
+          "hit_1r_first_rate": 35.22,
+          "mean_gross_r": 0.0385,
+          "mean_net_r": -0.0069,
+          "median_net_r": -0.0675,
+          "ci_95": [
+            -0.1082,
+            0.0972
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 1251,
+            "HOLDING_LIMIT_EXIT": 2315,
+            "GAP_DOWN_STOP": 151,
+            "TAKE_PROFIT": 948
+          }
+        }
+      },
+      "by_regime": {
+        "ABOVE_200D": {
+          "count": 10900,
+          "pos_count": 2252,
+          "pos_rate": 20.66,
+          "hit_1r_first_count": 3609,
+          "hit_1r_first_rate": 33.11,
+          "mean_gross_r": 0.0509,
+          "mean_net_r": 0.0064,
+          "median_net_r": -0.0425,
+          "ci_95": [
+            -0.0456,
+            0.0636
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 2878,
+            "GAP_DOWN_STOP": 213,
+            "HOLDING_LIMIT_EXIT": 5839,
+            "TAKE_PROFIT": 1970
+          }
+        },
+        "BELOW_200D": {
+          "count": 2363,
+          "pos_count": 649,
+          "pos_rate": 27.47,
+          "hit_1r_first_count": 965,
+          "hit_1r_first_rate": 40.84,
+          "mean_gross_r": 0.0842,
+          "mean_net_r": 0.045,
+          "median_net_r": -0.0071,
+          "ci_95": [
+            -0.1301,
+            0.2231
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 714,
+            "HOLDING_LIMIT_EXIT": 960,
+            "TAKE_PROFIT": 589,
+            "GAP_DOWN_STOP": 100
+          }
+        }
+      }
+    },
+    "SHORT": {
+      "overall": {
+        "count": 15587,
+        "pos_count": 3099,
+        "pos_rate": 19.88,
+        "hit_1r_first_count": 4951,
+        "hit_1r_first_rate": 31.76,
+        "mean_gross_r": -0.0183,
+        "mean_net_r": -0.0387,
+        "median_net_r": -0.186,
+        "ci_95": [
+          -0.0812,
+          0.0032
+        ],
+        "exit_reasons": {
+          "HOLDING_LIMIT_EXIT": 7120,
+          "TAKE_PROFIT": 2685,
+          "STOP_LOSS": 5304,
+          "GAP_UP_STOP": 478
+        }
+      },
+      "by_year": {
+        "2023": {
+          "count": 5607,
+          "pos_count": 906,
+          "pos_rate": 16.16,
+          "hit_1r_first_count": 1542,
+          "hit_1r_first_rate": 27.5,
+          "mean_gross_r": -0.1538,
+          "mean_net_r": -0.176,
+          "median_net_r": -0.3698,
+          "ci_95": [
+            -0.2304,
+            -0.1163
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 2446,
+            "TAKE_PROFIT": 794,
+            "STOP_LOSS": 2164,
+            "GAP_UP_STOP": 203
+          }
+        },
+        "2024": {
+          "count": 5219,
+          "pos_count": 1201,
+          "pos_rate": 23.01,
+          "hit_1r_first_count": 1820,
+          "hit_1r_first_rate": 34.87,
+          "mean_gross_r": 0.0406,
+          "mean_net_r": 0.0226,
+          "median_net_r": -0.1152,
+          "ci_95": [
+            -0.0498,
+            0.096
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 2316,
+            "TAKE_PROFIT": 1045,
+            "STOP_LOSS": 1705,
+            "GAP_UP_STOP": 153
+          }
+        },
+        "2025": {
+          "count": 4761,
+          "pos_count": 992,
+          "pos_rate": 20.84,
+          "hit_1r_first_count": 1589,
+          "hit_1r_first_rate": 33.38,
+          "mean_gross_r": 0.0766,
+          "mean_net_r": 0.0559,
+          "median_net_r": -0.0754,
+          "ci_95": [
+            -0.0213,
+            0.1419
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 2358,
+            "TAKE_PROFIT": 846,
+            "GAP_UP_STOP": 122,
+            "STOP_LOSS": 1435
+          }
+        }
+      },
+      "by_regime": {
+        "ABOVE_200D": {
+          "count": 13896,
+          "pos_count": 2729,
+          "pos_rate": 19.64,
+          "hit_1r_first_count": 4390,
+          "hit_1r_first_rate": 31.59,
+          "mean_gross_r": -0.0289,
+          "mean_net_r": -0.0498,
+          "median_net_r": -0.197,
+          "ci_95": [
+            -0.0922,
+            -0.0081
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 6292,
+            "TAKE_PROFIT": 2359,
+            "STOP_LOSS": 4813,
+            "GAP_UP_STOP": 432
+          }
+        },
+        "BELOW_200D": {
+          "count": 1691,
+          "pos_count": 370,
+          "pos_rate": 21.88,
+          "hit_1r_first_count": 561,
+          "hit_1r_first_rate": 33.18,
+          "mean_gross_r": 0.069,
+          "mean_net_r": 0.0525,
+          "median_net_r": -0.0986,
+          "ci_95": [
+            -0.1367,
+            0.24
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 828,
+            "TAKE_PROFIT": 326,
+            "GAP_UP_STOP": 46,
+            "STOP_LOSS": 491
+          }
+        }
+      }
+    },
+    "COMBINED": {
+      "overall": {
+        "count": 28850,
+        "pos_count": 6000,
+        "pos_rate": 20.8,
+        "hit_1r_first_count": 9525,
+        "hit_1r_first_rate": 33.02,
+        "mean_gross_r": 0.0162,
+        "mean_net_r": -0.0148,
+        "median_net_r": -0.1159,
+        "ci_95": [
+          -0.0399,
+          0.0113
+        ],
+        "exit_reasons": {
+          "STOP_LOSS": 8896,
+          "GAP_DOWN_STOP": 313,
+          "HOLDING_LIMIT_EXIT": 13919,
+          "TAKE_PROFIT": 5244,
+          "GAP_UP_STOP": 478
+        }
+      },
+      "by_year": {
+        "2023": {
+          "count": 9717,
+          "pos_count": 1836,
+          "pos_rate": 18.89,
+          "hit_1r_first_count": 2969,
+          "hit_1r_first_rate": 30.55,
+          "mean_gross_r": -0.0316,
+          "mean_net_r": -0.0641,
+          "median_net_r": -0.1661,
+          "ci_95": [
+            -0.0972,
+            -0.0295
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 3153,
+            "GAP_DOWN_STOP": 67,
+            "HOLDING_LIMIT_EXIT": 4700,
+            "TAKE_PROFIT": 1594,
+            "GAP_UP_STOP": 203
+          }
+        },
+        "2024": {
+          "count": 9707,
+          "pos_count": 2124,
+          "pos_rate": 21.88,
+          "hit_1r_first_count": 3324,
+          "hit_1r_first_rate": 34.24,
+          "mean_gross_r": 0.0239,
+          "mean_net_r": -0.004,
+          "median_net_r": -0.1129,
+          "ci_95": [
+            -0.0474,
+            0.0415
+          ],
+          "exit_reasons": {
+            "HOLDING_LIMIT_EXIT": 4546,
+            "STOP_LOSS": 3057,
+            "TAKE_PROFIT": 1856,
+            "GAP_DOWN_STOP": 95,
+            "GAP_UP_STOP": 153
+          }
+        },
+        "2025": {
+          "count": 9426,
+          "pos_count": 2040,
+          "pos_rate": 21.64,
+          "hit_1r_first_count": 3232,
+          "hit_1r_first_rate": 34.29,
+          "mean_gross_r": 0.0577,
+          "mean_net_r": 0.0248,
+          "median_net_r": -0.0735,
+          "ci_95": [
+            -0.0249,
+            0.0814
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 2686,
+            "HOLDING_LIMIT_EXIT": 4673,
+            "GAP_DOWN_STOP": 151,
+            "TAKE_PROFIT": 1794,
+            "GAP_UP_STOP": 122
+          }
+        }
+      },
+      "by_regime": {
+        "ABOVE_200D": {
+          "count": 24796,
+          "pos_count": 4981,
+          "pos_rate": 20.09,
+          "hit_1r_first_count": 7999,
+          "hit_1r_first_rate": 32.26,
+          "mean_gross_r": 0.0062,
+          "mean_net_r": -0.0251,
+          "median_net_r": -0.1222,
+          "ci_95": [
+            -0.0495,
+            -0.0013
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 7691,
+            "GAP_DOWN_STOP": 213,
+            "HOLDING_LIMIT_EXIT": 12131,
+            "TAKE_PROFIT": 4329,
+            "GAP_UP_STOP": 432
+          }
+        },
+        "BELOW_200D": {
+          "count": 4054,
+          "pos_count": 1019,
+          "pos_rate": 25.14,
+          "hit_1r_first_count": 1526,
+          "hit_1r_first_rate": 37.64,
+          "mean_gross_r": 0.0779,
+          "mean_net_r": 0.0481,
+          "median_net_r": -0.064,
+          "ci_95": [
+            -0.0564,
+            0.1612
+          ],
+          "exit_reasons": {
+            "STOP_LOSS": 1205,
+            "HOLDING_LIMIT_EXIT": 1788,
+            "TAKE_PROFIT": 915,
+            "GAP_DOWN_STOP": 100,
+            "GAP_UP_STOP": 46
+          }
+        }
+      }
+    }
+  }
+}
