@@ -27,8 +27,33 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+import random
+import statistics
 from sqlalchemy import create_engine, inspect, text
+
+
+def _safe_mean(vals: Sequence[float]) -> float:
+    if not vals:
+        return 0.0
+    return float(sum(vals) / len(vals))
+
+
+def _safe_percentile(vals: Sequence[float], p: float) -> float:
+    if not vals:
+        return 0.0
+    s = sorted(vals)
+    k = (len(s) - 1) * (p / 100.0)
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return float(s[int(k)])
+    return float(s[f] * (c - k) + s[c] * (k - f))
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("shadow_scorecard")
@@ -171,8 +196,8 @@ def compute_metrics(
     losses = [r for r in net_rs if r < 0.0]
 
     win_rate = (len(wins) / n * 100.0) if n > 0 else 0.0
-    avg_win_r = float(np.mean(wins)) if wins else 0.0
-    avg_loss_r = float(np.mean(losses)) if losses else 0.0
+    avg_win_r = _safe_mean(wins) if wins else 0.0
+    avg_loss_r = _safe_mean(losses) if losses else 0.0
 
     payoff_ratio = (avg_win_r / abs(avg_loss_r)) if abs(avg_loss_r) > 1e-9 else (999.0 if avg_win_r > 0 else 0.0)
 
@@ -184,7 +209,7 @@ def compute_metrics(
     else:
         profit_factor = 999.0 if sum_wins > 0 else 0.0
 
-    expectancy = float(np.mean(net_rs))
+    expectancy = _safe_mean(net_rs)
 
     # Block bootstrap resampled by trading day across all symbols
     trades_by_day = defaultdict(list)
@@ -193,20 +218,36 @@ def compute_metrics(
 
     unique_days = sorted(list(trades_by_day.keys()))
     if len(unique_days) >= 2:
-        rng = np.random.default_rng(seed)
         boot_means = []
-        for _ in range(n_bootstraps):
-            sampled_days = rng.choice(unique_days, size=len(unique_days), replace=True)
-            sampled_rs = []
-            for d in sampled_days:
-                sampled_rs.extend(trades_by_day[d])
-            if sampled_rs:
-                boot_means.append(float(np.mean(sampled_rs)))
-        if boot_means:
-            ci_lower = float(np.percentile(boot_means, 2.5))
-            ci_upper = float(np.percentile(boot_means, 97.5))
+        if np is not None:
+            rng = np.random.default_rng(seed)
+            for _ in range(n_bootstraps):
+                sampled_days = rng.choice(unique_days, size=len(unique_days), replace=True)
+                sampled_rs = []
+                for d in sampled_days:
+                    sampled_rs.extend(trades_by_day[d])
+                if sampled_rs:
+                    boot_means.append(float(np.mean(sampled_rs)))
+            if boot_means:
+                ci_lower = float(np.percentile(boot_means, 2.5))
+                ci_upper = float(np.percentile(boot_means, 97.5))
+            else:
+                ci_lower, ci_upper = expectancy, expectancy
         else:
-            ci_lower, ci_upper = expectancy, expectancy
+            rng = random.Random(seed)
+            n_days = len(unique_days)
+            for _ in range(n_bootstraps):
+                sampled_days = [rng.choice(unique_days) for _ in range(n_days)]
+                sampled_rs = []
+                for d in sampled_days:
+                    sampled_rs.extend(trades_by_day[d])
+                if sampled_rs:
+                    boot_means.append(_safe_mean(sampled_rs))
+            if boot_means:
+                ci_lower = _safe_percentile(boot_means, 2.5)
+                ci_upper = _safe_percentile(boot_means, 97.5)
+            else:
+                ci_lower, ci_upper = expectancy, expectancy
     else:
         ci_lower, ci_upper = expectancy, expectancy
 
@@ -236,7 +277,7 @@ def compute_metrics(
 
     # Average hold time
     hold_times = [t.hold_time_minutes for t in trades if t.hold_time_minutes > 0]
-    avg_hold = float(np.mean(hold_times)) if hold_times else 0.0
+    avg_hold = _safe_mean(hold_times) if hold_times else 0.0
 
     return ScorecardMetrics(
         trade_count=n,
@@ -312,8 +353,8 @@ def compute_cost_realism(trades: Sequence[ShadowTrade]) -> Dict[str, Any]:
             realised = abs(t.theoretical_fill_price - t.decision_price)
         realised_slips.append(realised)
 
-    avg_assumed = float(np.mean(assumed_slips)) if assumed_slips else 0.0
-    avg_realised = float(np.mean(realised_slips)) if realised_slips else 0.0
+    avg_assumed = _safe_mean(assumed_slips) if assumed_slips else 0.0
+    avg_realised = _safe_mean(realised_slips) if realised_slips else 0.0
     slippage_drag = avg_realised - avg_assumed
 
     return {
@@ -602,17 +643,28 @@ def evaluate_promotion_gates(
         all_passed = False
 
     # Gate 5: Expectancy 95% CI Lower Bound > 0.0
-    ci_lower = metrics.expectancy_ci_95[0]
-    ci_pass = ci_lower > 0.0
-    ci_delta = round(ci_lower - 0.0, 4)
-    gates["expectancy_ci_positive"] = {
-        "description": "Expectancy 95% CI Lower Bound > 0.00R",
-        "required": 0.0001,
-        "actual": ci_lower,
-        "passed": ci_pass,
-        "margin": ci_delta,
-        "message": f"{ci_lower:+.4f}R > 0.00R ({'PASS' if ci_pass else f'lower bound is {ci_lower:+.4f}R'})",
-    }
+    if metrics.insufficient_data or metrics.trade_count == 0:
+        ci_pass = False
+        gates["expectancy_ci_positive"] = {
+            "description": "Expectancy 95% CI Lower Bound > 0.00R",
+            "required": 0.0001,
+            "actual": "NO DATA",
+            "passed": False,
+            "margin": None,
+            "message": "NO DATA",
+        }
+    else:
+        ci_lower = metrics.expectancy_ci_95[0]
+        ci_pass = ci_lower > 0.0
+        ci_delta = round(ci_lower - 0.0, 4)
+        gates["expectancy_ci_positive"] = {
+            "description": "Expectancy 95% CI Lower Bound > 0.00R",
+            "required": 0.0001,
+            "actual": ci_lower,
+            "passed": ci_pass,
+            "margin": ci_delta,
+            "message": f"{ci_lower:+.4f}R > 0.00R ({'PASS' if ci_pass else f'lower bound is {ci_lower:+.4f}R'})",
+        }
     if not ci_pass:
         all_passed = False
 
@@ -784,8 +836,11 @@ def generate_full_scorecard(
     overall_metrics = metrics_by_category["overall"]
     promotion_gates = evaluate_promotion_gates(overall_metrics, max_dd_limit=max_dd_limit)
 
+    db_url_str = engine.url.render_as_string(hide_password=True) if hasattr(engine, "url") else str(engine)
+
     return {
         "generated_at": datetime.now(IST).isoformat(),
+        "database_source": db_url_str,
         "since_date": since_date.isoformat(),
         "mode_filter": mode_filter.upper() if mode_filter else "ALL",
         "total_closed_trades": len(closed_trades),
@@ -805,6 +860,7 @@ def format_plain_text_report(report: Dict[str, Any]) -> str:
     lines.append("=" * 78)
     lines.append("             SHADOW-TRADING STATISTICAL SCORECARD (PHASE 6A)")
     lines.append("=" * 78)
+    lines.append(f"  Database     : {report.get('database_source', 'UNKNOWN')}")
     lines.append(f"  Generated At : {report['generated_at']}")
     lines.append(f"  Since Date   : {report['since_date']}")
     lines.append(f"  Mode Filter  : {report['mode_filter']}")
@@ -950,6 +1006,7 @@ def main():
     if not db_url:
         # Check standard default candidate URLs
         candidates = [
+            "postgresql+psycopg2://avinash@localhost:5432/nivesh_v3_staging",
             "postgresql://avinash@localhost:5432/nivesh_v3_staging",
             "postgresql://localhost:5432/nivesh_v3_staging",
         ]
@@ -962,16 +1019,20 @@ def main():
 
         # Find first connectable URL
         for cand in candidates:
+            cand_norm = cand.replace("postgresql://", "postgresql+psycopg2://", 1) if cand.startswith("postgresql://") else cand
             try:
-                test_eng = create_engine(cand, pool_pre_ping=True)
+                test_eng = create_engine(cand_norm, pool_pre_ping=True)
                 with test_eng.connect():
-                    db_url = cand
+                    db_url = cand_norm
                     break
             except Exception:
                 continue
 
         if not db_url:
-            db_url = "postgresql://avinash@localhost:5432/nivesh_v3_staging"
+            db_url = "postgresql+psycopg2://avinash@localhost:5432/nivesh_v3_staging"
+
+    if db_url and db_url.startswith("postgresql://"):
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
 
     logger.info(f"Connecting to database: {db_url.split('@')[-1] if '@' in db_url else db_url}")
     engine = create_engine(db_url, pool_pre_ping=True)
