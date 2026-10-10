@@ -369,9 +369,14 @@ def compute_cost_realism(trades: Sequence[ShadowTrade]) -> Dict[str, Any]:
 def compute_layer_attribution(
     engine,
     since_date: date,
+    until_date: Optional[date] = None,
     mode_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Analyze vetoes by architecture layer (Chart Gate, Brains, LLM) and counterfactual replay fidelity."""
+    if isinstance(until_date, str) and until_date.lower() in ("intraday", "swing"):
+        mode_filter = until_date
+        until_date = None
+
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
 
@@ -384,10 +389,13 @@ def compute_layer_attribution(
 
     dialect = getattr(getattr(engine, "dialect", None), "name", "")
     date_filter = "observed_at >= :since" if dialect == "sqlite" else "(observed_at AT TIME ZONE 'Asia/Kolkata')::date >= :since"
+    params: Dict[str, Any] = {"since": since_date.isoformat() if dialect == "sqlite" else since_date}
+    if until_date:
+        date_filter += " AND " + ("observed_at <= :until" if dialect == "sqlite" else "(observed_at AT TIME ZONE 'Asia/Kolkata')::date <= :until")
+        params["until"] = until_date.isoformat() if dialect == "sqlite" else until_date
 
     # Query candidate rejections
     mode_sql = ""
-    params: Dict[str, Any] = {"since": since_date.isoformat() if dialect == "sqlite" else since_date}
     if mode_filter:
         mode_sql = "AND UPPER(trade_mode) = :mode"
         params["mode"] = mode_filter.upper()
@@ -425,12 +433,17 @@ def compute_layer_attribution(
     if "counterfactual_daily_audits" in existing_tables:
         try:
             with engine.connect() as conn:
+                cf_d_filt = "audit_date >= :since"
+                cf_params = {"since": since_date.isoformat() if dialect == "sqlite" else since_date}
+                if until_date:
+                    cf_d_filt += " AND audit_date <= :until"
+                    cf_params["until"] = until_date.isoformat() if dialect == "sqlite" else until_date
                 cf_query = text(f"""
                     SELECT AVG(gate_accuracy_pct) as avg_acc, COUNT(*) as c
                     FROM counterfactual_daily_audits
-                    WHERE audit_date >= :since
+                    WHERE {cf_d_filt}
                 """)
-                cf_row = conn.execute(cf_query, {"since": since_date.isoformat() if dialect == "sqlite" else since_date}).mappings().one_or_none()
+                cf_row = conn.execute(cf_query, cf_params).mappings().one_or_none()
                 if cf_row and cf_row["c"] and cf_row["c"] > 0:
                     fidelity_pct = float(cf_row["avg_acc"] or 0.0)
                     if fidelity_pct >= 80.0:
@@ -526,6 +539,7 @@ def check_data_integrity(
     engine,
     since_date: date,
     open_trades: Sequence[ShadowTrade],
+    until_date: Optional[date] = None,
 ) -> Dict[str, Any]:
     """Check for open positions, missing bars, and session anomalies."""
     inspector = inspect(engine)
@@ -548,14 +562,18 @@ def check_data_integrity(
         try:
             with engine.connect() as conn:
                 dialect = getattr(getattr(engine, "dialect", None), "name", "")
-                d_filt = "session_date >= :since" if dialect == "sqlite" else "session_date >= :since"
+                d_filt = "session_date >= :since"
+                d_params: Dict[str, Any] = {"since": since_date.isoformat() if dialect == "sqlite" else since_date}
+                if until_date:
+                    d_filt += " AND session_date <= :until"
+                    d_params["until"] = until_date.isoformat() if dialect == "sqlite" else until_date
                 q = text(f"""
                     SELECT session_date, status, valid, warnings, mistakes
                     FROM shadow_session_daily_log
                     WHERE {d_filt} AND (valid = FALSE OR status != 'COMPLETED')
                     ORDER BY session_date DESC
                 """)
-                rows = conn.execute(q, {"since": since_date.isoformat() if dialect == "sqlite" else since_date}).mappings().all()
+                rows = conn.execute(q, d_params).mappings().all()
                 for r in rows:
                     anomalous_sessions.append({
                         "session_date": str(r["session_date"]),
@@ -692,18 +710,26 @@ def evaluate_promotion_gates(
 def load_shadow_trades_from_db(
     engine,
     since_date: date,
+    until_date: Optional[date] = None,
     mode_filter: Optional[str] = None,
 ) -> Tuple[List[ShadowTrade], List[ShadowTrade]]:
     """Fetch closed trades and open trades from shadow_execution_audits."""
+    if isinstance(until_date, str) and until_date.lower() in ("intraday", "swing"):
+        mode_filter = until_date
+        until_date = None
+
     inspector = inspect(engine)
     if "shadow_execution_audits" not in set(inspector.get_table_names()):
         return [], []
 
     dialect = getattr(getattr(engine, "dialect", None), "name", "")
     date_filter = "a.signal_at >= :since" if dialect == "sqlite" else "(a.signal_at AT TIME ZONE 'Asia/Kolkata')::date >= :since"
+    params: Dict[str, Any] = {"since": since_date.isoformat() if dialect == "sqlite" else since_date}
+    if until_date:
+        date_filter += " AND " + ("a.signal_at <= :until" if dialect == "sqlite" else "(a.signal_at AT TIME ZONE 'Asia/Kolkata')::date <= :until")
+        params["until"] = until_date.isoformat() if dialect == "sqlite" else until_date
 
     mode_sql = ""
-    params: Dict[str, Any] = {"since": since_date.isoformat() if dialect == "sqlite" else since_date}
     if mode_filter:
         mode_sql = "AND UPPER(COALESCE(a.trade_mode, 'INTRADAY')) = :mode"
         params["mode"] = mode_filter.upper()
@@ -800,11 +826,16 @@ def load_shadow_trades_from_db(
 def generate_full_scorecard(
     engine,
     since_date: date,
+    until_date: Optional[date] = None,
     mode_filter: Optional[str] = None,
     max_dd_limit: float = 5.0,
 ) -> Dict[str, Any]:
     """Generate comprehensive shadow-trading scorecard report."""
-    closed_trades, open_trades = load_shadow_trades_from_db(engine, since_date, mode_filter)
+    if isinstance(until_date, str) and until_date.lower() in ("intraday", "swing"):
+        mode_filter = until_date
+        until_date = None
+
+    closed_trades, open_trades = load_shadow_trades_from_db(engine, since_date, until_date, mode_filter)
 
     # Segregate trades by mode & direction
     intraday_trades = [t for t in closed_trades if t.trade_mode == "INTRADAY"]
@@ -829,8 +860,8 @@ def generate_full_scorecard(
     # Attribution sections
     exit_attribution = compute_exit_attribution(closed_trades)
     cost_realism = compute_cost_realism(closed_trades)
-    layer_attribution = compute_layer_attribution(engine, since_date, mode_filter)
-    data_integrity = check_data_integrity(engine, since_date, open_trades)
+    layer_attribution = compute_layer_attribution(engine, since_date, until_date, mode_filter)
+    data_integrity = check_data_integrity(engine, since_date, open_trades, until_date)
 
     # Promotion Gates
     overall_metrics = metrics_by_category["overall"]
@@ -842,6 +873,7 @@ def generate_full_scorecard(
         "generated_at": datetime.now(IST).isoformat(),
         "database_source": db_url_str,
         "since_date": since_date.isoformat(),
+        "until_date": until_date.isoformat() if until_date else None,
         "mode_filter": mode_filter.upper() if mode_filter else "ALL",
         "total_closed_trades": len(closed_trades),
         "total_open_trades": len(open_trades),
@@ -863,6 +895,8 @@ def format_plain_text_report(report: Dict[str, Any]) -> str:
     lines.append(f"  Database     : {report.get('database_source', 'UNKNOWN')}")
     lines.append(f"  Generated At : {report['generated_at']}")
     lines.append(f"  Since Date   : {report['since_date']}")
+    if report.get("until_date"):
+        lines.append(f"  Until Date   : {report['until_date']}")
     lines.append(f"  Mode Filter  : {report['mode_filter']}")
     lines.append(f"  Closed Trades: {report['total_closed_trades']}")
     lines.append(f"  Open Trades  : {report['total_open_trades']}")
@@ -989,6 +1023,7 @@ def format_plain_text_report(report: Dict[str, Any]) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Shadow-trading statistical scorecard report generator.")
     parser.add_argument("--since", required=True, help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--until", default=None, help="End date (YYYY-MM-DD, optional)")
     parser.add_argument("--mode", choices=["intraday", "swing"], default=None, help="Filter trade mode (intraday or swing)")
     parser.add_argument("--json", dest="json_out", default=None, help="Path to write structured JSON report")
     parser.add_argument("--db", dest="db_url", default=None, help="Optional DATABASE_URL override")
@@ -1001,6 +1036,14 @@ def main():
     except ValueError:
         logger.error(f"Invalid date format for --since: {args.since}. Expected YYYY-MM-DD.")
         sys.exit(1)
+
+    until_date = None
+    if args.until:
+        try:
+            until_date = date.fromisoformat(args.until)
+        except ValueError:
+            logger.error(f"Invalid date format for --until: {args.until}. Expected YYYY-MM-DD.")
+            sys.exit(1)
 
     db_url = args.db_url or os.environ.get("DATABASE_URL")
     if not db_url:
@@ -1040,6 +1083,7 @@ def main():
     report = generate_full_scorecard(
         engine=engine,
         since_date=since_date,
+        until_date=until_date,
         mode_filter=args.mode,
         max_dd_limit=args.max_dd_limit,
     )
