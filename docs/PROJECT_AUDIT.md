@@ -39,14 +39,16 @@
 
 The following components were audited and verified through static inspection and automated test execution:
 
-### 2.1 Automated Test Suite
-- **Result**: **283 / 283 passed** in 11.83s (`DATABASE_URL="" PYTHONPATH=. ./.venv/bin/pytest tests/ --ignore=tests/test_postgres_runtime.py`).
-- **Coverage**:
+### 2.1 Automated Test Suite Execution Results
+- **Isolated SQLite Run**: **283 passed, 0 failed** in 11.83s when running `DATABASE_URL="" PYTHONPATH=. ./.venv/bin/pytest tests/ --ignore=tests/test_postgres_runtime.py`.
+- **Full Suite Run (with `.env` active)**: **279 passed, 7 failed, 2 warnings** in 15.69s when running `PYTHONPATH=. ./.venv/bin/pytest tests/`.
+  - **Cause of Failures**: All 7 failures (`PostgresRuntimeTests.test_history_repository_routes_to_postgres_and_reads_bars`, `test_release_preflight_is_audited_and_never_allows_orders`, `test_research_repository_routes_to_postgres_and_reads_registry`, and 4 tests in `NiveshSystemTests`) were caused directly by `psycopg2.OperationalError: connection to server at 'localhost', port 5433 failed: Connection refused`. When `.env` sets `DATABASE_URL`, tests attempt to connect to an external PostgreSQL service on port 5433 rather than using isolated in-memory test fixtures.
+- **Verified Coverage Areas (in passing test modules)**:
   - `test_risk_management_suite.py` (12/12 passed): Stop-loss calculation, order frequency limits, kill switch enforcement, maximum position size, quote freshness verification.
   - `test_swing_stops.py` (19/19 passed): ATR-based trailing stops, swing risk bounds, weekend gap risk buffers.
   - `test_profit_harvest.py` (25/25 passed): Dynamic profit harvesting, reversal scoring, lock fractions.
   - `test_candle_sanitizer.py` (4/4 passed): Spike filtering with 3-consecutive-tick confirmation.
-  - `test_system.py` (48/48 passed in SQLite isolation): Multi-timeframe analysis, indicator math, security master lookups, AI gateway rate limiting and caching.
+  - `test_system.py` (48/48 passed in clean SQLite isolation): Multi-timeframe analysis, indicator math, security master lookups, AI gateway rate limiting and caching.
   - `test_adaptive_regime_gates.py`, `test_volume_profile.py`, `test_asi_indicator.py`, `test_pcr_engine.py`: Microstructure and quantitative indicators.
 
 ### 2.2 Statutory & Broker Transaction Costs (`backend/transaction_costs.py`)
@@ -56,7 +58,7 @@ The following components were audited and verified through static inspection and
   - **SEBI & IPFT**: 0.0001% SEBI turnover charge, ₹1 per crore IPFT.
   - **GST**: 18% on (Brokerage + Exchange Charges + SEBI Charges + IPFT).
   - **Stamp Duty**: 0.015% on equity delivery buy, 0.003% on intraday buy, 0.002% on futures buy, 0.003% on options buy.
-  - **Reconciliation**: `reconcile_contract_note(...)` verifies fee variance and slippage.
+  - **Reconciliation**: `reconcile_contract_note(...)` verifies fee variance and slippage against expected trade costs.
 
 ### 2.3 Trading Calendar & Market Session Validation (`backend/market_ingestion_v3.py`, `scripts/sync_trading_calendar.py`)
 - Verified exchange holiday enforcement using `data/nse_holidays_2026.json`.
@@ -94,38 +96,39 @@ The following components were audited and verified through static inspection and
 
 ## 3. Simulated, Incomplete, or Disconnected Components
 
-### 3.1 Upstox Market-Data Authentication Failure
-- **Finding**: The Upstox token configured in `.env` (`UPSTOX_ANALYTICS_TOKEN`) returns `HTTP 401 Unauthorized` across all endpoints:
-  - Token claims: Issued `2026-07-13T18:05:47Z`, Expires `2027-07-13T22:00:00Z`, Subject `2YCFQG`.
-  - Upstox API response: `{"status":"error","errors":[{"errorCode":"UDAPI100050","message":"Invalid token used to access API"}]}`.
-  - The token was revoked or invalidated on the Upstox gateway. Live streaming and option chain ingestion fail on startup.
+### 3.1 Upstox Market-Data Authentication & Cloudflare Findings
+- **Observed HTTP Responses**:
+  1. An HTTP request to Upstox using default `Python-urllib` headers returned:
+     `HTTP 403 Forbidden: {"error_code": 1010, "error_name": "browser_signature_banned", "detail": "The site owner has blocked access based on your browser's signature."}`.
+     This indicates that Cloudflare WAF on `api.upstox.com` rejects requests presenting default script user-agent signatures.
+  2. An HTTP request using a standard application identifier (`User-Agent: TradeMind/1.0`) and the configured `UPSTOX_ANALYTICS_TOKEN` bearer header returned:
+     `HTTP 401 Unauthorized: {"status":"error","errors":[{"errorCode":"UDAPI100050","message":"Invalid token used to access API"}]}`.
+  3. Decoding the JWT claims reveals: issued at `iat=1783965947` (2026-07-13), expires at `exp=1815516000` (2027-07-13), subject `2YCFQG`.
+- **Factual Distinction**:
+  - The exact root cause for `UDAPI100050` cannot be determined solely from client-side inspection. Potential causes include upstream server-side revocation, account/app suspension, token regeneration, or endpoint-specific permission mismatches.
+  - Using a custom User-Agent does not guarantee API access or bypass upstream controls; official integration must use standard, compliant headers and valid credentials acquired through official Upstox authorization channels.
 
-### 3.2 Cloudflare Anti-Bot Blocking (`api.upstox.com`)
-- **Finding**: Upstox REST endpoints fronted by Cloudflare reject standard Python client headers:
-  - Error: `403 Forbidden` with `Cloudflare Error 1010: Access denied (browser_signature_banned)`.
-  - Calls succeed only when explicitly configured with a non-standard User-Agent header (e.g., `TradeMind/1.0`).
-
-### 3.3 The "Split-Brain" Database & Portfolio Ledger
+### 3.2 The "Split-Brain" Database & Portfolio Ledger
 - **Finding**:
   - The Web Dashboard (`frontend/app.js` and `backend/server.py`) reads user portfolios from SQLite `data/nivesh.db`.
   - The Shadow Trading execution pipeline (`backend/live_inference.py`, `backend/position_manager.py`) writes trades to PostgreSQL `shadow_execution_audits`.
   - The PostgreSQL shadow database has **no persistent cash ledger**. Fills record realized P&L, but do not deduct cash, track margin, or calculate total portfolio equity starting from ₹10,00,000.
   - Trades executed by the background shadow manager never appear on the web dashboard trade book.
 
-### 3.4 Sizing Decoupled from Portfolio Equity
+### 3.3 Sizing Decoupled from Portfolio Equity
 - **Finding**: In `backend/live_inference.py`, position quantity is derived from a static environment variable:
   `self.paper_notional = Decimal(os.getenv("NIVESH_PAPER_NOTIONAL", "50000"))`.
   - Quantity is calculated as `int(50000 / price)` rather than budgeting 0.25% of ₹10,00,000 (₹2,500) divided by the stop-loss distance.
   - Violates the requirement for dynamic risk-proportional position sizing based on portfolio equity.
 
-### 3.5 Synthetic Sine-Wave Fallback in Web Server
+### 3.4 Synthetic Sine-Wave Fallback in Web Server
 - **Finding**: `backend/market.py` generates synthetic mock prices using `math.sin((phase + idx * 3) * 0.37) * 0.0015` when live data is unavailable.
   - This data is rendered in `/api/market/update` without explicit UI labeling as "SYNTHETIC / SIMULATED", risking confusion with real market prices.
 
-### 3.6 Zerodha Broker Adapter Incomplete
+### 3.5 Zerodha Broker Adapter Incomplete
 - **Finding**: `backend/zerodha_adapter.py` is read-only. Methods for placing, modifying, or cancelling orders raise `NotImplementedError`. No abstract adapter interface links `UpstoxAdapter` and `ZerodhaAdapter`.
 
-### 3.7 Test Suite Environment Dependency
+### 3.6 Test Suite Environment Dependency
 - **Finding**: 7 tests fail if `DATABASE_URL` is set to `localhost:5433` in `.env` while PostgreSQL is not running. Tests lack automated mock fixtures to fallback gracefully to isolated in-memory test databases.
 
 ---
@@ -134,11 +137,11 @@ The following components were audited and verified through static inspection and
 
 | ID | Severity | Category | Description | Source File & Line |
 | :--- | :--- | :--- | :--- | :--- |
-| **DEF-01** | **CRITICAL** | Data Ingestion | Upstox Analytics Token revoked (`UDAPI100050`); market feeds fail on startup. | `backend/config.py:83`, `.env:73` |
+| **DEF-01** | **CRITICAL** | Data Ingestion | Upstox market-data requests fail with HTTP 401 (`UDAPI100050`). Live feeds cannot connect until valid credentials are provided. | `backend/config.py:83`, `.env:73` |
 | **DEF-02** | **CRITICAL** | Financial Integrity | Missing canonical ₹10,00,000 paper cash/margin ledger in shadow execution engine. | `backend/live_inference.py:199`, `backend/position_manager.py` |
 | **DEF-03** | **HIGH** | Architecture | Split-brain database divergence (SQLite UI vs PostgreSQL shadow workers). | `backend/server.py:16`, `backend/live_inference.py:31` |
 | **DEF-04** | **HIGH** | Financial Risk | Fixed ₹50,000 notional sizing instead of 0.25% equity-at-risk per trade. | `backend/live_inference.py:199` |
-| **DEF-05** | **HIGH** | Operational | Cloudflare WAF bans default Python User-Agent headers (Error 1010). | `backend/upstox_adapter.py:38`, `backend/upstox_backfill.py` |
+| **DEF-05** | **HIGH** | Operational | Cloudflare WAF rejects default Python client signatures with Error 1010. | `backend/upstox_adapter.py:38`, `backend/upstox_backfill.py` |
 | **DEF-06** | **HIGH** | Data Integrity | Synthetic sine-wave prices served without prominent live vs. simulated tagging. | `backend/market.py:32-48` |
 | **DEF-07** | **MEDIUM** | Code Quality | No common abstract base class for broker and market data adapters. | `backend/upstox_adapter.py`, `backend/zerodha_adapter.py` |
 | **DEF-08** | **MEDIUM** | Testing | Test suite fails on unmocked PostgreSQL connection when Docker is offline. | `tests/test_postgres_runtime.py:5`, `tests/test_system.py:355` |
@@ -151,7 +154,8 @@ The following components were audited and verified through static inspection and
 The algorithmic, mathematical, and risk-management cores of `Trade_Mind` (`position_manager.py`, `transaction_costs.py`, `chart_gate.py`, `deep_thinker.py`) are sophisticated, rigorous, and verified. 
 
 However, the application cannot operate as a reliable personal trading system until:
-1. The Upstox authentication layer is repaired with a fresh token and Cloudflare-compliant headers.
+1. Valid Upstox market-data credentials are provided and verified through official authentication channels.
 2. The split-brain architecture is collapsed into a single PostgreSQL persistence layer.
 3. A true double-entry ₹10,00,000 paper portfolio ledger with dynamic 0.25% risk-proportional sizing is established.
 4. Clean abstract broker and market-data interfaces decouple strategy logic from broker specifics.
+5. The test suite is partitioned into independent unit, integration, and full-system tiers.
