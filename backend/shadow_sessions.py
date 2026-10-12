@@ -393,10 +393,18 @@ def open_session(engine,session_date: date = None) -> Dict:
 
 
 def get_code_version() -> str:
-    """Retrieve the current Git commit hash or configured version string."""
-    env_ver = os.getenv("NIVESH_CODE_VERSION") or os.getenv("GIT_COMMIT_HASH")
-    if env_ver:
-        return env_ver.strip()
+    """Retrieve the Git commit hash or configured version string.
+
+    Supports Docker containers by checking standard environment variables:
+    - GIT_COMMIT (standard build/runtime env var in Docker)
+    - NIVESH_CODE_VERSION / CODE_VERSION
+    - GIT_COMMIT_HASH / GIT_SHA
+    Falls back to `git rev-parse HEAD` if running in a git checkout.
+    """
+    for env_key in ("GIT_COMMIT", "NIVESH_CODE_VERSION", "CODE_VERSION", "GIT_COMMIT_HASH", "GIT_SHA"):
+        val = os.getenv(env_key)
+        if val and val.strip():
+            return val.strip()
     try:
         repo_root = Path(__file__).resolve().parent.parent
         res = subprocess.check_output(
@@ -436,6 +444,9 @@ def _persist_daily_log(engine, today: Dict, completed: int, effective_completed:
         except Exception:
             pass
 
+        is_sqlite = bool(getattr(getattr(engine, "dialect", None), "name", "") == "sqlite")
+        cast_json = ":{name}" if is_sqlite else "CAST(:{name} AS jsonb)"
+
         params = {
             "session_date": today.get("session_date"),
             "status": today.get("status"),
@@ -450,8 +461,8 @@ def _persist_daily_log(engine, today: Dict, completed: int, effective_completed:
             "predictions": int(metrics.get("predictions") or 0),
             "trades_taken": int(pnl.get("closed_trades") or 0) + int(pnl.get("open_trades") or 0),
             "closed_trades": int(pnl.get("closed_trades") or 0),
-            "win_rate_pct": Decimal(str(pnl.get("win_rate_pct") or 0)),
-            "net_pnl": Decimal(str(pnl.get("net_marked_pnl") or 0)),
+            "win_rate_pct": float(pnl.get("win_rate_pct") or 0.0),
+            "net_pnl": float(pnl.get("net_marked_pnl") or 0.0),
             "rejection_reasons": json.dumps(today.get("rejection_reasons") or []),
             "warnings": json.dumps(today.get("warnings") or []),
             "mistakes": json.dumps(mistakes, default=str),
@@ -459,8 +470,13 @@ def _persist_daily_log(engine, today: Dict, completed: int, effective_completed:
             "code_version": code_version,
         }
 
+        sql_rej = cast_json.format(name="rejection_reasons")
+        sql_warn = cast_json.format(name="warnings")
+        sql_mist = cast_json.format(name="mistakes")
+        sql_metr = cast_json.format(name="metrics")
+
         if has_code_col:
-            connection.execute(text("""
+            connection.execute(text(f"""
                 INSERT INTO shadow_session_daily_log(
                     session_date,status,valid,completed_sessions,effective_completed_sessions,
                     live_one_minute_buckets,live_five_minute_buckets,live_instruments_seen,
@@ -471,8 +487,8 @@ def _persist_daily_log(engine, today: Dict, completed: int, effective_completed:
                     :session_date,:status,:valid,:completed_sessions,:effective_completed_sessions,
                     :live_one_minute_buckets,:live_five_minute_buckets,:live_instruments_seen,
                     :repaired_one_minute_bars,:repaired_five_minute_bars,:predictions,:trades_taken,
-                    :closed_trades,:win_rate_pct,:net_pnl,CAST(:rejection_reasons AS jsonb),
-                    CAST(:warnings AS jsonb),CAST(:mistakes AS jsonb),CAST(:metrics AS jsonb),
+                    :closed_trades,:win_rate_pct,:net_pnl,{sql_rej},
+                    {sql_warn},{sql_mist},{sql_metr},
                     :code_version
                 )
                 ON CONFLICT(session_date) DO UPDATE SET
@@ -498,7 +514,7 @@ def _persist_daily_log(engine, today: Dict, completed: int, effective_completed:
                     updated_at=CURRENT_TIMESTAMP
             """), params)
         else:
-            connection.execute(text("""
+            connection.execute(text(f"""
                 INSERT INTO shadow_session_daily_log(
                     session_date,status,valid,completed_sessions,effective_completed_sessions,
                     live_one_minute_buckets,live_five_minute_buckets,live_instruments_seen,
@@ -508,8 +524,8 @@ def _persist_daily_log(engine, today: Dict, completed: int, effective_completed:
                     :session_date,:status,:valid,:completed_sessions,:effective_completed_sessions,
                     :live_one_minute_buckets,:live_five_minute_buckets,:live_instruments_seen,
                     :repaired_one_minute_bars,:repaired_five_minute_bars,:predictions,:trades_taken,
-                    :closed_trades,:win_rate_pct,:net_pnl,CAST(:rejection_reasons AS jsonb),
-                    CAST(:warnings AS jsonb),CAST(:mistakes AS jsonb),CAST(:metrics AS jsonb)
+                    :closed_trades,:win_rate_pct,:net_pnl,{sql_rej},
+                    {sql_warn},{sql_mist},{sql_metr}
                 )
                 ON CONFLICT(session_date) DO UPDATE SET
                     status=EXCLUDED.status,
