@@ -47,6 +47,23 @@ from backend.alb_identity import verify_alb_claims
 
 
 class NiveshSystemTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from backend import config
+        cls._orig_config_db_url = config.DATABASE_URL
+        cls._orig_env_db_url = os.environ.get("DATABASE_URL")
+        config.DATABASE_URL = ""
+        os.environ["DATABASE_URL"] = ""
+
+    @classmethod
+    def tearDownClass(cls):
+        from backend import config
+        config.DATABASE_URL = cls._orig_config_db_url
+        if cls._orig_env_db_url is not None:
+            os.environ["DATABASE_URL"] = cls._orig_env_db_url
+        else:
+            os.environ.pop("DATABASE_URL", None)
+
     def test_production_asgi_adapter_returns_hardened_health_response(self):
         scope={"type":"http","method":"GET","path":"/api/health","raw_path":b"/api/health","query_string":b"",
                "headers":[(b"host",b"localhost")],"client":("127.0.0.1",1234)}

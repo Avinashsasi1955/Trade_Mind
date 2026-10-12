@@ -2,7 +2,33 @@ import os
 import unittest
 
 
-@unittest.skipUnless(os.getenv("DATABASE_URL"),"PostgreSQL integration environment is not configured")
+def _postgres_is_reachable() -> bool:
+    """Determine whether PostgreSQL integration tests should run.
+
+    When RUN_POSTGRES=1 is explicitly set, always returns True so that
+    connection failures (auth errors, invalid DSN, server offline) surface
+    as real test errors rather than silent skips.
+
+    When RUN_POSTGRES is not set, probes the connection and returns False
+    for a clean skip when the database is unavailable.
+    """
+    if os.getenv("RUN_POSTGRES"):
+        # Explicitly requested — let failures propagate as test errors.
+        return True
+    url = os.getenv("DATABASE_URL", "")
+    if not url or not url.startswith("postgres"):
+        return False
+    try:
+        import psycopg2
+        clean_dsn = url.replace("postgresql+psycopg2://", "postgresql://", 1)
+        conn = psycopg2.connect(clean_dsn, connect_timeout=1)
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(_postgres_is_reachable(), "PostgreSQL integration environment is not reachable or not configured")
 class PostgresRuntimeTests(unittest.TestCase):
     def test_history_repository_routes_to_postgres_and_reads_bars(self):
         from backend.history_store import HistoryStore
