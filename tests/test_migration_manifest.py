@@ -83,17 +83,30 @@ class TestMigrationManifestAndLedger(unittest.TestCase):
 
         - v3_0 through v3_16 contain explicit COMMIT; statements.
         - v3_17 and v3_18 do NOT contain internal COMMIT; statements and rely on runner transaction management.
+        SQL comments (-- and /* */) are stripped before regex inspection to avoid comment false positives.
         """
         migrations_dir = ROOT / "migrations" / "postgres"
         files = sorted(migrations_dir.glob("*.sql"), key=lambda f: int(f.name.split("_")[1]))
+
+        def strip_sql_tokens(sql_text: str) -> str:
+            # 1. Strip block comments /* ... */
+            s = re.sub(r"/\*.*?\*/", " ", sql_text, flags=re.DOTALL)
+            # 2. Strip line comments -- ...
+            s = re.sub(r"--[^\n]*", " ", s)
+            # 3. Strip dollar-quoted function bodies / strings $tag$...$tag$
+            s = re.sub(r"\$(\w*)\$.*?\$\1\$", " ", s, flags=re.DOTALL)
+            # 4. Strip single-quoted string literals '...' (preserving escaped quotes '')
+            s = re.sub(r"'(''|[^'])*'", " ", s)
+            return s
 
         commit_pattern = re.compile(r"\bCOMMIT\s*;", re.IGNORECASE)
         files_with_commit = []
         files_without_commit = []
 
         for f in files:
-            content = f.read_text(encoding="utf-8")
-            if commit_pattern.search(content):
+            raw_content = f.read_text(encoding="utf-8")
+            clean_content = strip_sql_tokens(raw_content)
+            if commit_pattern.search(clean_content):
                 files_with_commit.append(f.name)
             else:
                 files_without_commit.append(f.name)
@@ -114,15 +127,32 @@ class TestMigrationManifestAndLedger(unittest.TestCase):
         )
 
     def test_manage_test_database_import_is_side_effect_free(self):
-        """Verify importing scripts.manage_test_database triggers zero network or CLI side effects."""
+        """Verify importing scripts.manage_test_database in an isolated subprocess executes zero connections or CLI operations."""
+        import subprocess
         import sys
-        # manage_test_database should already be loaded without having connected to any database
-        mod = sys.modules.get("scripts.manage_test_database")
-        self.assertIsNotNone(mod)
-        # Verify main is guarded
-        import inspect
-        source = inspect.getsource(mod)
-        self.assertIn("if __name__ == '__main__':", source.replace('"', "'"))
+
+        # Script run in an isolated subprocess: monkeypatches psycopg2.connect to fail immediately if called,
+        # then imports scripts.manage_test_database and checks that sys.exit was not called.
+        code = (
+            "import sys, psycopg2\n"
+            "def forbidden_connect(*args, **kwargs):\n"
+            "    raise RuntimeError('FORBIDDEN: manage_test_database made a DB connection during import!')\n"
+            "psycopg2.connect = forbidden_connect\n"
+            "import scripts.manage_test_database as mtd\n"
+            "# Assert module loaded and constants are accessible\n"
+            "assert mtd.APPROVED_TEST_DB == 'nivesh_test'\n"
+            "print('IMPORT_SUCCESS_NO_SIDE_EFFECTS')\n"
+        )
+
+        res = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(res.returncode, 0, f"Subprocess failed with stderr: {res.stderr}")
+        self.assertIn("IMPORT_SUCCESS_NO_SIDE_EFFECTS", res.stdout)
 
 
 
@@ -245,3 +275,292 @@ class TestPostgresUrlValidation(unittest.TestCase):
                     f"Flag value {flag!r} should NOT activate postgres tests",
                 )
 
+
+class TestDatabaseSafetyAndReadiness(unittest.TestCase):
+    def test_unexpected_database_objects_cause_readiness_failure(self):
+        """Verify get_status marks database as unclean/not ready for each unexpected object category."""
+        from unittest.mock import MagicMock, patch
+        from scripts.manage_test_database import (
+            get_status,
+            EXPECTED_LEDGER_ENTRIES,
+            EXPECTED_SCHEMA_TABLES,
+            EXPECTED_POSTGRES_EXTENSIONS,
+            EXPECTED_CUSTOM_TYPES,
+            EXPECTED_USER_FUNCTIONS,
+            EXPECTED_SEQUENCES,
+        )
+
+        mock_conn = MagicMock()
+        mock_meta = {
+            "database": "nivesh_test",
+            "user": "test_user",
+            "server_addr": "127.0.0.1",
+            "server_port": 5432,
+            "in_recovery": False,
+            "pg_version": "PostgreSQL 17.0",
+        }
+
+        base_inventory = {
+            "is_pristine": False,
+            "applied_migrations": list(EXPECTED_LEDGER_ENTRIES),
+            "tables": set(EXPECTED_SCHEMA_TABLES),
+            "views": set(),
+            "matviews": set(),
+            "functions": list(EXPECTED_USER_FUNCTIONS),
+            "foreign_tables": set(),
+            "custom_types": {t: "e" for t in EXPECTED_CUSTOM_TYPES},
+            "extensions": {e: "1.0" for e in EXPECTED_POSTGRES_EXTENSIONS},
+            "sequences": list(EXPECTED_SEQUENCES),
+            "schemas": ["public"],
+            "fixtures": {"instruments": 1, "bars": 5, "active_models": 1, "coverage_bars": 5},
+        }
+
+        # Sub-case 1: Extra unexpected table
+        inv_table = dict(base_inventory, tables=set(EXPECTED_SCHEMA_TABLES) | {"unexpected_rogue_table"})
+        with patch("scripts.manage_test_database.validate_migration_manifest", return_value=[]), \
+             patch("scripts.manage_test_database.connect_maintenance", return_value=mock_conn), \
+             patch("scripts.manage_test_database.verify_connection_metadata", return_value=mock_meta), \
+             patch("scripts.manage_test_database.connect_test_db", return_value=mock_conn), \
+             patch("scripts.manage_test_database.inspect_database_objects", return_value=inv_table):
+            with patch.object(mock_conn, "cursor") as mock_cur_factory:
+                mock_cur = MagicMock()
+                mock_cur.fetchone.return_value = (1,)
+                mock_cur_factory.return_value.__enter__.return_value = mock_cur
+                status = get_status("localhost", 5432)
+                self.assertFalse(status["is_ready_for_tests"])
+                self.assertTrue(any("unexpected_rogue_table" in err for err in status["ledger_errors"]))
+
+        # Sub-case 2: Extra unexpected function
+        inv_func = dict(base_inventory, functions=list(EXPECTED_USER_FUNCTIONS) + ["public.malicious_func"])
+        with patch("scripts.manage_test_database.validate_migration_manifest", return_value=[]), \
+             patch("scripts.manage_test_database.connect_maintenance", return_value=mock_conn), \
+             patch("scripts.manage_test_database.verify_connection_metadata", return_value=mock_meta), \
+             patch("scripts.manage_test_database.connect_test_db", return_value=mock_conn), \
+             patch("scripts.manage_test_database.inspect_database_objects", return_value=inv_func):
+            with patch.object(mock_conn, "cursor") as mock_cur_factory:
+                mock_cur = MagicMock()
+                mock_cur.fetchone.return_value = (1,)
+                mock_cur_factory.return_value.__enter__.return_value = mock_cur
+                status = get_status("localhost", 5432)
+                self.assertFalse(status["is_ready_for_tests"])
+                self.assertTrue(any("public.malicious_func" in err for err in status["ledger_errors"]))
+
+        # Sub-case 3: Extra unexpected extension
+        inv_ext = dict(base_inventory, extensions=dict(base_inventory["extensions"], pg_trgm="1.0"))
+        with patch("scripts.manage_test_database.validate_migration_manifest", return_value=[]), \
+             patch("scripts.manage_test_database.connect_maintenance", return_value=mock_conn), \
+             patch("scripts.manage_test_database.verify_connection_metadata", return_value=mock_meta), \
+             patch("scripts.manage_test_database.connect_test_db", return_value=mock_conn), \
+             patch("scripts.manage_test_database.inspect_database_objects", return_value=inv_ext):
+            with patch.object(mock_conn, "cursor") as mock_cur_factory:
+                mock_cur = MagicMock()
+                mock_cur.fetchone.return_value = (1,)
+                mock_cur_factory.return_value.__enter__.return_value = mock_cur
+                status = get_status("localhost", 5432)
+                self.assertFalse(status["is_ready_for_tests"])
+                self.assertTrue(any("pg_trgm" in err for err in status["ledger_errors"]))
+
+        # Sub-case 4: Extra unexpected sequence
+        inv_seq = dict(base_inventory, sequences=list(EXPECTED_SEQUENCES) + ["rogue_sequence_seq"])
+        with patch("scripts.manage_test_database.validate_migration_manifest", return_value=[]), \
+             patch("scripts.manage_test_database.connect_maintenance", return_value=mock_conn), \
+             patch("scripts.manage_test_database.verify_connection_metadata", return_value=mock_meta), \
+             patch("scripts.manage_test_database.connect_test_db", return_value=mock_conn), \
+             patch("scripts.manage_test_database.inspect_database_objects", return_value=inv_seq):
+            with patch.object(mock_conn, "cursor") as mock_cur_factory:
+                mock_cur = MagicMock()
+                mock_cur.fetchone.return_value = (1,)
+                mock_cur_factory.return_value.__enter__.return_value = mock_cur
+                status = get_status("localhost", 5432)
+                self.assertFalse(status["is_ready_for_tests"])
+                self.assertTrue(any("rogue_sequence_seq" in err for err in status["ledger_errors"]))
+
+        # Sub-case 5: Extra unexpected custom type
+        inv_type = dict(base_inventory, custom_types=dict(base_inventory["custom_types"], extra_enum="e"))
+        with patch("scripts.manage_test_database.validate_migration_manifest", return_value=[]), \
+             patch("scripts.manage_test_database.connect_maintenance", return_value=mock_conn), \
+             patch("scripts.manage_test_database.verify_connection_metadata", return_value=mock_meta), \
+             patch("scripts.manage_test_database.connect_test_db", return_value=mock_conn), \
+             patch("scripts.manage_test_database.inspect_database_objects", return_value=inv_type):
+            with patch.object(mock_conn, "cursor") as mock_cur_factory:
+                mock_cur = MagicMock()
+                mock_cur.fetchone.return_value = (1,)
+                mock_cur_factory.return_value.__enter__.return_value = mock_cur
+                status = get_status("localhost", 5432)
+                self.assertFalse(status["is_ready_for_tests"])
+                self.assertTrue(any("extra_enum" in err for err in status["ledger_errors"]))
+
+        # Sub-case 6: Extra unexpected schema
+        inv_schema = dict(base_inventory, schemas=["public", "staging_schema"])
+        with patch("scripts.manage_test_database.validate_migration_manifest", return_value=[]), \
+             patch("scripts.manage_test_database.connect_maintenance", return_value=mock_conn), \
+             patch("scripts.manage_test_database.verify_connection_metadata", return_value=mock_meta), \
+             patch("scripts.manage_test_database.connect_test_db", return_value=mock_conn), \
+             patch("scripts.manage_test_database.inspect_database_objects", return_value=inv_schema):
+            with patch.object(mock_conn, "cursor") as mock_cur_factory:
+                mock_cur = MagicMock()
+                mock_cur.fetchone.return_value = (1,)
+                mock_cur_factory.return_value.__enter__.return_value = mock_cur
+                status = get_status("localhost", 5432)
+                self.assertFalse(status["is_ready_for_tests"])
+                self.assertTrue(any("staging_schema" in err for err in status["ledger_errors"]))
+
+    def test_failed_initialization_at_precheck_restores_all_state(self):
+        """Verify PostgresRuntimeTests.setUpClass failure at precheck restores environment and module state."""
+        import os
+        from unittest.mock import MagicMock, patch
+        from tests.test_postgres_runtime import PostgresRuntimeTests
+        import backend.config as cfg
+        import backend.postgres_repositories as pr
+        import backend.history_store as hs
+        import backend.ml_pipeline as ml
+
+        orig_db_url = os.environ.get("DATABASE_URL")
+        orig_env = os.environ.get("NIVESH_ENV")
+        orig_cfg_url = getattr(cfg, "DATABASE_URL", None)
+        orig_pr_url = getattr(pr, "DATABASE_URL", None)
+        orig_hs_url = getattr(hs, "DATABASE_URL", None)
+        orig_ml_url = getattr(ml, "DATABASE_URL", None)
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchone.return_value = ("nivesh_v3_staging", False)  # Disallowed DB
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+        mock_pool = MagicMock()
+
+        test_env = {
+            "RUN_POSTGRES": "1",
+            "POSTGRES_TEST_DATABASE_URL": "postgresql://localhost:5432/nivesh_test",
+        }
+        import backend.postgres_compat as pc
+        orig_actual_pool = pc._pool
+        pc._pool = mock_pool
+
+        try:
+            with patch.dict(os.environ, test_env, clear=False), \
+                 patch("psycopg2.connect", return_value=mock_conn):
+
+                with self.assertRaisesRegex(RuntimeError, "SAFETY GATE TRIGGERED"):
+                    PostgresRuntimeTests.setUpClass()
+
+                mock_conn.close.assert_called()
+                # Verify exact restoration of every saved environment variable and module attribute
+                self.assertEqual(os.environ.get("DATABASE_URL"), orig_db_url)
+                self.assertEqual(os.environ.get("NIVESH_ENV"), orig_env)
+                self.assertEqual(getattr(cfg, "DATABASE_URL", None), orig_cfg_url)
+                self.assertEqual(getattr(pr, "DATABASE_URL", None), orig_pr_url)
+                self.assertEqual(getattr(hs, "DATABASE_URL", None), orig_hs_url)
+                self.assertEqual(getattr(ml, "DATABASE_URL", None), orig_ml_url)
+                self.assertIs(pc._pool, mock_pool, "Original pool reference must be restored")
+                self.assertEqual(len(PostgresRuntimeTests._original_env), 0)
+                self.assertEqual(len(PostgresRuntimeTests._original_modules), 0)
+                self.assertIsNone(PostgresRuntimeTests._original_pool)
+        finally:
+            pc._pool = orig_actual_pool
+
+    def test_failed_initialization_after_config_mutation_restores_all_state(self):
+        """Verify PostgresRuntimeTests.setUpClass failure after config mutation restores environment, modules, and pool."""
+        import os
+        import sys
+        from unittest.mock import MagicMock, patch
+        from tests.test_postgres_runtime import PostgresRuntimeTests
+        import backend.config as cfg
+        import backend.postgres_repositories as pr
+        import backend.history_store as hs
+        import backend.ml_pipeline as ml
+
+        orig_db_url = os.environ.get("DATABASE_URL")
+        orig_env = os.environ.get("NIVESH_ENV")
+        orig_live = os.environ.get("NIVESH_LIVE_TRADING_ENABLED")
+        orig_live_elig = os.environ.get("LIVE_ELIGIBLE")
+        orig_cfg_url = getattr(cfg, "DATABASE_URL", None)
+        orig_pr_url = getattr(pr, "DATABASE_URL", None)
+        orig_hs_url = getattr(hs, "DATABASE_URL", None)
+        orig_ml_url = getattr(ml, "DATABASE_URL", None)
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchone.return_value = ("nivesh_test", False)  # Valid precheck
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+        mock_pool = MagicMock()
+        import backend.postgres_compat as pc
+        orig_actual_pool = pc._pool
+        pc._pool = mock_pool
+
+        test_env = {
+            "RUN_POSTGRES": "1",
+            "POSTGRES_TEST_DATABASE_URL": "postgresql://localhost:5432/nivesh_test",
+        }
+
+        class FailingModule:
+            def __init__(self):
+                self.should_fail = True
+            def __setattr__(self, name, val):
+                if name == "DATABASE_URL" and getattr(self, "should_fail", False):
+                    self.should_fail = False
+                    raise RuntimeError("SIMULATED_FAILURE_AFTER_MUTATION")
+                super().__setattr__(name, val)
+
+        failing_ml = FailingModule()
+
+        try:
+            with patch.dict(os.environ, test_env, clear=False), \
+                 patch.object(sys.modules["backend"], "ml_pipeline", failing_ml), \
+                 patch("psycopg2.connect", return_value=mock_conn):
+
+                with self.assertRaisesRegex(RuntimeError, "SIMULATED_FAILURE_AFTER_MUTATION"):
+                    PostgresRuntimeTests.setUpClass()
+
+                mock_conn.close.assert_called()
+                # Verify exact restoration of every saved environment variable and module attribute
+                self.assertEqual(os.environ.get("DATABASE_URL"), orig_db_url)
+                self.assertEqual(os.environ.get("NIVESH_ENV"), orig_env)
+                self.assertEqual(os.environ.get("NIVESH_LIVE_TRADING_ENABLED"), orig_live)
+                self.assertEqual(os.environ.get("LIVE_ELIGIBLE"), orig_live_elig)
+                self.assertEqual(getattr(cfg, "DATABASE_URL", None), orig_cfg_url)
+                self.assertEqual(getattr(pr, "DATABASE_URL", None), orig_pr_url)
+                self.assertEqual(getattr(hs, "DATABASE_URL", None), orig_hs_url)
+                self.assertEqual(getattr(ml, "DATABASE_URL", None), orig_ml_url)
+                self.assertIs(pc._pool, mock_pool, "Original pool reference must be restored")
+                self.assertEqual(len(PostgresRuntimeTests._original_env), 0)
+                self.assertEqual(len(PostgresRuntimeTests._original_modules), 0)
+                self.assertIsNone(PostgresRuntimeTests._original_pool)
+        finally:
+            pc._pool = orig_actual_pool
+
+
+    def test_pool_cleanup_when_closeall_raises(self):
+        """Verify tearDownClass guarantees pool reference is restored/cleared even if closeall() raises."""
+        import backend.postgres_compat as pc
+        from unittest.mock import MagicMock
+        from tests.test_postgres_runtime import PostgresRuntimeTests
+
+        bad_pool = MagicMock()
+        bad_pool.closeall.side_effect = RuntimeError("CORRUPTED_POOL_CLOSEALL_FAILED")
+
+        orig_pool = MagicMock()
+        pc._pool = bad_pool
+        PostgresRuntimeTests._original_pool = orig_pool
+
+        # Run tearDownClass: must not raise and must restore pc._pool to orig_pool
+        PostgresRuntimeTests.tearDownClass()
+
+        self.assertIs(pc._pool, orig_pool, "Pool reference must be restored even if closeall raises")
+        self.assertIsNone(PostgresRuntimeTests._original_pool)
+
+    def test_verify_connection_metadata_closes_connection_on_failure(self):
+        """Verify verify_connection_metadata closes the connection if server metadata check fails."""
+        from unittest.mock import MagicMock
+        from scripts.manage_test_database import verify_connection_metadata
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchone.return_value = ("wrong_db", "user", "127.0.0.1", 5432, False, "PostgreSQL 17")
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+        with self.assertRaisesRegex(RuntimeError, "SAFETY VIOLATION"):
+            verify_connection_metadata(mock_conn, "nivesh_test")
+
+        mock_conn.close.assert_called()

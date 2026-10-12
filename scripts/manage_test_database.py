@@ -125,30 +125,123 @@ EXPECTED_LEDGER_ENTRIES: List[str] = [
     "v3_18_shadow_session_code_version",
 ]
 
-EXPECTED_SCHEMA_TABLES: Set[str] = {
-    "instrument_master",
-    "live_market_bars",
-    "schema_migrations",
-    "history_sync_coverage",
-    "forward_shadow_sessions",
-    "shadow_execution_audits",
-    "auth_login_attempts",
-    "live_feature_snapshots",
-    "operational_preflight_runs",
-    "system_promotion_ledger",
-    "instrument_provider_keys",
-    "model_quality_feedback",
-    "option_chain_oi_snapshots",
-    "adaptive_trade_rewards",
-    "trade_candidate_audits",
-    "agentic_sentinel_logs",
-    "model_versions",
-    "exchange_trading_calendar",
+EXPECTED_POSTGRES_EXTENSIONS: Set[str] = {
+    "plpgsql",
+    "pgcrypto",  # Added in v3_0_production.sql
 }
 
 EXPECTED_CUSTOM_TYPES: Set[str] = {
     "instrument_kind",
     "bar_interval",
+    "order_side",
+    "execution_status",
+}
+
+EXPECTED_USER_FUNCTIONS: Set[str] = {
+    "public.enforce_hard_daily_drawdown",  # Created in v3_0_production.sql
+    "public.block_unpromoted_trading",     # Created in v3_4_promotion_engine.sql
+}
+
+EXPECTED_SCHEMA_TABLES: Set[str] = {
+    "account_equity_snapshots",
+    "adaptive_trade_guardrails",
+    "adaptive_trade_rewards",
+    "agent_runs",
+    "agentic_sentinel_logs",
+    "ai_gateway_logs",
+    "auth_login_attempts",
+    "bot_conversations",
+    "bot_messages",
+    "broker_auth_states",
+    "broker_connections",
+    "corporate_action_ingestions",
+    "corporate_actions",
+    "derivative_plans",
+    "drift_reports",
+    "exchange_trading_calendar",
+    "feature_rows",
+    "forward_shadow_sessions",
+    "history_ingestions",
+    "history_sync_coverage",
+    "holdings",
+    "india_vix_history",
+    "instrument_master",
+    "instrument_provider_keys",
+    "kill_switches",
+    "live_feature_snapshots",
+    "live_market_bars",
+    "market_data_gaps",
+    "ml_feature_observations",
+    "model_drift_reports",
+    "model_quality_feedback",
+    "model_release_manifests",
+    "model_versions",
+    "monitoring_events",
+    "news_article_symbols",
+    "news_articles",
+    "news_articles_v3",
+    "news_ingestion_logs",
+    "news_sentiment_scores",
+    "operational_preflight_runs",
+    "option_chain_oi_snapshots",
+    "order_events",
+    "order_execution_events",
+    "order_execution_ledger",
+    "order_intents",
+    "portfolios",
+    "revoked_tokens",
+    "risk_control_state",
+    "risk_policies",
+    "schema_migrations",
+    "sentiment_snapshots",
+    "settings",
+    "shadow_execution_audits",
+    "shadow_predictions",
+    "shadow_session_daily_log",
+    "stock_analyses",
+    "system_promotion_ledger",
+    "trade_candidate_audits",
+    "trades",
+    "universe_membership",
+    "users",
+    "validation_runs",
+    "watchlist_snapshots",
+}
+
+EXPECTED_SEQUENCES: Set[str] = {
+    "account_equity_snapshots_id_seq",
+    "adaptive_trade_rewards_id_seq",
+    "agent_runs_id_seq",
+    "agentic_sentinel_logs_id_seq",
+    "ai_gateway_logs_id_seq",
+    "auth_login_attempts_id_seq",
+    "bot_conversations_id_seq",
+    "bot_messages_id_seq",
+    "derivative_plans_id_seq",
+    "drift_reports_id_seq",
+    "holdings_id_seq",
+    "instrument_master_id_seq",
+    "market_data_gaps_id_seq",
+    "model_drift_reports_id_seq",
+    "model_quality_feedback_id_seq",
+    "model_versions_id_seq",
+    "monitoring_events_id_seq",
+    "news_articles_id_seq",
+    "news_ingestion_logs_id_seq",
+    "operational_preflight_runs_id_seq",
+    "option_chain_oi_snapshots_id_seq",
+    "order_events_id_seq",
+    "order_execution_events_id_seq",
+    "order_intents_id_seq",
+    "sentiment_snapshots_id_seq",
+    "shadow_execution_audits_id_seq",
+    "shadow_predictions_id_seq",
+    "stock_analyses_id_seq",
+    "trade_candidate_audits_id_seq",
+    "trades_id_seq",
+    "users_id_seq",
+    "validation_runs_id_seq",
+    "watchlist_snapshots_id_seq",
 }
 
 
@@ -262,41 +355,51 @@ def validate_test_connection_params(
 def verify_connection_metadata(conn: psycopg2.extensions.connection, expected_db: str) -> Dict:
     """Queries server-side session metadata to verify database identity before any operation.
 
-    Note: Localhost checks cannot detect whether an SSH port forward is bound to local port 5432.
-    Metadata returned here reflects the server receiving the connection.
+    SECURITY AND NETWORK BOUNDARY LIMITATIONS:
+    - Client-side URL validation confirms only the destination hostname/port string.
+    - Server-side metadata queries confirm the identity, role, and recovery status of
+      the PostgreSQL instance that actually accepted the connection.
+    - HOWEVER, NEITHER CLIENT-SIDE VALIDATION NOR SERVER METADATA CAN CONCLUSIVELY RULE OUT
+      LOCAL PORT FORWARDING (e.g. `ssh -L 5432:...`), local iptables redirects, or transparent
+      proxies that forward localhost:5432 to an external or remote instance.
+    - Operators MUST independently ensure that no forwarding processes or tunnels exist.
     """
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT current_database(), current_user, inet_server_addr(), inet_server_port(), pg_is_in_recovery(), version();"
-        )
-        row = cur.fetchone()
-        actual_db, actual_user, server_addr, server_port, in_recovery, pg_version = row
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT current_database(), current_user, inet_server_addr(), inet_server_port(), pg_is_in_recovery(), version();"
+            )
+            row = cur.fetchone()
+            actual_db, actual_user, server_addr, server_port, in_recovery, pg_version = row
 
-    if actual_db != expected_db:
-        conn.close()
-        raise RuntimeError(
-            f"SAFETY VIOLATION: Connected database '{actual_db}' does not match expected '{expected_db}'. "
-            "Aborting immediately."
-        )
+        if actual_db != expected_db:
+            raise RuntimeError(
+                f"SAFETY VIOLATION: Connected database '{actual_db}' does not match expected '{expected_db}'. "
+                "Aborting immediately."
+            )
 
-    if actual_db in FORBIDDEN_DATABASES and actual_db != "postgres":
-        conn.close()
-        raise RuntimeError(
-            f"SAFETY VIOLATION: Connected database is forbidden target '{actual_db}'. Aborting immediately."
-        )
+        if actual_db in FORBIDDEN_DATABASES and actual_db != "postgres":
+            raise RuntimeError(
+                f"SAFETY VIOLATION: Connected database is forbidden target '{actual_db}'. Aborting immediately."
+            )
 
-    if in_recovery:
-        conn.close()
-        raise RuntimeError("SAFETY VIOLATION: Target PostgreSQL server is a read-only replica.")
+        if in_recovery:
+            raise RuntimeError("SAFETY VIOLATION: Target PostgreSQL server is a read-only replica.")
 
-    return {
-        "database": actual_db,
-        "user": actual_user,
-        "server_addr": str(server_addr) if server_addr else "local_socket",
-        "server_port": server_port,
-        "in_recovery": in_recovery,
-        "pg_version": pg_version,
-    }
+        return {
+            "database": actual_db,
+            "user": actual_user,
+            "server_addr": str(server_addr) if server_addr else "local_socket",
+            "server_port": server_port,
+            "in_recovery": in_recovery,
+            "pg_version": pg_version,
+        }
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
 
 
 def validate_migration_manifest(migrations_dir: Path) -> List[Dict]:
@@ -390,13 +493,15 @@ def inspect_database_objects(conn: psycopg2.extensions.connection) -> Dict[str, 
         sequence_names = {r[2] for r in rel_rows if r[0] == 'S'}
         foreign_table_names = {r[2] for r in rel_rows if r[0] == 'f'}
 
-        # 4. User-defined functions / procedures
+        # 4. User-defined functions / procedures (excluding extension-packaged functions like pgcrypto)
         cur.execute(
             """
             SELECT p.proname, n.nspname
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
-            WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname != 'information_schema';
+            LEFT JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+            WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname != 'information_schema'
+              AND d.objid IS NULL;
             """
         )
         user_funcs = [f"{r[1]}.{r[0]}" for r in cur.fetchall()]
@@ -640,17 +745,69 @@ def get_status(host: str, port: int, user: Optional[str] = None) -> Dict:
         if not missing_ledger and not unexpected_ledger and applied != EXPECTED_LEDGER_ENTRIES:
             ledger_errors.append("Applied migrations are out of expected sequence order.")
 
-        # Check expected schema tables
-        existing_tables = db_inventory["tables"]
+        # Check expected schema tables (both missing and unexpected)
+        existing_tables = set(db_inventory["tables"])
         missing_tables = EXPECTED_SCHEMA_TABLES - existing_tables
         if missing_tables:
             ledger_errors.append(f"Missing required application tables: {sorted(missing_tables)}")
 
-        # Check expected custom enum types
+        unexpected_tables = existing_tables - EXPECTED_SCHEMA_TABLES
+        if unexpected_tables:
+            ledger_errors.append(f"Unexpected application tables detected: {sorted(unexpected_tables)}")
+
+        # Check expected custom enum types (both missing and unexpected)
         existing_types = set(db_inventory["custom_types"].keys())
         missing_types = EXPECTED_CUSTOM_TYPES - existing_types
         if missing_types:
             ledger_errors.append(f"Missing required custom types: {sorted(missing_types)}")
+
+        unexpected_types = existing_types - EXPECTED_CUSTOM_TYPES
+        if unexpected_types:
+            ledger_errors.append(f"Unexpected custom types detected: {sorted(unexpected_types)}")
+
+        # Check expected extensions (both missing and unexpected)
+        existing_extensions = set(db_inventory.get("extensions", {}).keys())
+        missing_extensions = EXPECTED_POSTGRES_EXTENSIONS - existing_extensions
+        if missing_extensions:
+            ledger_errors.append(f"Missing required extensions: {sorted(missing_extensions)}")
+
+        unexpected_extensions = existing_extensions - EXPECTED_POSTGRES_EXTENSIONS
+        if unexpected_extensions:
+            ledger_errors.append(f"Unexpected extensions detected: {sorted(unexpected_extensions)}")
+
+        # Check expected user functions (both missing and unexpected)
+        existing_functions = set(db_inventory.get("functions", []))
+        missing_functions = EXPECTED_USER_FUNCTIONS - existing_functions
+        if missing_functions:
+            ledger_errors.append(f"Missing required user functions: {sorted(missing_functions)}")
+
+        unexpected_functions = existing_functions - EXPECTED_USER_FUNCTIONS
+        if unexpected_functions:
+            ledger_errors.append(f"Unexpected user functions detected: {sorted(unexpected_functions)}")
+
+        # Check expected sequences (both missing and unexpected)
+        existing_sequences = set(db_inventory.get("sequences", []))
+        missing_sequences = EXPECTED_SEQUENCES - existing_sequences
+        if missing_sequences:
+            ledger_errors.append(f"Missing required sequences: {sorted(missing_sequences)}")
+
+        unexpected_sequences = existing_sequences - EXPECTED_SEQUENCES
+        if unexpected_sequences:
+            ledger_errors.append(f"Unexpected sequences detected: {sorted(unexpected_sequences)}")
+
+        # Check for unexpected views, matviews, foreign tables, or schemas
+        if db_inventory.get("views"):
+            ledger_errors.append(f"Unexpected views detected: {sorted(db_inventory['views'])}")
+
+        if db_inventory.get("matviews"):
+            ledger_errors.append(f"Unexpected materialized views detected: {sorted(db_inventory['matviews'])}")
+
+        if db_inventory.get("foreign_tables"):
+            ledger_errors.append(f"Unexpected foreign tables detected: {sorted(db_inventory['foreign_tables'])}")
+
+        unexpected_schemas = set(db_inventory.get("schemas", [])) - PERMITTED_DEFAULT_SCHEMAS
+        if unexpected_schemas:
+            ledger_errors.append(f"Unexpected schemas detected: {sorted(unexpected_schemas)}")
 
         if ledger_errors:
             return {
