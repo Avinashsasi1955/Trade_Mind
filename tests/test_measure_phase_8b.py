@@ -1,16 +1,22 @@
-import os
 import importlib
 import pytest
 from decimal import Decimal
 from io import StringIO
 
-# Ensure the test uses an in‑memory SQLite DB
-os.environ['DATABASE_URL'] = 'sqlite:///:memory:'
+measure = None
 
-# Import the module after setting env so it creates the engine on import
-measure = importlib.import_module('scripts.measure_phase_8b')
+@pytest.fixture(autouse=True)
+def setup_measure(monkeypatch):
+    global measure
+    monkeypatch.setenv('DATABASE_URL', 'sqlite:///:memory:')
+    import scripts.measure_phase_8b as measure_mod
+    importlib.reload(measure_mod)
+    measure = measure_mod
+    return measure_mod
 
-from scripts.measure_phase_8b import run_query
+def run_query(conn, sql, params=None):
+    return measure.run_query(conn, sql, params)
+
 def _setup_schema(engine):
     with engine.begin() as conn:
         run_query(conn, 'DROP TABLE IF EXISTS shadow_execution_audits')

@@ -164,3 +164,13 @@ Slippage = `fill_price − decision_price` (positive = adverse for buys).
 │                   trade #674 decision_price data error).        │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 8. Not done in 8c
+
+- random-entry null (placeholder only)
+- entry slippage vs bid/ask (not implemented)
+- day-block bootstrap (not implemented)
+- bar-source split by decision bars (not implemented)
+- trade #674 root cause (not fixed)
