@@ -11,4 +11,4 @@ jobs:
       - run: pip install -r requirements.txt pytest
       - run: python -m compileall backend scripts tests
       - run: python scripts/sync_trading_calendar.py
-      - run: pytest tests/ -v
+      - run: PYTHONPATH=. pytest tests/ -v
