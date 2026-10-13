@@ -13,11 +13,14 @@ Run anytime:
 from __future__ import annotations
 import os
 import sys
+import shutil
+import re
 import subprocess
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from decimal import Decimal
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -30,57 +33,174 @@ from backend.position_manager import PositionManager
 IST = ZoneInfo("Asia/Kolkata")
 
 
-def get_git_commit() -> str:
+def _read_git_commit_from_dir(git_dir: Path) -> Optional[str]:
+    """Parse git commit directly from .git directory without requiring the git CLI."""
     try:
-        res = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-        return res
-    except Exception as exc:
-        return f"UNKNOWN ({exc})"
+        if git_dir.is_file():
+            # Support git worktrees or submodules where .git is a file like "gitdir: /path"
+            content = git_dir.read_text(encoding="utf-8").strip()
+            if content.startswith("gitdir:"):
+                target = content[7:].strip()
+                git_dir = (git_dir.parent / target).resolve()
+
+        head_file = git_dir / "HEAD"
+        if not head_file.is_file():
+            return None
+
+        head_content = head_file.read_text(encoding="utf-8").strip()
+        if not head_content:
+            return None
+
+        # Detached HEAD contains the 40-char commit SHA directly
+        if not head_content.startswith("ref:"):
+            if len(head_content) == 40 and all(c in "0123456789abcdefABCDEF" for c in head_content):
+                return head_content
+            return None
+
+        # Symbolic ref: e.g. "ref: refs/heads/docs/architecture-audit"
+        ref_path = head_content[4:].strip()
+        target_ref_file = git_dir / ref_path
+        if target_ref_file.is_file():
+            sha = target_ref_file.read_text(encoding="utf-8").strip()
+            if len(sha) == 40 and all(c in "0123456789abcdefABCDEF" for c in sha):
+                return sha
+
+        # If the ref is packed in .git/packed-refs
+        packed_refs_file = git_dir / "packed-refs"
+        if packed_refs_file.is_file():
+            for line in packed_refs_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("^"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == ref_path:
+                    candidate = parts[0].strip()
+                    if len(candidate) == 40 and all(c in "0123456789abcdefABCDEF" for c in candidate):
+                        return candidate
+    except Exception:
+        pass
+    return None
+
+
+def get_git_commit(repo_root: Optional[Path] = None) -> str:
+    """Retrieve the exact Git commit hash safely across environments.
+
+    Order of resolution:
+    1. Environment variables (GITHUB_SHA, GIT_COMMIT, NIVESH_CODE_VERSION, CODE_VERSION, GIT_COMMIT_HASH, GIT_SHA, CI_COMMIT_SHA)
+    2. Git CLI via PATH (or standard binary paths: /usr/bin/git, /usr/local/bin/git, /opt/homebrew/bin/git, /bin/git)
+    3. Direct pure-Python inspection of .git/HEAD and refs (no git CLI binary required)
+    4. Clean fallback string "UNKNOWN" without raw exception tracebacks
+    """
+    root = repo_root or ROOT
+
+    # 1. CI / Docker / Environment Variables
+    env_keys = (
+        "GITHUB_SHA",
+        "GIT_COMMIT",
+        "NIVESH_CODE_VERSION",
+        "CODE_VERSION",
+        "GIT_COMMIT_HASH",
+        "GIT_SHA",
+        "CI_COMMIT_SHA",
+    )
+    for env_key in env_keys:
+        val = os.getenv(env_key)
+        if val and val.strip():
+            return val.strip()
+
+    # 2. Try git binary via PATH or standard locations
+    git_binaries = []
+    which_git = shutil.which("git")
+    if which_git:
+        git_binaries.append(which_git)
+    for std_path in ("/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git", "/bin/git"):
+        if std_path not in git_binaries and os.path.exists(std_path) and os.access(std_path, os.X_OK):
+            git_binaries.append(std_path)
+
+    for git_cmd in git_binaries:
+        try:
+            res = subprocess.check_output(
+                [git_cmd, "rev-parse", "HEAD"],
+                cwd=root,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            if res and len(res) == 40 and all(c in "0123456789abcdefABCDEF" for c in res):
+                return res
+        except Exception:
+            continue
+
+    # 3. Direct inspection of .git directory
+    git_dir = root / ".git"
+    if git_dir.exists():
+        direct_commit = _read_git_commit_from_dir(git_dir)
+        if direct_commit:
+            return direct_commit
+
+    # 4. Clean fallback without raw exception details
+    return "UNKNOWN"
 
 
 def main():
     gen_time = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     commit_hash = get_git_commit()
+    status_file = ROOT / "STATUS.md"
     
     # 1. Query Real Shadow Executions
-    engine = create_engine(DATABASE_URL)
     shadow_stats = []
-    with engine.connect() as conn:
-        q_shadow = """
-        SELECT 
-            model_version,
-            COUNT(*) as total_trades,
-            COUNT(CASE WHEN net_pnl > 0 THEN 1 END) as wins,
-            COUNT(CASE WHEN net_pnl <= 0 THEN 1 END) as losses,
-            ROUND(COUNT(CASE WHEN net_pnl > 0 THEN 1 END)::numeric / NULLIF(COUNT(*), 0) * 100, 2) as win_rate,
-            ROUND(COALESCE(SUM(CASE WHEN net_pnl > 0 THEN net_pnl END), 0)::numeric, 2) as gross_profit,
-            ROUND(COALESCE(ABS(SUM(CASE WHEN net_pnl < 0 THEN net_pnl END)), 0)::numeric, 2) as gross_loss,
-            ROUND(COALESCE(SUM(CASE WHEN net_pnl > 0 THEN net_pnl END), 0)::numeric / NULLIF(ABS(SUM(CASE WHEN net_pnl < 0 THEN net_pnl END)), 0), 2) as profit_factor,
-            ROUND(SUM(net_pnl)::numeric, 2) as net_pnl,
-            ROUND(SUM(estimated_fees)::numeric, 2) as total_fees,
-            MIN((signal_at AT TIME ZONE 'Asia/Kolkata')::date) as first_date,
-            MAX((signal_at AT TIME ZONE 'Asia/Kolkata')::date) as last_date,
-            COUNT(DISTINCT (signal_at AT TIME ZONE 'Asia/Kolkata')::date) as distinct_days
-        FROM shadow_execution_audits
-        WHERE exit_at IS NOT NULL AND net_pnl IS NOT NULL
-        GROUP BY model_version
-        ORDER BY total_trades DESC;
-        """
-        shadow_stats = conn.execute(text(q_shadow)).mappings().all()
+    day_stats = []
+    try:
+        engine = create_engine(DATABASE_URL)
+        with engine.connect() as conn:
+            q_shadow = """
+            SELECT
+                model_version,
+                COUNT(*) as total_trades,
+                COUNT(CASE WHEN net_pnl > 0 THEN 1 END) as wins,
+                COUNT(CASE WHEN net_pnl <= 0 THEN 1 END) as losses,
+                ROUND(COUNT(CASE WHEN net_pnl > 0 THEN 1 END)::numeric / NULLIF(COUNT(*), 0) * 100, 2) as win_rate,
+                ROUND(COALESCE(SUM(CASE WHEN net_pnl > 0 THEN net_pnl END), 0)::numeric, 2) as gross_profit,
+                ROUND(COALESCE(ABS(SUM(CASE WHEN net_pnl < 0 THEN net_pnl END)), 0)::numeric, 2) as gross_loss,
+                ROUND(COALESCE(SUM(CASE WHEN net_pnl > 0 THEN net_pnl END), 0)::numeric / NULLIF(ABS(SUM(CASE WHEN net_pnl < 0 THEN net_pnl END)), 0), 2) as profit_factor,
+                ROUND(SUM(net_pnl)::numeric, 2) as net_pnl,
+                ROUND(SUM(estimated_fees)::numeric, 2) as total_fees,
+                MIN((signal_at AT TIME ZONE 'Asia/Kolkata')::date) as first_date,
+                MAX((signal_at AT TIME ZONE 'Asia/Kolkata')::date) as last_date,
+                COUNT(DISTINCT (signal_at AT TIME ZONE 'Asia/Kolkata')::date) as distinct_days
+            FROM shadow_execution_audits
+            WHERE exit_at IS NOT NULL AND net_pnl IS NOT NULL
+            GROUP BY model_version
+            ORDER BY total_trades DESC;
+            """
+            shadow_stats = conn.execute(text(q_shadow)).mappings().all()
 
-        # Query Candidate Funnel over last 10 days in IST
-        q_days = """
-        SELECT 
-            (observed_at AT TIME ZONE 'Asia/Kolkata')::date as trade_date,
-            COUNT(*) as total_candidates,
-            COUNT(CASE WHEN accepted THEN 1 END) as accepted_candidates,
-            COUNT(CASE WHEN NOT accepted THEN 1 END) as rejected_candidates
-        FROM trade_candidate_audits
-        GROUP BY 1
-        ORDER BY 1 DESC
-        LIMIT 10;
-        """
-        day_stats = conn.execute(text(q_days)).mappings().all()
+            # Query Candidate Funnel over last 10 days in IST
+            q_days = """
+            SELECT
+                (observed_at AT TIME ZONE 'Asia/Kolkata')::date as trade_date,
+                COUNT(*) as total_candidates,
+                COUNT(CASE WHEN accepted THEN 1 END) as accepted_candidates,
+                COUNT(CASE WHEN NOT accepted THEN 1 END) as rejected_candidates
+            FROM trade_candidate_audits
+            GROUP BY 1
+            ORDER BY 1 DESC
+            LIMIT 10;
+            """
+            day_stats = conn.execute(text(q_days)).mappings().all()
+    except Exception as exc:
+        if status_file.exists():
+            existing_content = status_file.read_text(encoding="utf-8")
+            updated_content = re.sub(
+                r"(\*Exact Git Commit Hash:\s*`)[^`]*(`\*)",
+                lambda m: f"{m.group(1)}{commit_hash}{m.group(2)}",
+                existing_content,
+            )
+            status_file.write_text(updated_content, encoding="utf-8")
+            print(
+                f"Database unavailable ({exc}); preserved existing metrics and updated commit hash to {commit_hash} in {status_file}."
+            )
+            return
+        raise RuntimeError(f"Database unavailable and {status_file} does not exist: {exc}") from exc
 
     # 2. Read Runtime Parameters
     pm = PositionManager()

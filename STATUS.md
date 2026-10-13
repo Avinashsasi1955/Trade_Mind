@@ -2,7 +2,7 @@
 
 *Generated Automatically by `scripts/generate_status.py`*  
 *Generation Timestamp: `2026-10-13 16:06:21 IST`*  
-*Exact Git Commit Hash: `UNKNOWN ([Errno 2] No such file or directory: 'git')`*  
+*Exact Git Commit Hash: `6b1a88ae132eabd114ed388328de45507214b7ea`*
 *Canonical Single Source of Truth for Architecture, Model Benchmarks & Operational Ground Truth*
 
 ---
