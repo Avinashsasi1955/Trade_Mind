@@ -1,8 +1,8 @@
 # TradeMind — Living Project Status (STATUS.md)
 
 *Generated Automatically by `scripts/generate_status.py`*  
-*Generation Timestamp: `2026-10-08 19:04:30 IST`*  
-*Exact Git Commit Hash: `20f5f3eb5fa7449210cc59bf6f114bc9f94f4c39`*  
+*Generation Timestamp: `2026-10-13 16:06:21 IST`*  
+*Exact Git Commit Hash: `UNKNOWN ([Errno 2] No such file or directory: 'git')`*  
 *Canonical Single Source of Truth for Architecture, Model Benchmarks & Operational Ground Truth*
 
 ---
@@ -24,7 +24,7 @@
 | Model Version | Status / Role | Closed Trades | Wins / Losses | Win Rate | Profit Factor | Gross Profit | Gross Loss | Fees Drag | Net Realised P&L | Date Range (Sessions) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | `direction-v2.5-20260703T210440115936Z` | Retired Baseline | 590 | 178W / 412L | **30.17%** | **0.34** | ₹5516.23 | ₹16421.59 | ₹3903.75 | **₹-10905.36** | 2026-07-20 to 2026-09-29 (39d) |
-| `direction-v3.0-20260930T121513227395Z` | Active Paper Model | 19 | 11W / 8L | **57.89%** | **1.43** | ₹18434.52 | ₹12886.24 | ₹715.64 | **₹5548.28** | 2026-10-05 to 2026-10-08 (4d) |
+| `direction-v3.0-20260930T121513227395Z` | Active Paper Model | 32 | 17W / 15L | **53.13%** | **1.19** | ₹19322.11 | ₹16218.66 | ₹1359.77 | **₹3103.45** | 2026-10-05 to 2026-10-13 (7d) |
 
 > **Critical Reconciliation Finding**:
 > The figures previously labeled as active performance (`56.83% Win Rate / PF 1.22 / +18.24% Net Return`) were produced on **2026-09-29T19:57:22** by `walk_forward_validate()` running a **historical 6-fold backtest over Aug 2023–Jun 2026** (SQLite `validation_runs` Run 13). They were NOT live paper trades.
@@ -58,7 +58,7 @@
 
 | Parameter Name | Live Runtime Value (`.env` & Code) | Source Code Origin | Conflicting Documented Values | Stale Documents | Status / Rationale |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`NIVESH_SHADOW_MIN_PROFESSIONAL_RR`** | **1.90** (tiered: best=1.50, neutral=1.80, worst=2.00) | `.env:159`, `live_inference.py:264` | "Hard 2.00 R:R mandatory non-negotiable" | `rules.md` | **1.90 active** (tiered 1.50–2.00 to avoid Zero-Trade Trap). |
+| **`NIVESH_SHADOW_MIN_PROFESSIONAL_RR`** | **1.90** (tiered: best=1.80, neutral=2.00, worst=1.90) | `.env:159`, `live_inference.py:264` | "Hard 2.00 R:R mandatory non-negotiable" | `rules.md` | **1.90 active** (tiered 1.50–2.00 to avoid Zero-Trade Trap). |
 | **`breakeven_trigger_r`** | **+1.10R** | `position_manager.py:57`, `.env:161` | +0.70R or +0.75R | `MASTER_COMPREHENSIVE_PLAN.md`, `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4` | **+1.10R active** to avoid cutting winners prematurely. |
 | **`profit_lock_trigger_r`** | **+1.60R** | `position_manager.py:58`, `.env:162` | +1.50R | `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4`, `rules.md` | **+1.60R active**. |
 | **`profit_lock_guaranteed_r`** | **+1.00R** | `position_manager.py:59`, `.env:163` | +0.75R | `NIVESH_AI_COMPREHENSIVE_SPECIFICATION.md §10.4` | **+1.00R locked** once +1.60R is reached. |
@@ -77,6 +77,9 @@
 
 | Trade Date | Total Candidates Evaluated | Accepted Candidates | Acceptance Rate (%) | Zero-Trade Trap Flag |
 | :--- | :--- | :--- | :--- | :--- |
+| 2026-10-13 | 544 | 9 | 1.65% | Normal Filtered |
+| 2026-10-12 | 884 | 4 | 0.45% | Normal Filtered |
+| 2026-10-09 | 264 | 5 | 1.89% | Normal Filtered |
 | 2026-10-08 | 330 | 4 | 1.21% | Normal Filtered |
 | 2026-10-07 | 396 | 5 | 1.26% | Normal Filtered |
 | 2026-10-06 | 525 | 8 | 1.52% | Normal Filtered |
@@ -84,9 +87,6 @@
 | 2026-09-10 | 283 | 27 | 9.54% | Normal Filtered |
 | 2026-09-09 | 114 | 8 | 7.02% | Normal Filtered |
 | 2026-09-08 | 434 | 4 | 0.92% | Normal Filtered |
-| 2026-09-03 | 637 | 1 | 0.16% | Normal Filtered |
-| 2026-09-02 | 163 | 15 | 9.2% | Normal Filtered |
-| 2026-09-01 | 426 | 0 | 0.0% | ⚠️ **ZERO ACCEPTED** |
 
 ### B. Gate Architecture: Scored Confluence Ensemble vs. Serial Boolean AND
 

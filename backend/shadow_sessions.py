@@ -387,7 +387,9 @@ def open_session(engine,session_date: date = None) -> Dict:
         if calendar=="CLOSED":
             return {"session_date":day.isoformat(),"status":"SKIPPED","reason":"official exchange calendar marks the session closed","orders_allowed":False}
         connection.execute(text("""INSERT INTO forward_shadow_sessions(session_date,status,started_at,live_eligible,execution_enabled)
-            VALUES(:day,'STARTED',CURRENT_TIMESTAMP,FALSE,FALSE) ON CONFLICT(session_date) DO NOTHING"""),{"day":day})
+            VALUES(:day,'STARTED',CURRENT_TIMESTAMP,FALSE,FALSE)
+            ON CONFLICT(session_date) DO UPDATE
+            SET status = CASE WHEN forward_shadow_sessions.status != 'COMPLETE' THEN 'STARTED' ELSE forward_shadow_sessions.status END"""),{"day":day})
         completed=connection.execute(text("SELECT COUNT(*) FROM forward_shadow_sessions WHERE status='COMPLETE'")).scalar_one()
     return {"session_date":day.isoformat(),"status":"STARTED","completed_sessions":int(completed),"target":90,"orders_allowed":False}
 
@@ -550,17 +552,22 @@ def _persist_daily_log(engine, today: Dict, completed: int, effective_completed:
             """), params)
 
 
-def finalize_session(engine,session_date: date = None) -> Dict:
-    day=session_date or datetime.now(IST).date()
-    today=datetime.now(IST).date()
-    if day!=today: raise ValueError("Only today's live session can be finalized")
+def finalize_session(engine, session_date: date = None, force: bool = False) -> Dict:
+    day = session_date or datetime.now(IST).date()
+    today = datetime.now(IST).date()
+    if day != today:
+        raise ValueError("Only today's live session can be finalized")
+    now_ist = datetime.now(IST)
+    is_post_market = (now_ist.hour > 15) or (now_ist.hour == 15 and now_ist.minute >= 35)
+    if not is_post_market and not force:
+        raise ValueError(f"Cannot finalize live session before market close (15:35 IST). Current time: {now_ist.strftime('%H:%M:%S IST')}")
     with engine.begin() as connection:
-        evaluation=evaluate_session(engine,day)
-        reasons=evaluation["rejection_reasons"]
-        status="REJECTED" if reasons else "COMPLETE"
-        metrics=evaluation["metrics"]
-        metrics["warnings"]=evaluation["warnings"]
-        pnl=evaluation["paper_pnl"]
+        evaluation = evaluate_session(engine, day)
+        reasons = evaluation["rejection_reasons"]
+        status = "REJECTED" if reasons else "COMPLETE"
+        metrics = evaluation["metrics"]
+        metrics["warnings"] = evaluation["warnings"]
+        pnl = evaluation["paper_pnl"]
         connection.execute(text("""INSERT INTO forward_shadow_sessions(session_date,status,started_at,completed_at,one_minute_bars,five_minute_bars,
             instruments_seen,vix_observations,oi_observations,predictions,news_articles,critical_errors,live_eligible,execution_enabled,rejection_reasons,metrics,
             paper_realised_pnl,paper_unrealised_pnl,paper_net_pnl,paper_closed_trades,paper_open_trades,paper_rejected_trades,paper_win_rate_pct,paper_profit_factor)
@@ -596,9 +603,14 @@ def materialize_session(engine, session_date: date, status_override: str = None)
     days such as 2026-08-03 / 2026-08-04 in the formal session list.
     """
     day = session_date
+    today_dt = datetime.now(IST)
+    is_post_market = (today_dt.hour > 15) or (today_dt.hour == 15 and today_dt.minute >= 35)
     evaluation = evaluate_session(engine, day)
     reasons = evaluation["rejection_reasons"]
-    status = (status_override or ("REJECTED" if reasons else "COMPLETE")).upper()
+    if day == today_dt.date() and not is_post_market and not status_override:
+        status = "STARTED"
+    else:
+        status = (status_override or ("REJECTED" if reasons else "COMPLETE")).upper()
     if status not in {"STARTED", "COMPLETE", "REJECTED"}:
         raise ValueError("status_override must be STARTED, COMPLETE, or REJECTED")
     metrics = evaluation["metrics"]
@@ -699,8 +711,13 @@ def status(engine) -> Dict:
         try:
             with engine.connect() as connection:
                 t_row = connection.execute(text("SELECT status FROM forward_shadow_sessions WHERE session_date=:d"), {"d": today_date}).mappings().one_or_none()
-            if t_row and t_row.get("status") == "STARTED":
-                finalize_session(engine, today_date)
+            if t_row and t_row.get("status") in {"STARTED", "REJECTED"}:
+                if t_row.get("status") == "STARTED":
+                    finalize_session(engine, today_date)
+                elif t_row.get("status") == "REJECTED":
+                    ev = evaluate_session(engine, today_date)
+                    if ev.get("eligible") or not ev.get("rejection_reasons"):
+                        finalize_session(engine, today_date, force=True)
         except Exception as exc:
             _monitor(engine, "shadow_session_status", "WARNING", f"Post-market session auto-finalization skipped: {exc}",
                      {"session_date": today_date.isoformat(), "error": str(exc)[:500]})
@@ -728,17 +745,19 @@ def status(engine) -> Dict:
     # preflight check failed, there would be no row and the dashboard would
     # silently skip today.  A simple INSERT … ON CONFLICT DO NOTHING is safe
     # and idempotent.
-    try:
-        with engine.begin() as connection:
-            connection.execute(text("""
-                INSERT INTO forward_shadow_sessions(session_date,status,started_at,live_eligible,execution_enabled)
-                VALUES(:day,'STARTED',CURRENT_TIMESTAMP,FALSE,FALSE)
-                ON CONFLICT(session_date) DO NOTHING
-            """), {"day": today_date})
-    except Exception as exc:
-        _monitor(engine, "shadow_session_status", "WARNING",
-                 f"Auto-open today session skipped: {exc}",
-                 {"session_date": today_date.isoformat(), "error": str(exc)[:500]})
+    if not is_post_market:
+        try:
+            with engine.begin() as connection:
+                connection.execute(text("""
+                    INSERT INTO forward_shadow_sessions(session_date,status,started_at,live_eligible,execution_enabled)
+                    VALUES(:day,'STARTED',CURRENT_TIMESTAMP,FALSE,FALSE)
+                    ON CONFLICT(session_date) DO UPDATE
+                    SET status = CASE WHEN forward_shadow_sessions.status != 'COMPLETE' THEN 'STARTED' ELSE forward_shadow_sessions.status END
+                """), {"day": today_date})
+        except Exception as exc:
+            _monitor(engine, "shadow_session_status", "WARNING",
+                     f"Auto-open today session skipped: {exc}",
+                     {"session_date": today_date.isoformat(), "error": str(exc)[:500]})
 
     with engine.connect() as connection:
         counts = connection.execute(text("SELECT status,COUNT(*) count FROM forward_shadow_sessions GROUP BY status")).fetchall()
@@ -750,17 +769,22 @@ def status(engine) -> Dict:
     already_counted = any(str(row["session_date"]) == today_iso and row["status"] == "COMPLETE" for row in recent)
     effective_completed = completed + (1 if today["eligible"] and not already_counted else 0)
 
-    # Enrich recent list so that a STARTED session during market hours displays live counts
+    # Enrich recent list so that today's session displays live counts
     recent_list = []
     for row in recent:
         item = dict(row)
-        if str(item.get("session_date")) == today_iso and item.get("status") == "STARTED":
+        if str(item.get("session_date")) == today_iso:
             m = today.get("metrics") or {}
             pnl = today.get("paper_pnl") or {}
-            item["one_minute_bars"] = m.get("one_minute_bars", item.get("one_minute_bars", 0))
-            item["five_minute_bars"] = m.get("five_minute_bars", item.get("five_minute_bars", 0))
-            item["predictions"] = m.get("predictions", item.get("predictions", 0))
-            item["paper_net_pnl"] = pnl.get("net_marked_pnl", item.get("paper_net_pnl", 0))
+            if not is_post_market or item.get("status") == "STARTED":
+                item["one_minute_bars"] = m.get("one_minute_bars", item.get("one_minute_bars", 0))
+                item["five_minute_bars"] = m.get("five_minute_bars", item.get("five_minute_bars", 0))
+                item["predictions"] = m.get("predictions", item.get("predictions", 0))
+                item["paper_net_pnl"] = pnl.get("net_marked_pnl", item.get("paper_net_pnl", 0))
+                item["paper_realised_pnl"] = pnl.get("realised_pnl", item.get("paper_realised_pnl", 0))
+                item["paper_closed_trades"] = pnl.get("closed_trades", item.get("paper_closed_trades", 0))
+                if not is_post_market and item.get("status") == "REJECTED":
+                    item["status"] = "STARTED"
         recent_list.append(item)
 
     # If today is not yet in the recent list (no session row created), inject
