@@ -1,6 +1,21 @@
 import math
+import os
 from datetime import date
 from typing import Dict, List
+
+
+def is_synthetic_market_data_allowed() -> bool:
+    """Categorically prohibits synthetic market data for entry authorization in production and staging.
+
+    In production and staging, returns False unconditionally even if
+    NIVESH_ALLOW_SYNTHETIC_MARKET_DATA=1. In development and other environments,
+    synthetic entry authorization requires an explicit opt-in
+    (NIVESH_ALLOW_SYNTHETIC_MARKET_DATA=1). It is NEVER silently authorized.
+    """
+    env = os.getenv("ENVIRONMENT", os.getenv("NIVESH_ENV", "development")).lower()
+    if env in {"production", "staging"}:
+        return False
+    return os.getenv("NIVESH_ALLOW_SYNTHETIC_MARKET_DATA", "0") == "1"
 
 
 BASE_MARKET = [
@@ -22,15 +37,15 @@ BASE_MARKET = [
 ]
 
 INDICES = [
-    {"symbol": "NIFTY 50", "price": 24835.40, "change_pct": 0.62},
-    {"symbol": "SENSEX", "price": 81354.92, "change_pct": 0.48},
-    {"symbol": "BANKNIFTY", "price": 56124.15, "change_pct": -0.17},
-    {"symbol": "INDIA VIX", "price": 13.72, "change_pct": -2.04},
+    {"symbol": "NIFTY 50", "price": 24835.40, "change_pct": 0.62, "source": "SYNTHETIC_FIXTURE", "is_synthetic": True},
+    {"symbol": "SENSEX", "price": 81354.92, "change_pct": 0.48, "source": "SYNTHETIC_FIXTURE", "is_synthetic": True},
+    {"symbol": "BANKNIFTY", "price": 56124.15, "change_pct": -0.17, "source": "SYNTHETIC_FIXTURE", "is_synthetic": True},
+    {"symbol": "INDIA VIX", "price": 13.72, "change_pct": -2.04, "source": "SYNTHETIC_FIXTURE", "is_synthetic": True},
 ]
 
 
 def market_snapshot(run_number: int = 0) -> List[Dict]:
-    """Deterministic NSE-like data for paper trading; replace with ZerodhaMarketDataAdapter later."""
+    """Deterministic NSE-like synthetic fixture for non-executable research, displays, and isolated tests."""
     phase = date.today().toordinal() + run_number
     rows = []
     for idx, row in enumerate(BASE_MARKET):
@@ -43,6 +58,9 @@ def market_snapshot(run_number: int = 0) -> List[Dict]:
             "breakout_pct": round(breakout_pct + drift * 50, 2),
             "vwap_pct": round(vwap_pct + drift * 40, 2),
             "volatility": round(1.1 + (idx % 5) * 0.25, 2),
+            "source": "SYNTHETIC_FIXTURE",
+            "data_provenance": "SYNTHETIC_FIXTURE",
+            "is_synthetic": True,
         })
     return rows
 

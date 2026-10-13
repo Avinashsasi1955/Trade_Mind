@@ -44,7 +44,8 @@ def route_ml_signal(db,payload: Dict,order: Dict) -> RoutingDecision:
         return RoutingDecision(False,order,{"required":True,"status":"REJECTED","reason":"Fresh derivative limit price is required; underlying price cannot price a derivative","original":original,"candidate":dict(contract)})
     lot=int(contract["lot_size"]); lots=max(1,ceil(int(order["quantity"])/lot))
     routed={**order,"symbol":contract["symbol"],"exchange":contract["exchange"],"transaction_type":"SELL" if contract["instrument_type"]=="FUT" else "BUY",
-            "quantity":lots*lot,"limit_price":derivative_price,"product":"NRML","strategy":"ML bearish route: "+("Short Future" if contract["instrument_type"]=="FUT" else "Long Put")}
+            "quantity":lots*lot,"limit_price":derivative_price,"product":"NRML","strategy":"ML bearish route: "+("Short Future" if contract["instrument_type"]=="FUT" else "Long Put"),
+            "underlying":order["symbol"]}
     audit={"required":True,"status":"ROUTED","reason":"Cash-equity overnight short prohibited by policy","original":original,
            "route":{"exchange":routed["exchange"],"symbol":routed["symbol"],"instrument_type":contract["instrument_type"],"expiry":contract["expiry"],
                     "strike":contract["strike"],"lot_size":lot,"lots":lots,"quantity":routed["quantity"],"transaction_type":routed["transaction_type"]}}

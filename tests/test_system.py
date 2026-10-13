@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from backend.agent import TradingAgent
-from backend.database import SCHEMA, create_user, seed_demo_portfolio
+from backend.database import SCHEMA, create_user, now_iso, seed_demo_portfolio
 from backend.market import market_snapshot
 from backend.security import create_token, decode_token, hash_password, verify_password
 from backend.service import dashboard, run_agent, stock_analysis, update_settings
@@ -50,19 +50,36 @@ class NiveshSystemTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from backend import config
-        cls._orig_config_db_url = config.DATABASE_URL
+        cls._orig_config_db_url = getattr(config, "DATABASE_URL", "")
         cls._orig_env_db_url = os.environ.get("DATABASE_URL")
-        config.DATABASE_URL = ""
-        os.environ["DATABASE_URL"] = ""
+        cls._orig_allow_synth = os.environ.get("NIVESH_ALLOW_SYNTHETIC_MARKET_DATA")
+        try:
+            config.DATABASE_URL = ""
+            os.environ["DATABASE_URL"] = ""
+            os.environ["NIVESH_ALLOW_SYNTHETIC_MARKET_DATA"] = "1"
+        except Exception:
+            cls.tearDownClass()
+            raise
 
     @classmethod
     def tearDownClass(cls):
         from backend import config
-        config.DATABASE_URL = cls._orig_config_db_url
-        if cls._orig_env_db_url is not None:
-            os.environ["DATABASE_URL"] = cls._orig_env_db_url
-        else:
-            os.environ.pop("DATABASE_URL", None)
+        try:
+            if hasattr(cls, "_orig_config_db_url"):
+                config.DATABASE_URL = cls._orig_config_db_url
+        finally:
+            try:
+                if hasattr(cls, "_orig_env_db_url"):
+                    if cls._orig_env_db_url is not None:
+                        os.environ["DATABASE_URL"] = cls._orig_env_db_url
+                    else:
+                        os.environ.pop("DATABASE_URL", None)
+            finally:
+                if hasattr(cls, "_orig_allow_synth"):
+                    if cls._orig_allow_synth is not None:
+                        os.environ["NIVESH_ALLOW_SYNTHETIC_MARKET_DATA"] = cls._orig_allow_synth
+                    else:
+                        os.environ.pop("NIVESH_ALLOW_SYNTHETIC_MARKET_DATA", None)
 
     def test_production_asgi_adapter_returns_hardened_health_response(self):
         scope={"type":"http","method":"GET","path":"/api/health","raw_path":b"/api/health","query_string":b"",
@@ -405,13 +422,13 @@ class NiveshSystemTests(unittest.TestCase):
             self.assertIn(detect_drift(store)["overall"],{"stable","watch","alert"})
 
     def test_order_intent_requires_risk_then_human_approval_and_live_gate(self):
-        intent=create_intent(self.db,self.user_id,{"symbol":"RELIANCE","exchange":"NSE","transaction_type":"BUY","quantity":1,"order_type":"LIMIT","limit_price":2990,"product":"CNC","confidence":80,"reasoning":"Unit-tested supervised intent"})
+        intent=create_intent(self.db,self.user_id,{"symbol":"RELIANCE","exchange":"NSE","transaction_type":"BUY","quantity":1,"order_type":"LIMIT","limit_price":2990,"product":"CNC","confidence":80,"reasoning":"Unit-tested supervised intent","quote_timestamp":now_iso()})
         self.assertEqual(intent["status"],"APPROVAL_PENDING")
         approved=approve_intent(self.db,self.user_id,intent["id"])
         self.assertEqual(approved["status"],"APPROVED")
         with self.assertRaises(ValueError): submit_intent(self.db,self.user_id,intent["id"])
         set_kill_switch(self.db,self.user_id,True,"Test emergency")
-        blocked=create_intent(self.db,self.user_id,{"symbol":"RELIANCE","exchange":"NSE","transaction_type":"BUY","quantity":1,"order_type":"LIMIT","limit_price":2990,"product":"CNC","confidence":80,"reasoning":"Must be rejected"})
+        blocked=create_intent(self.db,self.user_id,{"symbol":"RELIANCE","exchange":"NSE","transaction_type":"BUY","quantity":1,"order_type":"LIMIT","limit_price":2990,"product":"CNC","confidence":80,"reasoning":"Must be rejected","quote_timestamp":now_iso()})
         self.assertEqual(blocked["status"],"RISK_REJECTED")
 
     def test_bearish_ml_signal_routes_to_put_and_enforces_lot_size(self):
@@ -421,7 +438,7 @@ class NiveshSystemTests(unittest.TestCase):
         self.db.execute("UPDATE risk_policies SET allow_derivatives=1 WHERE user_id=?",(self.user_id,)); self.db.commit()
         intent=create_intent(self.db,self.user_id,{"symbol":"RELIANCE","exchange":"NSE","transaction_type":"SELL","signal_direction":"SHORT",
             "signal_source":"ml","model_version":"test-model","quantity":10,"order_type":"LIMIT","limit_price":3000,
-            "derivative_limit_price":25,"confidence":80,"reasoning":"Bearish model signal"})
+            "derivative_limit_price":25,"confidence":80,"reasoning":"Bearish model signal","quote_timestamp":now_iso()})
         self.assertEqual(intent["status"],"APPROVAL_PENDING")
         self.assertEqual((intent["exchange"],intent["symbol"],intent["transaction_type"]),("NFO","RELIANCE30JUL3000PE","BUY"))
         self.assertEqual(intent["quantity"],250)
@@ -431,13 +448,13 @@ class NiveshSystemTests(unittest.TestCase):
     def test_bearish_ml_signal_without_derivative_chain_is_rejected_and_audited(self):
         intent=create_intent(self.db,self.user_id,{"symbol":"COALINDIA","exchange":"NSE","transaction_type":"SELL","signal_direction":"SHORT",
             "signal_source":"ml","model_version":"test-model","quantity":10,"order_type":"LIMIT","limit_price":480,
-            "derivative_limit_price":10,"confidence":80,"reasoning":"Bearish model signal"})
+            "derivative_limit_price":10,"confidence":80,"reasoning":"Bearish model signal","quote_timestamp":now_iso()})
         self.assertEqual(intent["status"],"RISK_REJECTED")
         self.assertEqual(intent["risk_payload"]["routing"]["status"],"REJECTED")
         self.assertEqual(intent["events"][0]["event_type"],"BEARISH_ROUTE_REJECTED")
 
     def test_duplicate_order_idempotency_and_partial_fill_reconciliation(self):
-        payload={"client_order_id":"IDEMPOTENT-001","symbol":"RELIANCE","exchange":"NSE","transaction_type":"BUY","quantity":10,"order_type":"LIMIT","limit_price":2990,"product":"CNC","confidence":80,"reasoning":"Failure-drill intent"}
+        payload={"client_order_id":"IDEMPOTENT-001","symbol":"RELIANCE","exchange":"NSE","transaction_type":"BUY","quantity":10,"order_type":"LIMIT","limit_price":2990,"product":"CNC","confidence":80,"reasoning":"Failure-drill intent","quote_timestamp":now_iso()}
         first=create_intent(self.db,self.user_id,payload)
         duplicate=create_intent(self.db,self.user_id,payload)
         self.assertEqual(first["id"],duplicate["id"])
@@ -456,7 +473,7 @@ class NiveshSystemTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT status FROM order_intents WHERE id=?",(first["id"],)).fetchone()[0],"PARTIAL")
 
     def test_broker_outage_does_not_mutate_approved_intent(self):
-        intent=create_intent(self.db,self.user_id,{"symbol":"RELIANCE","exchange":"NSE","transaction_type":"BUY","quantity":1,"order_type":"LIMIT","limit_price":2990,"product":"CNC","confidence":80,"reasoning":"Outage drill"})
+        intent=create_intent(self.db,self.user_id,{"symbol":"RELIANCE","exchange":"NSE","transaction_type":"BUY","quantity":1,"order_type":"LIMIT","limit_price":2990,"product":"CNC","confidence":80,"reasoning":"Outage drill","quote_timestamp":now_iso()})
         approve_intent(self.db,self.user_id,intent["id"])
         self.db.execute("CREATE TABLE system_promotion_ledger(singleton INTEGER PRIMARY KEY,live_eligible INTEGER NOT NULL)")
         self.db.execute("INSERT INTO system_promotion_ledger VALUES(1,1)"); self.db.commit()
@@ -471,14 +488,14 @@ class NiveshSystemTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT status FROM order_intents WHERE id=?",(intent["id"],)).fetchone()[0],"APPROVED")
 
     def test_live_eligible_fuse_blocks_submission_independently(self):
-        intent=create_intent(self.db,self.user_id,{"symbol":"RELIANCE","exchange":"NSE","transaction_type":"BUY","quantity":1,"order_type":"LIMIT","limit_price":2990,"product":"CNC","confidence":80,"reasoning":"Fuse test"})
+        intent=create_intent(self.db,self.user_id,{"symbol":"RELIANCE","exchange":"NSE","transaction_type":"BUY","quantity":1,"order_type":"LIMIT","limit_price":2990,"product":"CNC","confidence":80,"reasoning":"Fuse test","quote_timestamp":now_iso()})
         approve_intent(self.db,self.user_id,intent["id"])
         with patch("backend.execution.LIVE_TRADING_ENABLED",True), patch("backend.execution.LIVE_ELIGIBLE",False):
             with self.assertRaisesRegex(ValueError,"LIVE_ELIGIBLE"):
                 submit_intent(self.db,self.user_id,intent["id"])
 
     def test_database_promotion_ledger_fails_closed(self):
-        intent=create_intent(self.db,self.user_id,{"symbol":"RELIANCE","exchange":"NSE","transaction_type":"BUY","quantity":1,"order_type":"LIMIT","limit_price":2990,"product":"CNC","confidence":80,"reasoning":"Ledger test"})
+        intent=create_intent(self.db,self.user_id,{"symbol":"RELIANCE","exchange":"NSE","transaction_type":"BUY","quantity":1,"order_type":"LIMIT","limit_price":2990,"product":"CNC","confidence":80,"reasoning":"Ledger test","quote_timestamp":now_iso()})
         approve_intent(self.db,self.user_id,intent["id"])
         self.db.execute("CREATE TABLE system_promotion_ledger(singleton INTEGER PRIMARY KEY,live_eligible INTEGER NOT NULL)")
         self.db.execute("INSERT INTO system_promotion_ledger VALUES(1,0)"); self.db.commit()

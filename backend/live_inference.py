@@ -40,8 +40,12 @@ from .strategies import (
 )
 
 
+from .market import is_synthetic_market_data_allowed
+from .market_data_feed import validate_market_data_for_entry
+
+
 LIVE_BAR_SOURCES = ("zerodha_kite", "kite_gap_backfill", "upstox_v3", "upstox_rest_5m", "upstox_rest_intraday", "gap_repair_finalizer")
-DEFAULT_TRADE_BAR_SOURCES = "zerodha_kite,upstox_v3,upstox_rest_intraday,upstox_rest_5m,upstox_rest_history,gap_repair_finalizer,official_exchange_bhavcopy,yahoo_sample,kite_gap_backfill"
+DEFAULT_TRADE_BAR_SOURCES = "zerodha_kite,upstox_v3,upstox_rest_intraday,upstox_rest_5m,upstox_rest_history,gap_repair_finalizer,kite_gap_backfill"
 TRADE_BAR_SOURCES = tuple(
     item.strip() for item in os.getenv("NIVESH_SHADOW_TRADE_BAR_SOURCES", DEFAULT_TRADE_BAR_SOURCES).split(",") if item.strip()
 )
@@ -462,9 +466,9 @@ class LivePaperInference:
         with self.engine.connect() as connection:
             row=connection.execute(text("""
                 SELECT i.id instrument_id,COALESCE(i.instrument_token,k.provider_token) instrument_token,
-                    i.lot_size,i.instrument_type,i.expiry,i.strike,b.close_price
+                    i.lot_size,i.instrument_type,i.expiry,i.strike,b.close_price,b.source,b.bar_time
                 FROM instrument_master i JOIN LATERAL(
-                    SELECT close_price FROM live_market_bars WHERE instrument_id=i.id AND interval='5minute'
+                    SELECT close_price, source, bar_time FROM live_market_bars WHERE instrument_id=i.id AND interval='5minute'
                       AND bar_time<=:watermark AND bar_time>:watermark-INTERVAL '10 minutes'
                       AND source = ANY(:trade_sources) ORDER BY bar_time DESC LIMIT 1
                 ) b ON TRUE
@@ -483,7 +487,8 @@ class LivePaperInference:
                     return {"instrument_token":row["instrument_token"],"instrument_id":row["instrument_id"],"side":item.get("option_side","BUY"),
                             "price":price,"lot_size":int(row["lot_size"] or 100),"kind":row["instrument_type"],
                             "option_strike":strike_val,
-                            "expiry":str(row["expiry"]) if row.get("expiry") else None,"dte_days":dte_days}
+                            "expiry":str(row["expiry"]) if row.get("expiry") else None,"dte_days":dte_days,
+                            "source": row["source"], "observed_at": row["bar_time"]}
                 return None
             # Real option instrument lookup without live completed bars requirement
             opt_sym = OPTION_UNDERLYING_ALIASES.get(str(item["symbol"]).upper(), str(item["symbol"]).upper())
@@ -518,6 +523,8 @@ class LivePaperInference:
                         "option_strike": strike_val,
                         "expiry": str(opt_row["expiry"]) if opt_row.get("expiry") else None,
                         "dte_days": dte_days,
+                        "source": greeks.get("source", "analytical_black_scholes"),
+                        "observed_at": greeks.get("observed_at"),
                         "greeks": greeks
                     }
                 except Exception:
@@ -877,12 +884,16 @@ class LivePaperInference:
         if item.get("instrument_type") == "EQ" and Decimal(str(item["session"]["close"])) < Decimal("100"):
             return None
         direction=option_direction if option_direction is not None else item["signal"]
+        eq_source = item.get("source") or (item.get("session") or {}).get("source")
+        eq_observed_at = (item.get("session") or {}).get("timestamp")
         if direction>0:
             return {"instrument_token":item["instrument_token"],"instrument_id":item["instrument_id"],"side":"BUY",
-                    "price":Decimal(str(item["session"]["close"])),"lot_size":1,"kind":"EQ","fallback_from_option":requested_option}
+                    "price":Decimal(str(item["session"]["close"])),"lot_size":1,"kind":"EQ","fallback_from_option":requested_option,
+                    "source": eq_source, "observed_at": eq_observed_at}
         if direction<0 and self.intraday_short_fallback:
             return {"instrument_token":item["instrument_token"],"instrument_id":item["instrument_id"],"side":"SELL",
-                    "price":Decimal(str(item["session"]["close"])),"lot_size":1,"kind":"EQ_INTRADAY_SHORT","fallback_from_option":requested_option}
+                    "price":Decimal(str(item["session"]["close"])),"lot_size":1,"kind":"EQ_INTRADAY_SHORT","fallback_from_option":requested_option,
+                    "source": eq_source, "observed_at": eq_observed_at}
         return None
 
     def _close_due(self,watermark: datetime) -> int:
@@ -3643,6 +3654,18 @@ class LivePaperInference:
                     rejected += 1
                     continue
 
+            is_valid_entry_quote, entry_quote_err = validate_market_data_for_entry(
+                price=target.get("price"),
+                observed_at=target.get("observed_at"),
+                source=target.get("source"),
+                max_age_seconds=float(os.getenv("NIVESH_PRICE_MAX_AGE_SECONDS", "30.0")),
+                allow_synthetic=is_synthetic_market_data_allowed(),
+            )
+            if not is_valid_entry_quote:
+                logger.warning("Rejected trade entry for %s due to unreliable market data: %s", item.get("symbol"), entry_quote_err)
+                rejected += 1
+                continue
+
             result=record_shadow_signal(self.engine,self.redis,model["version"],int(target["instrument_token"]),target["side"],quantity,
                                         item["probability"],target["price"],item["session"]["timestamp"],
                                         strategy_note=json.dumps({"strategy":strategy_name,
@@ -3822,6 +3845,20 @@ class LivePaperInference:
                     sentiment,adaptive,consistency,option_grade
                 )
                 risk_levels=self._risk_levels_for_target(item,target)
+                # F-02: Option entries must validate strictly against the option contract's own source and timestamp
+                option_source = target.get("source") or (target.get("greeks", {}).get("source") if target.get("greeks") else None)
+                option_observed = target.get("observed_at")
+                is_valid_entry_quote, entry_quote_err = validate_market_data_for_entry(
+                    price=target.get("price"),
+                    observed_at=option_observed,
+                    source=option_source,
+                    max_age_seconds=float(os.getenv("NIVESH_PRICE_MAX_AGE_SECONDS", "30.0")),
+                    allow_synthetic=is_synthetic_market_data_allowed(),
+                )
+                if not is_valid_entry_quote:
+                    logger.warning("Rejected option entry for %s due to unreliable option market data: %s", item.get("symbol"), entry_quote_err)
+                    rejected += 1
+                    continue
                 result=record_shadow_signal(self.engine,self.redis,model["version"],int(target["instrument_token"]),target["side"],quantity,
                                             item["probability"],target["price"],item["session"]["timestamp"],
                                             strategy_note=json.dumps({"strategy":item.get("chart_gate",{}).get("strategy"),
@@ -3936,17 +3973,27 @@ class LivePaperInference:
                                         ).mappings().one_or_none()
 
                                     if other_inst and other_inst.get("instrument_token"):
-                                        mark = conn.execute(text("""
-                                            SELECT close_price FROM live_market_bars
+                                        mark_row = conn.execute(text("""
+                                            SELECT close_price, source, bar_time FROM live_market_bars
                                             WHERE instrument_id = :id AND interval IN ('1minute', '5minute')
                                               AND source = ANY(:src) AND bar_time <= :wm
                                               AND bar_time > :wm - INTERVAL '15 minutes'
                                             ORDER BY bar_time DESC LIMIT 1
-                                        """), {"id": other_inst["id"], "src": list(TRADE_BAR_SOURCES), "wm": source_watermark}).scalar_one_or_none()
-                                        if mark is None or float(mark) <= 0:
+                                        """), {"id": other_inst["id"], "src": list(TRADE_BAR_SOURCES), "wm": source_watermark}).mappings().one_or_none()
+                                        if not mark_row or mark_row["close_price"] is None or float(mark_row["close_price"]) <= 0:
                                             logger.info("No live mark for hedge leg %s %s strike=%s; skipping", sym_clean, other_otype, other_leg.get("strike"))
                                             continue
-                                        other_price = Decimal(str(mark))
+                                        other_price = Decimal(str(mark_row["close_price"]))
+                                        is_valid_hedge_quote, hedge_quote_err = validate_market_data_for_entry(
+                                            price=other_price,
+                                            observed_at=mark_row.get("bar_time"),
+                                            source=mark_row.get("source"),
+                                            max_age_seconds=float(os.getenv("NIVESH_PRICE_MAX_AGE_SECONDS", "30.0")),
+                                            allow_synthetic=is_synthetic_market_data_allowed(),
+                                        )
+                                        if not is_valid_hedge_quote:
+                                            logger.warning("Rejected hedge leg entry for %s due to unreliable market data: %s", sym_clean, hedge_quote_err)
+                                            continue
                                         other_qty = int(other_inst["lot_size"] or target["lot_size"])
                                         rec = record_shadow_signal(
                                             self.engine, self.redis, model["version"],
