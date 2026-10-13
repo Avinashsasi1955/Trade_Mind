@@ -3,6 +3,20 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_test_password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -11,4 +25,19 @@ jobs:
       - run: pip install -r requirements.txt pytest
       - run: python -m compileall backend scripts tests
       - run: python scripts/sync_trading_calendar.py
-      - run: PYTHONPATH=. pytest tests/ -v
+      - name: Provision isolated test database
+        env:
+          PGPASSWORD: postgres_test_password
+        run: |
+          python scripts/manage_test_database.py --action setup --target-db nivesh_test --host 127.0.0.1 --port 5432 --user postgres --confirm-setup nivesh_test
+      - name: Verify test database status
+        env:
+          PGPASSWORD: postgres_test_password
+        run: |
+          python scripts/manage_test_database.py --action status --target-db nivesh_test --host 127.0.0.1 --port 5432 --user postgres
+      - name: Run test suite with PostgreSQL integration
+        env:
+          RUN_POSTGRES: "1"
+          POSTGRES_TEST_DATABASE_URL: "postgresql://postgres:postgres_test_password@127.0.0.1:5432/nivesh_test"
+          PGPASSWORD: postgres_test_password
+        run: PYTHONPATH=. pytest tests/ -v
