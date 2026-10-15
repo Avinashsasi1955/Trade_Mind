@@ -7,6 +7,7 @@ from typing import Dict
 from sqlalchemy import text
 
 from backend.intelligence_memory import publish_brain_event
+from backend.shadow_sessions import count_promotion_eligible_sessions
 from backend.transaction_costs import estimate_zerodha_costs
 
 
@@ -312,7 +313,7 @@ def record_contract_note_reconciliation(engine,broker_order_id:str,actual_fees:D
 
 def evaluate_promotion(engine,starting_capital:Decimal=Decimal("1000000")) -> Dict:
     with engine.begin() as connection:
-        completed=int(connection.execute(text("SELECT COUNT(*) FROM forward_shadow_sessions WHERE status='COMPLETE'")).scalar_one())
+        completed = count_promotion_eligible_sessions(connection)
         model=connection.execute(text("SELECT metrics FROM model_versions WHERE status='active' ORDER BY id DESC LIMIT 1")).scalar_one_or_none() or {}
         if isinstance(model,str): model=json.loads(model)
         log_loss=float(model.get("holdout",{}).get("log_loss",999))

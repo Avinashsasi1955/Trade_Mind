@@ -8,12 +8,13 @@ This lets an Upstox read-only shadow day earn validation credit without pretendi
 that optional production dependencies such as broker OI reconciliation are ready.
 """
 import json
+import math
 import os
 import subprocess
 from decimal import Decimal
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import inspect, text
@@ -378,6 +379,136 @@ def evaluate_session(engine,session_date: date = None) -> Dict:
             "orders_allowed":False,"evaluated_at":datetime.now(IST).isoformat()}
 
 
+def is_promotion_eligible_session(session: Any) -> bool:
+    """Determine whether a forward shadow session constitutes valid promotion evidence.
+
+    A session counts toward the 90-session promotion target IF AND ONLY IF:
+    1. Status is strictly 'COMPLETE'.
+    2. Rejection reasons list is empty (no failed validation checks).
+    3. Metrics dictionary is present and contains valid repair-evidence.
+       Missing metrics, missing ratios/denominators, or malformed counts fail closed.
+    4. REST-repair ratio for 1-minute and 5-minute bars does not exceed
+       the configured policy threshold (default 10%, NIVESH_MAX_REPAIR_RATIO).
+       Row-stored values cannot loosen or override this threshold.
+    5. live_eligible is NOT required (avoids circular dependency since live_eligible
+       in system_promotion_ledger requires reaching the promotion threshold first,
+       and forward_shadow_sessions enforces CHECK(NOT live_eligible)).
+    """
+    if not session:
+        return False
+    if hasattr(session, "_mapping"):
+        row = dict(session._mapping)
+    elif hasattr(session, "items"):
+        row = dict(session)
+    else:
+        return False
+
+    if row.get("status") != "COMPLETE":
+        return False
+
+    reasons = row.get("rejection_reasons")
+    if isinstance(reasons, str):
+        try:
+            reasons = json.loads(reasons)
+        except Exception:
+            return False  # Malformed rejection_reasons fails closed
+    elif not isinstance(reasons, list):
+        if reasons is not None:
+            return False  # Unexpected type fails closed
+        reasons = []
+    if reasons and len(reasons) > 0:
+        return False
+
+    metrics = row.get("metrics")
+    if isinstance(metrics, str):
+        try:
+            metrics = json.loads(metrics)
+        except Exception:
+            return False  # Malformed JSON metrics fails closed
+    elif not isinstance(metrics, dict):
+        return False  # Missing or non-dict metrics fails closed
+
+    if not metrics:
+        return False  # Empty metrics fails closed (cannot prove evidence quality)
+
+    # Strictly policy-governed: row-provided values cannot loosen this threshold
+    max_repair_ratio = float(os.getenv("NIVESH_MAX_REPAIR_RATIO", "0.10"))
+
+    # Check 1-minute repair ratio
+    if "repair_ratio_1m" in metrics and metrics["repair_ratio_1m"] is not None:
+        try:
+            ratio_1m = float(metrics["repair_ratio_1m"])
+        except (ValueError, TypeError):
+            return False
+        if ratio_1m < 0.0 or ratio_1m > 1.0 or math.isnan(ratio_1m):
+            return False
+    elif "all_one_minute_buckets" in metrics and "one_minute_buckets" in metrics:
+        try:
+            all_1m = int(metrics["all_one_minute_buckets"])
+            live_1m = int(metrics["one_minute_buckets"])
+        except (ValueError, TypeError):
+            return False
+        # Exact evaluate_session semantics: all_1m is denominator; cannot be 0, negative, or < live_1m
+        if all_1m <= 0 or live_1m < 0 or live_1m > all_1m:
+            return False
+        ratio_1m = (all_1m - live_1m) / all_1m
+    else:
+        # Missing repair evidence entirely fails closed
+        return False
+
+    if ratio_1m > max_repair_ratio:
+        return False
+
+    # Check 5-minute repair ratio
+    if "repair_ratio_5m" in metrics and metrics["repair_ratio_5m"] is not None:
+        try:
+            ratio_5m = float(metrics["repair_ratio_5m"])
+        except (ValueError, TypeError):
+            return False
+        if ratio_5m < 0.0 or ratio_5m > 1.0 or math.isnan(ratio_5m):
+            return False
+    elif "all_five_minute_buckets" in metrics and "five_minute_buckets" in metrics:
+        try:
+            all_5m = int(metrics["all_five_minute_buckets"])
+            live_5m = int(metrics["five_minute_buckets"])
+        except (ValueError, TypeError):
+            return False
+        if all_5m <= 0 or live_5m < 0 or live_5m > all_5m:
+            return False
+        ratio_5m = (all_5m - live_5m) / all_5m
+    else:
+        # Missing 5m repair evidence fails closed
+        return False
+
+    if ratio_5m > max_repair_ratio:
+        return False
+
+    return True
+
+
+def count_promotion_eligible_sessions(engine_or_conn) -> int:
+    """Count the number of forward shadow sessions meeting promotion evidence criteria.
+
+    A session is only counted if it passes is_promotion_eligible_session.
+    `status = 'COMPLETE'` alone is never sufficient.
+    Fails closed if evidence rows cannot be retrieved. Never falls back to raw counts.
+    """
+    query = text(
+        "SELECT session_date, status, live_eligible, rejection_reasons, metrics "
+        "FROM forward_shadow_sessions WHERE status='COMPLETE'"
+    )
+    if hasattr(engine_or_conn, "execute"):
+        result = engine_or_conn.execute(query)
+    elif hasattr(engine_or_conn, "connect"):
+        with engine_or_conn.connect() as conn:
+            result = conn.execute(query)
+    else:
+        raise ValueError("engine_or_conn must be an Engine or Connection")
+
+    rows = result.mappings().all()
+    return sum(1 for row in rows if is_promotion_eligible_session(dict(row)))
+
+
 def open_session(engine,session_date: date = None) -> Dict:
     day=session_date or datetime.now(IST).date()
     today=datetime.now(IST).date()
@@ -390,7 +521,7 @@ def open_session(engine,session_date: date = None) -> Dict:
             VALUES(:day,'STARTED',CURRENT_TIMESTAMP,FALSE,FALSE)
             ON CONFLICT(session_date) DO UPDATE
             SET status = CASE WHEN forward_shadow_sessions.status != 'COMPLETE' THEN 'STARTED' ELSE forward_shadow_sessions.status END"""),{"day":day})
-        completed=connection.execute(text("SELECT COUNT(*) FROM forward_shadow_sessions WHERE status='COMPLETE'")).scalar_one()
+        completed=count_promotion_eligible_sessions(connection)
     return {"session_date":day.isoformat(),"status":"STARTED","completed_sessions":int(completed),"target":90,"orders_allowed":False}
 
 
@@ -586,7 +717,7 @@ def finalize_session(engine, session_date: date = None, force: bool = False) -> 
              "paper_net_pnl":Decimal(str(pnl["net_marked_pnl"])),"paper_closed_trades":pnl["closed_trades"],
              "paper_open_trades":pnl["open_trades"],"paper_rejected_trades":pnl["rejected_trades"],
              "paper_win_rate_pct":Decimal(str(pnl["win_rate_pct"])),"paper_profit_factor":Decimal(str(pnl["profit_factor"]))})
-        completed=connection.execute(text("SELECT COUNT(*) FROM forward_shadow_sessions WHERE status='COMPLETE'")).scalar_one()
+        completed=count_promotion_eligible_sessions(connection)
     try:
         _persist_daily_log(engine,evaluation,int(completed),int(completed))
     except Exception as exc:
@@ -606,15 +737,36 @@ def materialize_session(engine, session_date: date, status_override: str = None)
     today_dt = datetime.now(IST)
     is_post_market = (today_dt.hour > 15) or (today_dt.hour == 15 and today_dt.minute >= 35)
     evaluation = evaluate_session(engine, day)
-    reasons = evaluation["rejection_reasons"]
-    if day == today_dt.date() and not is_post_market and not status_override:
+    validation_reasons = list(evaluation.get("rejection_reasons") or [])
+    is_valid_evidence = not validation_reasons and bool(evaluation.get("eligible"))
+
+    if day == today_dt.date() and not is_post_market and (status_override is None or status_override.upper() == "STARTED"):
         status = "STARTED"
+    elif not is_valid_evidence:
+        status = "REJECTED"
+        if status_override and status_override.upper() == "COMPLETE":
+            evaluation["warnings"] = list(evaluation.get("warnings") or []) + [
+                f"Administrative override '{status_override}' rejected: session failed validation checks ({'; '.join(validation_reasons)})"
+            ]
     else:
-        status = (status_override or ("REJECTED" if reasons else "COMPLETE")).upper()
+        status = (status_override or "COMPLETE").upper()
+
     if status not in {"STARTED", "COMPLETE", "REJECTED"}:
         raise ValueError("status_override must be STARTED, COMPLETE, or REJECTED")
-    metrics = evaluation["metrics"]
+
+    reasons = validation_reasons
+    evaluation["rejection_reasons"] = reasons
+    evaluation["eligible"] = (status == "COMPLETE" and is_valid_evidence)
+    evaluation["status"] = status
+
+    metrics = dict(evaluation["metrics"])
     metrics["warnings"] = evaluation["warnings"]
+    metrics["one_minute_bars"] = (int(metrics.get("one_minute_bars") or 0) + int(metrics.get("repaired_one_minute_bars") or 0))
+    metrics["five_minute_bars"] = (int(metrics.get("five_minute_bars") or 0) + int(metrics.get("repaired_five_minute_bars") or 0))
+    metrics["instruments_seen"] = max(int(metrics.get("instruments_seen") or 0), int(metrics.get("repaired_instruments") or 0), int(metrics.get("all_instruments_seen") or 0))
+    if status_override:
+        metrics["admin_status_override"] = status_override.upper()
+    evaluation["metrics"] = metrics
     pnl = evaluation["paper_pnl"]
     with engine.begin() as connection:
         connection.execute(text("""INSERT INTO forward_shadow_sessions(session_date,status,started_at,completed_at,one_minute_bars,five_minute_bars,
@@ -635,7 +787,7 @@ def materialize_session(engine, session_date: date, status_override: str = None)
              "paper_net_pnl":Decimal(str(pnl["net_marked_pnl"])),"paper_closed_trades":pnl["closed_trades"],
              "paper_open_trades":pnl["open_trades"],"paper_rejected_trades":pnl["rejected_trades"],
              "paper_win_rate_pct":Decimal(str(pnl["win_rate_pct"])),"paper_profit_factor":Decimal(str(pnl["profit_factor"]))})
-        completed=connection.execute(text("SELECT COUNT(*) FROM forward_shadow_sessions WHERE status='COMPLETE'")).scalar_one()
+        completed=count_promotion_eligible_sessions(connection)
     try:
         _persist_daily_log(engine,evaluation,int(completed),int(completed))
     except Exception as exc:
@@ -762,11 +914,15 @@ def status(engine) -> Dict:
     with engine.connect() as connection:
         counts = connection.execute(text("SELECT status,COUNT(*) count FROM forward_shadow_sessions GROUP BY status")).fetchall()
         recent = connection.execute(text("SELECT * FROM forward_shadow_sessions ORDER BY session_date DESC LIMIT 10")).mappings().all()
+        completed = count_promotion_eligible_sessions(connection)
     values = {row[0]: int(row[1]) for row in counts}
-    completed = values.get("COMPLETE", 0)
+    values["COMPLETE"] = completed
     today = evaluate_session(engine)
     today_iso = str(today.get("session_date"))
-    already_counted = any(str(row["session_date"]) == today_iso and row["status"] == "COMPLETE" for row in recent)
+    already_counted = any(
+        str(row["session_date"]) == today_iso and is_promotion_eligible_session(dict(row))
+        for row in recent
+    )
     effective_completed = completed + (1 if today["eligible"] and not already_counted else 0)
 
     # Enrich recent list so that today's session displays live counts
