@@ -277,7 +277,12 @@ class UpstoxRestBackfill:
                     report["inserted_day"] += self.save_bars(instrument.instrument_id, "day", daily, REST_HISTORY_SOURCE, replace=replace)
                     time.sleep(self.sleep_seconds)
                 if mode in {"intraday", "both"}:
-                    one_minute = self.fetch_history(instrument.provider_key, "1minute", target_date, target_date) if target_date else self.fetch_intraday(instrument.provider_key, "1minute")
+                    if target_date:
+                        fetch_to = target_date + timedelta(days=2)
+                        raw_candles = self.fetch_history(instrument.provider_key, "1minute", target_date, fetch_to)
+                        one_minute = [c for c in raw_candles if c["bar_time"].astimezone(IST).date() == target_date]
+                    else:
+                        one_minute = self.fetch_intraday(instrument.provider_key, "1minute")
                     report["inserted_1minute"] += self.save_bars(instrument.instrument_id, "1minute", one_minute, REST_INTRADAY_SOURCE, replace=replace)
                     five_minute = aggregate_5minute(one_minute)
                     report["inserted_5minute"] += self.save_bars(instrument.instrument_id, "5minute", five_minute, REST_5M_SOURCE, replace=replace)

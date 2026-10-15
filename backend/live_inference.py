@@ -2358,7 +2358,7 @@ class LivePaperInference:
                     WHERE symbol = :symbol 
                       AND observed_at >= :wm_start
                       AND observed_at <= :wm_end
-                      AND (accepted = TRUE OR accepted = 1)
+                      AND (accepted = TRUE)
                       AND (instrument_id = :instrument_id OR instrument_id IS NULL)
                       AND (model_version = :model_version OR model_version IS NULL)
                 """), {
