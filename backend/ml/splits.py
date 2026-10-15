@@ -12,32 +12,74 @@ import numpy as np
 
 
 class PurgedGroupTimeSeriesSplit:
-    """Chronological walk-forward / purged K-fold split grouped by trading day with purge and embargo buffers."""
+    """Chronological walk-forward / purged split grouped by trading day with purge and embargo buffers.
+
+    Trading-strategy evaluation must use future-only expanding-window walk-forward splits.
+    Non-chronological modes (such as 'kfold' or future-inclusive folds) are restricted to explicit
+    research-only evaluations and rejected by the standard trading-evaluation pipeline.
+    """
 
     def __init__(
         self,
         n_splits: int = 5,
-        purge_days: int = 5,
-        embargo_days: int = 2,
-        max_label_horizon_days: int = 1,
+        purge_days: Optional[int] = None,
+        embargo_days: Optional[int] = None,
+        max_label_horizon_days: Optional[int] = None,
+        max_holding_period_days: Optional[int] = None,
         cv_mode: str = "expanding",
         min_train_days: Optional[int] = None,
+        allow_non_chronological: bool = False,
     ) -> None:
         if n_splits < 1:
             raise ValueError(f"n_splits must be at least 1, got {n_splits}")
-        if purge_days < 0:
-            raise ValueError(f"purge_days must be non-negative, got {purge_days}")
-        if embargo_days < 0:
-            raise ValueError(f"embargo_days must be non-negative, got {embargo_days}")
-        if max_label_horizon_days < 1:
+
+        # Check CV mode
+        cv_mode_clean = str(cv_mode).lower().strip()
+        if cv_mode_clean not in {"expanding", "walk_forward"}:
+            if not allow_non_chronological:
+                raise ValueError(
+                    f"Trading-strategy evaluation requires future-only expanding-window splits (got cv_mode='{cv_mode}'). "
+                    "Non-chronological or future-inclusive modes are prohibited for trading evaluation unless "
+                    "allow_non_chronological=True is explicitly set for non-trading research."
+                )
+        self.cv_mode = cv_mode_clean
+        self.allow_non_chronological = bool(allow_non_chronological)
+
+        # Validate horizons if given
+        if max_label_horizon_days is not None and int(max_label_horizon_days) < 1:
             raise ValueError(f"max_label_horizon_days must be at least 1, got {max_label_horizon_days}")
+        if max_holding_period_days is not None and int(max_holding_period_days) < 1:
+            raise ValueError(f"max_holding_period_days must be at least 1, got {max_holding_period_days}")
+
+        # Derive purge buffer dynamically
+        horizon = max(
+            int(max_label_horizon_days) if max_label_horizon_days is not None else 0,
+            int(max_holding_period_days) if max_holding_period_days is not None else 0,
+        )
+        if purge_days is None and horizon == 0:
+            raise ValueError(
+                "Purge buffer cannot be determined: requires at least one of max_label_horizon_days, "
+                "max_holding_period_days, or explicit purge_days."
+            )
+        if purge_days is not None and int(purge_days) < 0:
+            raise ValueError(f"purge_days must be non-negative, got {purge_days}")
+
+        if purge_days is None:
+            self.purge_days = horizon
+        else:
+            self.purge_days = max(int(purge_days), horizon)
+
+        # Derive embargo buffer dynamically if not provided
+        if embargo_days is not None:
+            if int(embargo_days) < 0:
+                raise ValueError(f"embargo_days must be non-negative, got {embargo_days}")
+            self.embargo_days = int(embargo_days)
+        else:
+            self.embargo_days = max(1, int(math.ceil(horizon * 0.5))) if horizon > 0 else 2
 
         self.n_splits = int(n_splits)
-        # Purge must be at least the maximum label horizon in trading days
-        self.purge_days = max(int(purge_days), int(max_label_horizon_days))
-        self.max_label_horizon_days = int(max_label_horizon_days)
-        self.embargo_days = int(embargo_days)
-        self.cv_mode = str(cv_mode).lower()  # "expanding" or "kfold"
+        self.max_label_horizon_days = int(max_label_horizon_days) if max_label_horizon_days is not None else None
+        self.max_holding_period_days = int(max_holding_period_days) if max_holding_period_days is not None else None
         self.min_train_days = min_train_days
 
     def get_n_splits(self, X: Any = None, y: Any = None, groups: Any = None) -> int:
@@ -57,7 +99,7 @@ class PurgedGroupTimeSeriesSplit:
             groups: Required trading day identifiers (e.g. date strings 'YYYY-MM-DD').
 
         Raises:
-            ValueError: If groups is missing, or insufficient distinct trading days exist.
+            ValueError: If groups is missing, contains invalid elements, or insufficient distinct trading days exist.
         """
         if groups is None:
             raise ValueError("PurgedGroupTimeSeriesSplit requires groups (trading days) to prevent intraday data leakage.")
@@ -65,6 +107,11 @@ class PurgedGroupTimeSeriesSplit:
         n_samples = len(X)
         if len(groups) != n_samples:
             raise ValueError(f"Length of groups ({len(groups)}) must match length of X ({n_samples})")
+
+        # Validate that groups do not contain None, whitespace or malformed values
+        for g in groups:
+            if g is None or (isinstance(g, str) and not g.strip()):
+                raise ValueError("Invalid trading day group: groups cannot contain empty, whitespace, or None values.")
 
         # Map each trading day to its sample indices in chronological order
         groups_arr = np.asarray(groups)
@@ -82,7 +129,12 @@ class PurgedGroupTimeSeriesSplit:
         day_to_indices = {day: np.where(groups_arr == day)[0] for day in unique_days}
 
         if self.cv_mode == "kfold":
-            # Purged K-Fold CV with post-test embargo
+            if not self.allow_non_chronological:
+                raise ValueError(
+                    "cv_mode='kfold' contains non-chronological future training folds and cannot be used "
+                    "without allow_non_chronological=True."
+                )
+            # Purged K-Fold CV with post-test embargo (strictly research-only)
             fold_size = max(1, n_days // self.n_splits)
             for fold in range(self.n_splits):
                 test_start_idx = fold * fold_size
@@ -105,12 +157,13 @@ class PurgedGroupTimeSeriesSplit:
                 test_idx = np.concatenate([day_to_indices[d] for d in test_days])
                 yield train_idx, test_idx
         else:
-            # Expanding walk-forward mode with purge before test and embargo spacing
+            # Strictly expanding walk-forward mode with purge before test and embargo spacing
             min_train = self.min_train_days or max(self.purge_days + 1, int(n_days * 0.40))
             remaining_days = n_days - min_train
             test_fold_size = max(1, remaining_days // self.n_splits)
 
             cursor = min_train
+            prev_train_count = 0
             for fold in range(self.n_splits):
                 test_start_idx = cursor
                 test_end_idx = min(n_days, test_start_idx + test_fold_size if fold < self.n_splits - 1 else n_days)
@@ -131,8 +184,23 @@ class PurgedGroupTimeSeriesSplit:
                         f"Fold {fold}: purge window ({self.purge_days} days) eliminated all training days."
                     )
 
+                # Future-only guarantee: every train day must precede every test day
+                if train_days[-1] >= test_days[0]:
+                    raise ValueError(
+                        f"Leakage violation in fold {fold}: latest training day {train_days[-1]} "
+                        f"is not strictly before test start {test_days[0]}."
+                    )
+
                 train_idx = np.concatenate([day_to_indices[d] for d in train_days])
                 test_idx = np.concatenate([day_to_indices[d] for d in test_days])
+
+                # Monotonic expansion check: training window must grow or remain equal
+                if len(train_days) < prev_train_count:
+                    raise ValueError(
+                        f"Monotonic expansion violation in fold {fold}: "
+                        f"train days ({len(train_days)}) decreased from previous fold ({prev_train_count})."
+                    )
+                prev_train_count = len(train_days)
 
                 yield train_idx, test_idx
 
@@ -214,36 +282,55 @@ def evaluate_split_folds(
     Strict error propagation: no silent failure or swallowed exceptions.
     """
     from sklearn.linear_model import LogisticRegression, Ridge
+    from sklearn.preprocessing import StandardScaler
+
+    if splitter.cv_mode != "expanding" and not splitter.allow_non_chronological:
+        raise ValueError(
+            f"Trading evaluation requires expanding chronological walk-forward splits. "
+            f"Got cv_mode='{splitter.cv_mode}' without allow_non_chronological=True."
+        )
 
     folds_metrics: List[Dict[str, Any]] = []
 
     for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(X, groups=groups)):
         # Extract features
         X_train, X_test = X[train_idx], X[test_idx]
-        train_days = list(set(np.asarray(groups)[train_idx]))
+        train_days = sorted(list(set(np.asarray(groups)[train_idx])))
         test_days = sorted(list(set(np.asarray(groups)[test_idx])))
+
+        # Verify strict chronological separation: latest train day must be strictly before earliest test day
+        if train_days[-1] >= test_days[0]:
+            raise ValueError(
+                f"Data leakage detected in fold {fold_idx}: "
+                f"latest training day ({train_days[-1]}) is not before earliest test day ({test_days[0]})."
+            )
+
+        # Fit feature transformations strictly on training partition only
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
 
         # 1. Model for y_long (Long setup classifier)
         y_train_long, y_test_long = y_long[train_idx], y_long[test_idx]
         clf_long = LogisticRegression(max_iter=200, solver="lbfgs")
-        clf_long.fit(X_train, y_train_long)
-        pred_long = clf_long.predict(X_test)
-        prob_long = clf_long.predict_proba(X_test)[:, 1] if hasattr(clf_long, "predict_proba") else None
+        clf_long.fit(X_train_scaled, y_train_long)
+        pred_long = clf_long.predict(X_test_scaled)
+        prob_long = clf_long.predict_proba(X_test_scaled)[:, 1] if hasattr(clf_long, "predict_proba") else None
         metrics_long = compute_classification_metrics(y_test_long, pred_long, prob_long)
 
         # 2. Model for y_short (Short setup classifier)
         y_train_short, y_test_short = y_short[train_idx], y_short[test_idx]
         clf_short = LogisticRegression(max_iter=200, solver="lbfgs")
-        clf_short.fit(X_train, y_train_short)
-        pred_short = clf_short.predict(X_test)
-        prob_short = clf_short.predict_proba(X_test)[:, 1] if hasattr(clf_short, "predict_proba") else None
+        clf_short.fit(X_train_scaled, y_train_short)
+        pred_short = clf_short.predict(X_test_scaled)
+        prob_short = clf_short.predict_proba(X_test_scaled)[:, 1] if hasattr(clf_short, "predict_proba") else None
         metrics_short = compute_classification_metrics(y_test_short, pred_short, prob_short)
 
         # 3. Model for r_net (Continuous realized R regression)
         r_train, r_test = r_net[train_idx], r_net[test_idx]
         reg_r = Ridge(alpha=1.0)
-        reg_r.fit(X_train, r_train)
-        pred_r = reg_r.predict(X_test)
+        reg_r.fit(X_train_scaled, r_train)
+        pred_r = reg_r.predict(X_test_scaled)
         metrics_r = compute_regression_metrics(r_test, pred_r)
 
         fold_report = {
@@ -252,10 +339,13 @@ def evaluate_split_folds(
             "test_days_count": len(test_days),
             "train_samples": len(train_idx),
             "test_samples": len(test_idx),
+            "train_date_start": train_days[0],
+            "train_date_end": train_days[-1],
             "test_date_start": test_days[0],
             "test_date_end": test_days[-1],
             "purge_days": splitter.purge_days,
             "embargo_days": splitter.embargo_days,
+            "preprocessing": "StandardScaler fitted on X_train only",
             "metrics_y_long": metrics_long,
             "metrics_y_short": metrics_short,
             "metrics_r_net": metrics_r,

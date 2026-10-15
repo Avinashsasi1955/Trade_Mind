@@ -12,9 +12,9 @@ import logging
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
 
-from .backtesting import run_backtest, STRATEGIES
+from .backtesting import run_backtest, STRATEGIES, InsufficientHistoryError
 from .market import BASE_MARKET, INDICES
-from .trade_memory import extract_candidate_vector, get_golden_trade_library, DEFAULT_GOLDEN_PATTERNS
+from .trade_memory import extract_candidate_vector, get_golden_trade_library
 
 logger = logging.getLogger("nivesh.backtest_miner")
 
@@ -86,11 +86,23 @@ def mine_golden_patterns_from_backtests(
     min_profit_pct: float = 1.5,
     min_rr: float = 2.0,
     strategy: str = "breakout",
-    horizon_years: int = 1
+    horizon_years: int = 1,
+    opt_in_research_memory: bool = False,
+    research_destination: Optional[List[Dict]] = None,
+    allow_simulated: bool = False,
 ) -> Dict:
-    """Run consecutive expanding multi-year backtests over symbols, extract winning trade footprints,
-    and convert them into Golden Vector Patterns for the live memory library.
+    """Run consecutive expanding multi-year backtests over symbols and extract winning trade footprints.
+
+    Research memory storage is strictly opt-in and requires an explicit research destination.
+    Under NO circumstances writes to live inference memory or DEFAULT_GOLDEN_PATTERNS.
     """
+    if opt_in_research_memory:
+        if research_destination is None or not isinstance(research_destination, list):
+            raise ValueError(
+                "Explicit research_destination list is required when opt_in_research_memory is enabled; "
+                "live memory fallback is strictly prohibited."
+            )
+
     if not symbols:
         symbols = list(DEFAULT_MINING_UNIVERSE[:12])
 
@@ -99,7 +111,13 @@ def mine_golden_patterns_from_backtests(
 
     for symbol in symbols:
         try:
-            result = run_backtest(symbol=symbol, strategy=strategy, horizon_years=horizon_years)
+            result = run_backtest(
+                symbol=symbol,
+                strategy=strategy,
+                horizon_years=horizon_years,
+                allow_simulated=allow_simulated,
+                opt_in_research_memory=False,
+            )
             out_sample = result.get("out_of_sample") or {}
             timeframe_env = result.get("timeframe_envelope") or {
                 "horizon": f"{horizon_years}-Year Horizon",
@@ -178,23 +196,24 @@ def mine_golden_patterns_from_backtests(
                 "win_rate": float(out_sample.get("win_rate") or 50.0),
                 "net_pnl": float(out_sample.get("net_pnl") or 0.0),
                 "patterns_extracted": patterns_for_symbol,
-                "status": "Synced to Vector Memory",
+                "status": "Stored to Research Sink" if (opt_in_research_memory and isinstance(research_destination, list)) else "Evaluated (No Memory Ingestion)",
                 "mined_at": datetime.now(timezone.utc).isoformat()
             })
+        except InsufficientHistoryError as ihe:
+            logger.warning(f"Skipping {symbol} in backtest mining due to insufficient genuine history: {ihe}")
+            continue
         except Exception as exc:
             logger.warning(f"Error mining backtest for {symbol}: {exc}")
+            continue
 
-    for pat in mined_patterns:
-        if not any(existing.get("pattern_name") == pat["pattern_name"] for existing in DEFAULT_GOLDEN_PATTERNS):
-            DEFAULT_GOLDEN_PATTERNS.append(pat)
+    if opt_in_research_memory and isinstance(research_destination, list):
+        for pat in mined_patterns:
+            research_destination.append(pat)
 
-    try:
-        from .trade_memory import save_golden_patterns_to_disk
-        save_golden_patterns_to_disk()
-    except Exception:
-        pass
-
-    logger.info(f"Mined {len(mined_patterns)} high-profit patterns across {len(symbols)} symbols ({horizon_years}Y).")
+    logger.info(
+        f"Mined {len(mined_patterns)} patterns across {len(symbols)} symbols ({horizon_years}Y). "
+        f"Research memory enabled: {opt_in_research_memory}."
+    )
     return {
         "status": "success",
         "horizon_years": horizon_years,
@@ -202,6 +221,11 @@ def mine_golden_patterns_from_backtests(
         "total_trades_evaluated": total_evaluated_trades,
         "mined_patterns_count": len(mined_patterns),
         "patterns": mined_patterns,
+        "research_memory": {
+            "enabled": bool(opt_in_research_memory),
+            "destination": type(research_destination).__name__ if research_destination is not None else None,
+            "patterns_stored": len(mined_patterns) if (opt_in_research_memory and isinstance(research_destination, list)) else 0,
+        },
         "active_library_size": len(get_golden_trade_library()),
         "journal_entries_count": len(MINING_JOURNAL_LOGS)
     }

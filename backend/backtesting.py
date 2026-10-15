@@ -10,7 +10,7 @@ import random
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean, pstdev
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 from .config import ROOT
 from .market import BASE_MARKET, INDICES
@@ -20,6 +20,29 @@ from .security_master import resolve_security
 
 HISTORY_DIR = ROOT / "data" / "historical"
 STRATEGIES = {"ensemble", "momentum", "mean_reversion", "breakout"}
+
+
+class InsufficientHistoryError(ValueError):
+    """Raised when genuine historical data is missing or below required observations."""
+
+    def __init__(
+        self,
+        symbol: str,
+        timeframe: str = "day",
+        available: int = 0,
+        required: int = 80,
+        message: Optional[str] = None,
+    ):
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.available = available
+        self.required = required
+        msg = (
+            message
+            or f"Insufficient genuine historical data for {symbol} ({timeframe}): "
+            f"available={available}, required={required}."
+        )
+        super().__init__(msg)
 
 
 def _sma(values: List[float], period: int) -> float:
@@ -68,22 +91,46 @@ def _simulated_history(symbol: str, sessions: int = 300) -> List[Dict]:
     return bars[-sessions:]
 
 
-def load_history(symbol: str, sessions: int = 300) -> Dict:
+def load_history(symbol: str, sessions: int = 300, allow_simulated: bool = False, min_bars: int = 80) -> Dict:
     clean_sym = symbol.upper().replace(".NS", "").strip()
     security = resolve_security(clean_sym)
     if security:
         stored = HistoryStore().candles(security["symbol"], security["exchange"], "day", 5000)
-        if len(stored) >= 80:
+        if len(stored) >= min_bars:
             bars = [{"date": item["timestamp"][:10], "open": item["open"], "high": item["high"], "low": item["low"], "close": item["close"], "volume": item["volume"]} for item in stored]
-            return {"symbol": security["symbol"], "source": "Zerodha Kite historical warehouse", "data_mode": "historical", "candles": bars[-sessions:]}
+            return {
+                "symbol": security["symbol"],
+                "source": "Zerodha Kite historical warehouse",
+                "data_mode": "historical",
+                "provenance": "genuine_market_data (Zerodha Kite historical warehouse)",
+                "candles": bars[-sessions:]
+            }
     target = HISTORY_DIR / f"{clean_sym}.json"
     if target.is_file():
         payload = json.loads(target.read_text())
         bars = payload.get("candles", payload if isinstance(payload, list) else [])
         source = payload.get("source", "imported historical data") if isinstance(payload, dict) else "imported historical data"
-        if len(bars) >= 80:
-            return {"symbol": clean_sym, "source": source, "data_mode": "historical", "candles": bars[-sessions:]}
-    return {"symbol": clean_sym, "source": "deterministic multi-year engine", "data_mode": "simulated", "candles": _simulated_history(clean_sym, sessions=sessions)}
+        if len(bars) >= min_bars:
+            return {
+                "symbol": clean_sym,
+                "source": source,
+                "data_mode": "historical",
+                "provenance": f"genuine_market_data ({source})",
+                "candles": bars[-sessions:]
+            }
+
+    # Strict fail-closed policy: reject missing or sparse data without synthetic price substitution
+    if not allow_simulated:
+        avail = len(stored) if (security and 'stored' in locals()) else (len(bars) if 'bars' in locals() else 0)
+        raise InsufficientHistoryError(symbol=clean_sym, timeframe="day", available=avail, required=min_bars)
+
+    return {
+        "symbol": clean_sym,
+        "source": "synthetic_test_fixture",
+        "data_mode": "synthetic_fixture",
+        "provenance": "SYNTHETIC TEST FIXTURE ONLY - NOT MARKET DATA",
+        "candles": _simulated_history(clean_sym, sessions=sessions)
+    }
 
 
 def _signal(bars: List[Dict], index: int, strategy: str) -> int:
@@ -151,12 +198,26 @@ def _segment(bars: List[Dict], strategy: str, capital: float, start_index: int,
             "recent_trades": list(reversed(trades[-10:]))}
 
 
-def run_backtest(symbol: str = "RELIANCE", strategy: str = "ensemble",
-                 capital: float = 1_000_000, start: str = "", end: str = "",
-                 horizon_years: int = 1) -> Dict:
+def run_backtest(
+    symbol: str = "RELIANCE",
+    strategy: str = "ensemble",
+    capital: float = 1_000_000,
+    start: str = "",
+    end: str = "",
+    horizon_years: int = 1,
+    allow_simulated: bool = False,
+    research_memory_sink: Optional[List[Dict]] = None,
+    opt_in_research_memory: bool = False,
+) -> Dict:
+    if opt_in_research_memory and research_memory_sink is None:
+        raise ValueError(
+            "Research memory opt-in requires an explicit research_memory_sink destination; "
+            "fallback to live memory is prohibited."
+        )
+
     strategy = strategy if strategy in STRATEGIES else "ensemble"
     sessions_req = 600 if int(horizon_years) >= 2 else 300
-    history = load_history(symbol, sessions=sessions_req)
+    history = load_history(symbol, sessions=sessions_req, allow_simulated=allow_simulated)
     bars = history["candles"]
     if start:
         bars = [bar for bar in bars if bar["date"] >= start]
@@ -179,34 +240,36 @@ def run_backtest(symbol: str = "RELIANCE", strategy: str = "ensemble",
         "holdout_sessions": len(bars) - split,
         "mined_at": datetime.now(timezone.utc).isoformat()
     }
-    # Auto-ingest winning backtest setups into Vector Memory Bank
-    try:
-        from .trade_memory import extract_candidate_vector, DEFAULT_GOLDEN_PATTERNS
-        for trade in out_sample.get("recent_trades", []):
-            ret_pct = float(trade.get("return_pct") or 0.0)
-            pnl = float(trade.get("pnl") or 0.0)
-            if ret_pct >= 1.5 and pnl > 0:
-                is_long = trade.get("side") in {"BUY", "LONG"}
-                side_str = "BUY" if is_long else "SELL"
-                rsi_val = round(65.0 + (ret_pct * 1.5), 1) if is_long else round(35.0 - (ret_pct * 1.5), 1)
-                cand = {
-                    "symbol": history["symbol"],
-                    "action": side_str,
-                    "side": side_str,
-                    "price": trade.get("entry", 1000.0),
-                    "price_change": ret_pct,
-                    "volume_ratio": 2.2,
-                    "confidence": 85.0,
-                    "risk_reward": max(2.0, round(ret_pct / 0.8, 2)),
-                    "rsi": rsi_val,
-                    "sector_flow_score": 0.90,
-                    "quality_score": 82.0
-                }
-                features = extract_candidate_vector(cand)
-                pat_name = f"Backtest Lab {strategy.upper()} {history['symbol']} (+{ret_pct:.1f}%) [{horizon_years}Y]"
-                if not any(p.get("pattern_name") == pat_name for p in DEFAULT_GOLDEN_PATTERNS):
-                    DEFAULT_GOLDEN_PATTERNS.append({
-                        "id": f"lab_{history['symbol']}_{trade.get('signal_date', '')}_{horizon_years}y",
+
+    # Isolated research-memory capture (strictly opt-in; never modifies live vector memory)
+    captured_patterns = 0
+    if opt_in_research_memory and isinstance(research_memory_sink, list):
+        try:
+            from .trade_memory import extract_candidate_vector
+            for trade in out_sample.get("recent_trades", []):
+                ret_pct = float(trade.get("return_pct") or 0.0)
+                pnl = float(trade.get("pnl") or 0.0)
+                if ret_pct >= 1.5 and pnl > 0:
+                    is_long = trade.get("side") in {"BUY", "LONG"}
+                    side_str = "BUY" if is_long else "SELL"
+                    rsi_val = round(65.0 + (ret_pct * 1.5), 1) if is_long else round(35.0 - (ret_pct * 1.5), 1)
+                    cand = {
+                        "symbol": history["symbol"],
+                        "action": side_str,
+                        "side": side_str,
+                        "price": trade.get("entry", 1000.0),
+                        "price_change": ret_pct,
+                        "volume_ratio": 2.2,
+                        "confidence": 85.0,
+                        "risk_reward": max(2.0, round(ret_pct / 0.8, 2)),
+                        "rsi": rsi_val,
+                        "sector_flow_score": 0.90,
+                        "quality_score": 82.0
+                    }
+                    features = extract_candidate_vector(cand)
+                    pat_name = f"Research {strategy.upper()} {history['symbol']} (+{ret_pct:.1f}%) [{horizon_years}Y]"
+                    pat = {
+                        "id": f"res_{history['symbol']}_{trade.get('signal_date', '')}_{horizon_years}y",
                         "pattern_name": pat_name,
                         "symbol": history["symbol"],
                         "side": side_str,
@@ -214,33 +277,48 @@ def run_backtest(symbol: str = "RELIANCE", strategy: str = "ensemble",
                         "win_pnl": round(pnl, 2),
                         "rr_achieved": max(2.0, round(ret_pct / 0.8, 2)),
                         "holding_time": "1-2 Sessions",
-                        "conditions": {
-                            "strategy": f"Backtest Lab {strategy.title()}",
-                            "rsi": rsi_val,
-                            "volume_mult": "2.20×",
-                            "vwap_dist": f"{ret_pct * 0.4:+.2f}%",
-                            "ema_slope": f"{ret_pct * 0.6:+.2f}%",
-                            "sector_flow": "INFLOW (+1.25%)" if is_long else "OUTFLOW (-0.85%)",
-                            "atr_band": "1.50%",
-                            "option_selection": f"ATM {'CE' if is_long else 'PE'} (Delta {0.52 if is_long else -0.48})"
-                        },
                         "timeframe_envelope": timeframe_env,
                         "features": features,
                         "target_rr": max(2.0, round(ret_pct / 0.8, 2)),
-                        "notes": f"Auto-stored from Backtest Lab {horizon_years}Y ({trade.get('signal_date', '')} -> {trade.get('trade_date', '')})",
+                        "notes": f"Captured to isolated research sink ({timeframe_env.get('horizon')})",
                         "mined_at": datetime.now(timezone.utc).isoformat(),
-                        "source": f"Backtest Lab {horizon_years}Y"
-                    })
-    except Exception:
-        pass
+                        "source": "Research Sink Only"
+                    }
+                    research_memory_sink.append(pat)
+                    captured_patterns += 1
+        except Exception:
+            pass
 
     verdict = "promising" if out_sample["return_pct"] > 0 and out_sample["profit_factor"] and out_sample["profit_factor"] > 1.15 else "weak"
-    return {"symbol": history["symbol"], "strategy": strategy, "source": history["source"],
-            "data_mode": history["data_mode"], "period": {"start": bars[0]["date"], "end": bars[-1]["date"], "sessions": len(bars)},
-            "timeframe_envelope": timeframe_env,
-            "methodology": {"train_test_split": "70 / 30 chronological", "execution": "signal at close, trade next open-to-close",
-                            "costs_bps_per_trade": 12, "position_allocation_pct": 20, "look_ahead_protection": True},
-            "in_sample": in_sample, "out_of_sample": out_sample,
-            "benchmark_return_pct": round(benchmark, 2), "verdict": verdict,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "warning": "Historical performance is not a guarantee of future returns. This is paper-trading research, not investment advice."}
+    warning_text = (
+        "SYNTHETIC TEST FIXTURE ONLY - NOT HISTORICAL PERFORMANCE"
+        if history["data_mode"] == "synthetic_fixture"
+        else "Historical performance is not a guarantee of future returns. This is paper-trading research, not investment advice."
+    )
+    return {
+        "symbol": history["symbol"],
+        "strategy": strategy,
+        "source": history["source"],
+        "data_mode": history["data_mode"],
+        "provenance": history.get("provenance", history["source"]),
+        "period": {"start": bars[0]["date"], "end": bars[-1]["date"], "sessions": len(bars)},
+        "timeframe_envelope": timeframe_env,
+        "methodology": {
+            "train_test_split": "70 / 30 chronological",
+            "execution": "signal at close, trade next open-to-close",
+            "costs_bps_per_trade": 12,
+            "position_allocation_pct": 20,
+            "look_ahead_protection": True
+        },
+        "in_sample": in_sample,
+        "out_of_sample": out_sample,
+        "benchmark_return_pct": round(benchmark, 2),
+        "verdict": verdict,
+        "research_memory": {
+            "enabled": bool(opt_in_research_memory),
+            "destination": type(research_memory_sink).__name__ if research_memory_sink is not None else None,
+            "patterns_captured": captured_patterns,
+        },
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "warning": warning_text
+    }
