@@ -5,13 +5,13 @@ import os
 import hashlib
 import secrets
 from decimal import Decimal
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 from sqlalchemy import create_engine, text
 
 from .agent import TradingAgent
-from .broker import PaperBroker
+from .broker import PaperBroker, DEFAULT_SHORT_MARGIN_RATIO
 from .config import DATABASE_URL, DEFAULT_CAPITAL, FINNHUB_WEBHOOK_SECRET, FINNHUB_WEBHOOK_URL, NEWS_PROVIDER
 from .database import now_iso
 from .market import INDICES, market_snapshot, price_map
@@ -124,7 +124,7 @@ def _float(value) -> float:
     return float(value or 0)
 
 
-def portfolio_summary(db: sqlite3.Connection, user_id: int) -> Dict:
+def portfolio_summary(db: sqlite3.Connection, user_id: int, margin_ratio: float = DEFAULT_SHORT_MARGIN_RATIO) -> Dict:
     portfolio = db.execute("SELECT * FROM portfolios WHERE user_id=?", (user_id,)).fetchone()
     starting = float(portfolio["starting_capital"]) if portfolio else DEFAULT_CAPITAL
     if getattr(db, "is_postgres", False):
@@ -154,16 +154,36 @@ def portfolio_summary(db: sqlite3.Connection, user_id: int) -> Dict:
             pass
     prices = _prices()
     holdings = db.execute("SELECT * FROM holdings WHERE user_id=? ORDER BY symbol", (user_id,)).fetchall()
-    invested = sum(item["quantity"] * item["average_price"] for item in holdings)
-    holdings_value = sum(item["quantity"] * prices.get(item["symbol"], item["average_price"]) for item in holdings)
-    current_value = portfolio["cash"] + holdings_value
+    long_holdings = [item for item in holdings if item["quantity"] > 0]
+    short_holdings = [item for item in holdings if item["quantity"] < 0]
+
+    invested_longs = sum(item["quantity"] * item["average_price"] for item in long_holdings)
+    long_value = sum(item["quantity"] * prices.get(item["symbol"], item["average_price"]) for item in long_holdings)
+
+    # Margin blocked for shorts (configurable collateral, defaulting to DEFAULT_SHORT_MARGIN_RATIO)
+    short_margin_blocked = sum(abs(item["quantity"]) * item["average_price"] * margin_ratio for item in short_holdings)
+    unrealised_short_pnl = sum(
+        (item["average_price"] - prices.get(item["symbol"], item["average_price"])) * abs(item["quantity"])
+        for item in short_holdings
+    )
+
+    # Total Portfolio Equity = Cash + Long Holdings Value + Short Unrealized P&L (TARGET_ARCHITECTURE.md §3.2)
+    current_value = portfolio["cash"] + long_value + unrealised_short_pnl
     total_pnl = current_value - portfolio["starting_capital"]
-    today_pnl = sum(item["quantity"] * (prices.get(item["symbol"], item["average_price"]) - item["average_price"]) for item in holdings)
+    today_long_pnl = sum(
+        item["quantity"] * (prices.get(item["symbol"], item["average_price"]) - item["average_price"])
+        for item in long_holdings
+    )
+    today_pnl = today_long_pnl + unrealised_short_pnl
+    invested = invested_longs + short_margin_blocked
+    available_funds = max(0.0, portfolio["cash"] - short_margin_blocked + min(0.0, unrealised_short_pnl))
+
     return {
         "starting_capital": round(portfolio["starting_capital"], 2), "cash": round(portfolio["cash"], 2),
         "invested": round(invested, 2), "current_value": round(current_value, 2),
         "total_pnl": round(total_pnl, 2), "total_pnl_pct": round(total_pnl / portfolio["starting_capital"] * 100, 2),
         "today_pnl": round(today_pnl, 2), "today_pnl_pct": round(today_pnl / portfolio["starting_capital"] * 100, 2),
+        "available_funds": round(available_funds, 2), "margin_locked": round(short_margin_blocked, 2),
     }
 
 
