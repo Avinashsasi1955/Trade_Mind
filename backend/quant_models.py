@@ -225,7 +225,7 @@ def _load_recent_bars(database_url: str, limit: int) -> List[Dict]:
                         FROM live_market_bars b
                         JOIN instrument_master i ON i.id=b.instrument_id
                         WHERE b.interval IN ('1second','1minute','5minute','day')
-                          AND b.source IN ('upstox_v3','upstox_rest_intraday','upstox_rest_5m','upstox_rest_history','upstox_rest_1s_proxy','zerodha_kite','kite_gap_backfill')
+                          AND b.source IN ('upstox_v3','upstox_rest_intraday','upstox_rest_5m','upstox_rest_history','zerodha_kite','kite_gap_backfill')
                           AND i.instrument_type IN ('EQ','INDEX')
                           AND (i.exchange='NSE' OR i.instrument_type='INDEX')
                           AND b.bar_time >= CURRENT_TIMESTAMP - INTERVAL '10 days'

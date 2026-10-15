@@ -13,7 +13,7 @@ from .security_master import resolve_security
 
 
 TIMEFRAMES = {"1s": 1, "1m": 60, "5m": 300, "15m": 900, "1H": 3600, "1D": 86400}
-LIVE_SOURCES = ("upstox_v3", "upstox_rest_intraday", "upstox_rest_5m", "zerodha_kite", "kite_gap_backfill")
+LIVE_SOURCES = ("upstox_v3", "upstox_rest_intraday", "upstox_rest_5m", "upstox_rest_1s_proxy", "zerodha_kite", "kite_gap_backfill")
 
 
 def _redis_client():
@@ -308,6 +308,57 @@ def _trade_markers(connection, security: Dict, candles: List[Dict]) -> List[Dict
     return markers
 
 
+def determine_chart_provenance(candles: List[Dict], timeframe: str, used_partial: bool = False) -> Dict:
+    sources = sorted({str(item.get("source") or "unknown") for item in candles}) if candles else []
+    has_live = any(source in {"upstox_v3", "zerodha_kite", "live_forming"} for source in sources)
+    has_rest = any(source in {"upstox_rest_intraday", "upstox_rest_5m", "kite_gap_backfill"} for source in sources)
+    has_synthetic_proxy = any(source in {"upstox_rest_1s_proxy"} for source in sources)
+
+    if timeframe == "1s":
+        if has_live and not has_synthetic_proxy:
+            data_mode = "provider_live_1second_microstructure"
+        elif has_live and has_synthetic_proxy:
+            data_mode = "mixed_live_and_proxy_1second"
+        elif has_synthetic_proxy:
+            data_mode = "synthetic_1second_rest_proxy"
+        else:
+            data_mode = "provider_stored_1second"
+    elif used_partial:
+        data_mode = "provider_live_forming_candle"
+    elif has_live and not has_rest:
+        data_mode = "provider_live_completed_bars"
+    elif has_live and has_rest:
+        data_mode = "mixed_live_and_rest_completed_bars"
+    elif has_rest:
+        data_mode = "provider_rest_completed_bars"
+    elif has_synthetic_proxy:
+        data_mode = "synthetic_proxy_completed_bars"
+    else:
+        data_mode = "provider_stored_completed_bars"
+
+    primary_source_type = (
+        "synthetic_proxy" if (has_synthetic_proxy and not has_live)
+        else "live_stream" if has_live
+        else "rest_repair" if has_rest
+        else "stored_provider"
+    )
+
+    latest_source = candles[-1].get("source") or "unknown" if candles else "unknown"
+    source_summary = {
+        "sources": sources,
+        "has_live_stream": has_live,
+        "has_rest_repair": has_rest,
+        "has_synthetic_proxy": has_synthetic_proxy,
+        "primary_source_type": primary_source_type,
+    }
+    return {
+        "sources": sources,
+        "source_summary": source_summary,
+        "data_mode": data_mode,
+        "latest_source": latest_source,
+    }
+
+
 def _live_chart(security: Dict, timeframe: str) -> Dict:
     if not DATABASE_URL:
         return {}
@@ -376,9 +427,7 @@ def _live_chart(security: Dict, timeframe: str) -> Dict:
             markers = _trade_markers(connection, security, candles)
     finally:
         engine.dispose()
-    sources = sorted({str(item.get("source") or "unknown") for item in candles})
-    has_live = any(source in {"upstox_v3", "zerodha_kite", "live_forming"} for source in sources)
-    has_rest = any(source in {"upstox_rest_intraday", "upstox_rest_5m", "kite_gap_backfill"} for source in sources)
+    provenance = determine_chart_provenance(candles, timeframe, used_partial=used_partial)
     change = candles[-1]["close"] - candles[-2]["close"]
     return {"symbol": security["symbol"], "name": security["name"], "exchange": security["exchange"], "timeframe": timeframe,
             "price": candles[-1]["close"], "change": round(change, 2),
@@ -387,10 +436,9 @@ def _live_chart(security: Dict, timeframe: str) -> Dict:
             "candle_analysis": _candle_analysis(candles),
             "structure_signal": _structure_signal(candles),
             "markers": markers,
-            "latest_source": candles[-1].get("source") or "unknown",
-            "source_summary": {"sources": sources, "has_live_stream": has_live, "has_rest_repair": has_rest},
-            "data_mode": ("provider_live_1second_microstructure" if timeframe == "1s" and not used_partial
-                          else "provider_live_forming_candle" if used_partial else "provider_live_completed_bars"),
+            "latest_source": provenance["latest_source"],
+            "source_summary": provenance["source_summary"],
+            "data_mode": provenance["data_mode"],
             "updated_at": datetime.now(timezone.utc).isoformat()}
 
 
