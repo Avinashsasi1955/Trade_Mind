@@ -17,10 +17,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
-if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
-    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON)] + sys.argv)
-
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -200,4 +196,7 @@ def run_smoke_test() -> int:
 
 
 if __name__ == "__main__":
+    venv_python = REPO_ROOT / ".venv" / "bin" / "python"
+    if venv_python.exists() and Path(sys.executable).resolve() != venv_python.resolve():
+        os.execv(str(venv_python), [str(venv_python)] + sys.argv)
     sys.exit(run_smoke_test())

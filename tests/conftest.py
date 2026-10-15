@@ -15,7 +15,13 @@ CRITICAL NETWORK AND SECURITY LIMITATIONS:
   database target is strictly rejected.
 """
 import os
+import sys
+from pathlib import Path
 import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.manage_test_database import validate_postgres_test_url
 
