@@ -509,6 +509,24 @@ def count_promotion_eligible_sessions(engine_or_conn) -> int:
     return sum(1 for row in rows if is_promotion_eligible_session(dict(row)))
 
 
+def count_raw_completed_sessions(engine_or_conn) -> int:
+    """Count the total number of sessions recorded with status 'COMPLETE'.
+
+    Does not filter on promotion evidence, repair ratios, or metric validity.
+    Does not count STARTED or REJECTED sessions.
+    """
+    query = text("SELECT COUNT(*) FROM forward_shadow_sessions WHERE status='COMPLETE'")
+    if hasattr(engine_or_conn, "connect"):
+        with engine_or_conn.connect() as conn:
+            val = conn.execute(query).scalar()
+            return int(val or 0)
+    elif hasattr(engine_or_conn, "execute"):
+        val = engine_or_conn.execute(query).scalar()
+        return int(val or 0)
+    else:
+        raise ValueError("engine_or_conn must be an Engine or Connection")
+
+
 def open_session(engine,session_date: date = None) -> Dict:
     day=session_date or datetime.now(IST).date()
     today=datetime.now(IST).date()
@@ -916,6 +934,10 @@ def status(engine) -> Dict:
         recent = connection.execute(text("SELECT * FROM forward_shadow_sessions ORDER BY session_date DESC LIMIT 10")).mappings().all()
         completed = count_promotion_eligible_sessions(connection)
     values = {row[0]: int(row[1]) for row in counts}
+    raw_completed = int(values.get("COMPLETE", 0))
+    ineligible_completed = max(0, raw_completed - completed)
+    values["COMPLETE_RAW"] = raw_completed
+    values["COMPLETE_ELIGIBLE"] = completed
     values["COMPLETE"] = completed
     today = evaluate_session(engine)
     today_iso = str(today.get("session_date"))
@@ -965,6 +987,8 @@ def status(engine) -> Dict:
                  {"session_date": today.get("session_date"), "error": str(exc)[:1000]})
     return {
         "completed_sessions": completed,
+        "raw_completed_sessions": raw_completed,
+        "ineligible_completed_sessions": ineligible_completed,
         "effective_completed_sessions": effective_completed,
         "remaining_sessions": max(0, TARGET_SESSIONS - effective_completed),
         "target": TARGET_SESSIONS,

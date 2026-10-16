@@ -21,6 +21,7 @@ from sqlalchemy import text
 from backend.shadow_sessions import (
     IST,
     count_promotion_eligible_sessions,
+    count_raw_completed_sessions,
     evaluate_session,
     finalize_session,
     is_promotion_eligible_session,
@@ -447,6 +448,9 @@ class TestShadowSessionValidation(unittest.TestCase):
         # Raw query for status='COMPLETE' yields 2 rows, but promotion evidence count must strictly be 1
         count = count_promotion_eligible_sessions(engine)
         self.assertEqual(count, 1)
+        # count_raw_completed_sessions accurately yields 2, excluding REJECTED
+        raw_count = count_raw_completed_sessions(engine)
+        self.assertEqual(raw_count, 2)
 
     def test_promotion_calculation_does_not_depend_circularly_on_live_eligible(self):
         """Regression test 5: Promotion counting does not circularly require live_eligible=TRUE to count valid evidence."""
@@ -665,6 +669,116 @@ class TestShadowSessionValidation(unittest.TestCase):
             },
         }
         self.assertFalse(is_promotion_eligible_session(excessive_repair_buckets))
+
+    def test_count_raw_completed_sessions_query(self):
+        """Verify count_raw_completed_sessions executes SELECT COUNT(*) for status='COMPLETE'."""
+        mock_conn = MagicMock()
+        mock_conn.execute.return_value.scalar.return_value = 25
+        self.mock_engine.connect.return_value.__enter__.return_value = mock_conn
+
+        res = count_raw_completed_sessions(self.mock_engine)
+        self.assertEqual(res, 25)
+        called_query = str(mock_conn.execute.call_args[0][0])
+        self.assertIn("status='COMPLETE'", called_query)
+        self.assertNotIn("STARTED", called_query)
+        self.assertNotIn("REJECTED", called_query)
+
+    def test_status_dynamic_session_counts_distinguishes_raw_and_eligible(self):
+        """Verify status() accurately reports raw_completed_sessions, completed_sessions (eligible),
+        and ineligible_completed_sessions dynamically without hardcoding.
+        """
+        post_market_time = datetime(self.today.year, self.today.month, self.today.day, 16, 0, 0, tzinfo=IST)
+        mock_eval = {
+            "session_date": self.today.isoformat(),
+            "eligible": False,
+            "rejection_reasons": ["waiting for post-market settlement"],
+            "warnings": [],
+            "metrics": {},
+            "paper_pnl": {},
+        }
+        mock_conn = MagicMock()
+        # 25 COMPLETE, 33 REJECTED, 1 STARTED
+        mock_conn.execute.return_value.fetchall.return_value = [
+            ("COMPLETE", 25),
+            ("REJECTED", 33),
+            ("STARTED", 1),
+        ]
+        # 21 eligible sessions out of 25 COMPLETE
+        eligible_rows = [
+            {
+                "session_date": (self.today - timedelta(days=i)).isoformat(),
+                "status": "COMPLETE",
+                "live_eligible": False,
+                "rejection_reasons": [],
+                "metrics": {
+                    "repair_ratio_1m": 0.05 if i <= 21 else 0.40,
+                    "repair_ratio_5m": 0.05 if i <= 21 else 0.40,
+                },
+            }
+            for i in range(1, 26)
+        ]
+        mock_conn.execute.return_value.mappings.return_value.all.return_value = eligible_rows
+        mock_conn.execute.return_value.mappings.return_value.one_or_none.return_value = {"status": "COMPLETE"}
+        self.mock_engine.connect.return_value.__enter__.return_value = mock_conn
+
+        with patch("backend.shadow_sessions.datetime") as mock_dt, \
+             patch("backend.shadow_sessions.evaluate_session", return_value=mock_eval), \
+             patch("backend.shadow_sessions.finalize_session"), \
+             patch("backend.shadow_sessions._persist_daily_log"):
+            mock_dt.now.return_value = post_market_time
+            mock_dt.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+
+            stat = status(self.mock_engine)
+
+            # Raw completed sessions: all 25 rows with status COMPLETE
+            self.assertEqual(stat["raw_completed_sessions"], 25)
+            # Promotion eligible: 21 rows meeting <= 10% repair threshold
+            self.assertEqual(stat["completed_sessions"], 21)
+            # Ineligible completed: raw minus eligible (4)
+            self.assertEqual(stat["ineligible_completed_sessions"], 4)
+            # STARTED (1) and REJECTED (33) are NOT counted in raw_completed_sessions
+            self.assertNotEqual(stat["raw_completed_sessions"], 25 + 33 + 1)
+            # effective_completed_sessions and remaining_sessions preserve strict eligibility semantics
+            self.assertEqual(stat["effective_completed_sessions"], 21)
+            self.assertEqual(stat["remaining_sessions"], 90 - 21)
+            # Check counts dictionary exposes both compatibility and raw fields
+            self.assertEqual(stat["counts"]["COMPLETE"], 21)
+            self.assertEqual(stat["counts"]["COMPLETE_RAW"], 25)
+            self.assertEqual(stat["counts"]["COMPLETE_ELIGIBLE"], 21)
+            self.assertEqual(stat["counts"]["REJECTED"], 33)
+            self.assertEqual(stat["counts"]["STARTED"], 1)
+
+    def test_status_zero_completed_sessions_handles_empty_db_gracefully(self):
+        """Verify status() handles empty session table without errors or negative counts."""
+        post_market_time = datetime(self.today.year, self.today.month, self.today.day, 16, 0, 0, tzinfo=IST)
+        mock_eval = {
+            "session_date": self.today.isoformat(),
+            "eligible": False,
+            "rejection_reasons": ["no data"],
+            "warnings": [],
+            "metrics": {},
+            "paper_pnl": {},
+        }
+        mock_conn = MagicMock()
+        mock_conn.execute.return_value.fetchall.return_value = []
+        mock_conn.execute.return_value.mappings.return_value.all.return_value = []
+        mock_conn.execute.return_value.mappings.return_value.one_or_none.return_value = None
+        self.mock_engine.connect.return_value.__enter__.return_value = mock_conn
+
+        with patch("backend.shadow_sessions.datetime") as mock_dt, \
+             patch("backend.shadow_sessions.evaluate_session", return_value=mock_eval), \
+             patch("backend.shadow_sessions.finalize_session"), \
+             patch("backend.shadow_sessions._persist_daily_log"):
+            mock_dt.now.return_value = post_market_time
+            mock_dt.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+
+            stat = status(self.mock_engine)
+
+            self.assertEqual(stat["raw_completed_sessions"], 0)
+            self.assertEqual(stat["completed_sessions"], 0)
+            self.assertEqual(stat["ineligible_completed_sessions"], 0)
+            self.assertEqual(stat["effective_completed_sessions"], 0)
+            self.assertEqual(stat["remaining_sessions"], 90)
 
 
 if __name__ == "__main__":

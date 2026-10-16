@@ -2286,6 +2286,16 @@ function renderShadowTracker(shadow){
     : Number(m.one_minute_buckets || 0) > 0
     ? 'Data-only session'
     : 'Failed / waiting';
+  const rawCompleted = shadow.raw_completed_sessions != null ? Number(shadow.raw_completed_sessions) : null;
+  const eligibleCompleted = shadow.completed_sessions != null ? Number(shadow.completed_sessions) : null;
+  const ineligibleCompleted = shadow.ineligible_completed_sessions != null
+    ? Number(shadow.ineligible_completed_sessions)
+    : (rawCompleted != null && eligibleCompleted != null ? Math.max(0, rawCompleted - eligibleCompleted) : null);
+  const completedTitle = rawCompleted != null ? 'Completed sessions' : 'Promotion eligible';
+  const completedMain = rawCompleted != null ? rawCompleted : (eligibleCompleted != null ? eligibleCompleted : '—');
+  const completedSubtitle = rawCompleted != null
+    ? `${eligibleCompleted != null ? eligibleCompleted : '—'} promotion eligible · ${ineligibleCompleted != null ? ineligibleCompleted : 0} ineligible`
+    : (eligibleCompleted != null ? 'qualifying sessions (≤10% repair)' : 'status unavailable');
   return `<section class="panel shadow-tracker">
     <div class="panel-head"><div><h3>Shadow validation tracker</h3><p>Formal live-paper promotion evidence · completed bars only for ML</p></div><span class="status-badge"><span></span>${shadow.effective_completed_sessions||0} / ${shadow.target||90}</span></div>
     <div class="shadow-verdict ${today.eligible?'pass':Number(m.predictions||0)>0?'partial':'wait'}">
@@ -2305,7 +2315,7 @@ function renderShadowTracker(shadow){
     <div class="shadow-session-head">
       <article><span>Today</span><strong class="${today.eligible?'up':'down'}">${escapeHtml((today.status||'WAITING').replace('_',' '))}</strong><small>${escapeHtml(today.session_date||'—')}</small></article>
       <article><span>Remaining</span><strong>${shadow.remaining_sessions}</strong><small>sessions to production review</small></article>
-      <article><span>Recorded complete</span><strong>${shadow.completed_sessions}</strong><small>finalized ledger rows</small></article>
+      <article title="${rawCompleted != null ? `${rawCompleted} recorded complete: ${eligibleCompleted != null ? eligibleCompleted : '—'} promotion eligible (≤10% repair), ${ineligibleCompleted != null ? ineligibleCompleted : 0} ineligible` : ''}"><span>${completedTitle}</span><strong>${completedMain}</strong><small>${completedSubtitle}</small></article>
     </div>
     <div class="shadow-gates">${check('1m buckets',m.one_minute_buckets,mins.one_minute_buckets)}${check('5m buckets',m.five_minute_buckets,mins.five_minute_buckets)}${check('Live instruments',m.instruments_seen,mins.instruments_seen)}${check('Predictions',m.predictions,mins.predictions)}${check('Paper trades',(Number(pnl.closed_trades||0)+Number(pnl.open_trades||0)),mins.paper_trades||1)}</div>
     <div class="shadow-pnl">
