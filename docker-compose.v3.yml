@@ -355,4 +355,8 @@ services:
 
 volumes:
   postgres_data:
+    external: true
+    name: design-a-modern-distinctive-ui-ux_postgres_data
   redis_data:
+    external: true
+    name: design-a-modern-distinctive-ui-ux_redis_data
