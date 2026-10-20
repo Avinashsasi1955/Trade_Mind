@@ -2,12 +2,14 @@ import os
 import struct
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from backend.kite_stream import KiteStream, parse_binary
 from backend.live_inference import LivePaperInference, build_causal_feature_vector
 from backend.live_stream_service import LiveStreamService
+from backend.market_data_feed import validate_market_data_for_entry
 from backend.ml_pipeline import FEATURES_V2
 from backend.ml.trading_policy import classify_regime, rank_candidates, score_candidate
 from backend.upstox_backfill import aggregate_5minute, parse_upstox_candles
@@ -170,6 +172,289 @@ class LivePaperPipelineTests(unittest.TestCase):
         self.assertIn("instrument_provider_keys",sql)
         self.assertIn("provider_key",sql)
         self.assertIn("UNIQUE(provider, provider_token)",sql)
+
+    def test_execution_target_uses_execution_mark_with_same_record_provenance_and_timestamp(self):
+        agent = LivePaperInference.__new__(LivePaperInference)
+        agent.option_paper_enabled = True
+        agent.intraday_short_fallback = True
+
+        now = datetime.now(timezone.utc)
+        item = {
+            "instrument_token": "12345",
+            "instrument_id": 1,
+            "instrument_type": "EQ",
+            "symbol": "TATASTEEL",
+            "signal": 1,
+            "session": {"close": 150.0, "timestamp": now - timedelta(minutes=5)},
+            "execution_mark": {
+                "price": Decimal("153.25"),
+                "source": "upstox_v3",
+                "observed_at": now - timedelta(seconds=2),
+            },
+        }
+        target = agent._execution_target(item, now)
+        self.assertIsNotNone(target)
+        self.assertEqual(target["price"], Decimal("153.25"))
+        self.assertEqual(target["source"], "upstox_v3")
+        self.assertEqual(target["observed_at"], item["execution_mark"]["observed_at"])
+
+        valid, err = validate_market_data_for_entry(
+            price=target["price"],
+            observed_at=target["observed_at"],
+            source=target["source"],
+            max_age_seconds=30.0,
+        )
+        self.assertTrue(valid, f"Expected valid quote, got: {err}")
+
+    def test_execution_target_never_falls_back_to_session_close_when_mark_missing(self):
+        agent = LivePaperInference.__new__(LivePaperInference)
+        agent.option_paper_enabled = True
+        agent.intraday_short_fallback = True
+        agent.engine = None
+
+        now = datetime.now(timezone.utc)
+        item = {
+            "instrument_token": "12345",
+            "instrument_id": 1,
+            "instrument_type": "EQ",
+            "symbol": "TATASTEEL",
+            "signal": 1,
+            "session": {"close": 150.0, "timestamp": now - timedelta(minutes=5)},
+        }
+        target = agent._execution_target(item, now)
+        self.assertIsNone(target, "Must never fall back to session close when execution mark is absent")
+
+    def test_option_target_resolves_freshest_mark_with_own_provenance_and_timestamp(self):
+        agent = LivePaperInference.__new__(LivePaperInference)
+        agent.engine = MagicMock()
+        agent.min_option_price = Decimal("5.0")
+        agent.max_option_price = Decimal("500.0")
+
+        now = datetime.now(timezone.utc)
+        mock_conn = MagicMock()
+        agent.engine.connect.return_value.__enter__.return_value = mock_conn
+
+        mock_row = {
+            "instrument_id": 42,
+            "instrument_token": 12345,
+            "lot_size": 25,
+            "instrument_type": "CE",
+            "expiry": (now + timedelta(days=5)).date(),
+            "strike": 24800.0,
+            "close_price": 120.0,
+            "source": "upstox_v3",
+            "bar_time": now - timedelta(seconds=20),
+            "observed_at": now - timedelta(seconds=3),
+        }
+        mock_conn.execute.return_value.mappings.return_value.one_or_none.return_value = mock_row
+
+        item = {
+            "symbol": "NIFTY",
+            "session": {"close": 24810.0, "timestamp": now - timedelta(minutes=5)},
+        }
+        target = agent._nearest_option_target(item, now, "CE")
+        self.assertIsNotNone(target)
+        self.assertEqual(target["price"], Decimal("120.0"))
+        self.assertEqual(target["source"], "upstox_v3")
+        self.assertEqual(target["observed_at"], mock_row["observed_at"])
+
+    def test_stale_option_fails_validation_even_with_fresh_underlying(self):
+        agent = LivePaperInference.__new__(LivePaperInference)
+        agent.engine = MagicMock()
+        agent.min_option_price = Decimal("5.0")
+        agent.max_option_price = Decimal("500.0")
+
+        now = datetime.now(timezone.utc)
+        mock_conn = MagicMock()
+        agent.engine.connect.return_value.__enter__.return_value = mock_conn
+
+        mock_row = {
+            "instrument_id": 42,
+            "instrument_token": 12345,
+            "lot_size": 25,
+            "instrument_type": "CE",
+            "expiry": (now + timedelta(days=5)).date(),
+            "strike": 24800.0,
+            "close_price": 120.0,
+            "source": "upstox_v3",
+            "bar_time": now - timedelta(minutes=5),
+            "observed_at": now - timedelta(seconds=50),
+        }
+        mock_conn.execute.return_value.mappings.return_value.one_or_none.return_value = mock_row
+
+        underlying_watermark = now - timedelta(seconds=1)
+        item = {
+            "symbol": "NIFTY",
+            "session": {"close": 24810.0, "timestamp": underlying_watermark},
+        }
+        target = agent._nearest_option_target(item, underlying_watermark, "CE")
+        self.assertIsNotNone(target)
+
+        valid, err = validate_market_data_for_entry(
+            price=target["price"],
+            observed_at=target["observed_at"],
+            source=target["source"],
+            max_age_seconds=30.0,
+        )
+        self.assertFalse(valid)
+        self.assertIn("PRICE_STALE", err)
+
+    def test_option_target_query_excludes_future_candle_beyond_watermark(self):
+        agent = LivePaperInference.__new__(LivePaperInference)
+        agent.engine = MagicMock()
+        agent.min_option_price = Decimal("5.0")
+        agent.max_option_price = Decimal("500.0")
+
+        mock_conn = MagicMock()
+        agent.engine.connect.return_value.__enter__.return_value = mock_conn
+
+        captured = []
+        def capture(query, params=None):
+            captured.append((str(query), params))
+            mock_res = MagicMock()
+            mock_res.mappings.return_value.one_or_none.return_value = None
+            return mock_res
+        mock_conn.execute.side_effect = capture
+
+        now = datetime(2026, 10, 19, 5, 20, 0, tzinfo=timezone.utc)
+        item = {"symbol": "NIFTY", "session": {"close": 24800.0}, "causal_watermark": now}
+        agent._nearest_option_target(item, now, "CE")
+
+        self.assertTrue(len(captured) >= 1)
+        sql, params = captured[0]
+        self.assertIn("<= :causal_boundary", sql)
+        self.assertIn("received_at", sql)
+        self.assertEqual(params["causal_boundary"], now)
+
+    def test_execution_target_query_excludes_future_candle_beyond_watermark(self):
+        agent = LivePaperInference.__new__(LivePaperInference)
+        agent.engine = MagicMock()
+        agent.option_paper_enabled = True
+        agent.intraday_short_fallback = True
+
+        mock_conn = MagicMock()
+        agent.engine.connect.return_value.__enter__.return_value = mock_conn
+
+        captured = []
+        def capture(query, params=None):
+            captured.append((str(query), params))
+            mock_res = MagicMock()
+            mock_res.mappings.return_value.one_or_none.return_value = None
+            return mock_res
+        mock_conn.execute.side_effect = capture
+
+        now = datetime(2026, 10, 19, 5, 20, 0, tzinfo=timezone.utc)
+        item = {
+            "instrument_id": 101,
+            "instrument_token": "TATASTEEL",
+            "instrument_type": "EQ",
+            "signal": 1,
+            "session": {"close": Decimal("150.0")},
+            "causal_watermark": now,
+        }
+        agent._execution_target(item, now)
+
+        self.assertTrue(len(captured) >= 1)
+        sql, params = captured[0]
+        self.assertIn("<= :causal_boundary", sql)
+        self.assertIn("received_at", sql)
+        self.assertEqual(params["causal_boundary"], now)
+
+    def test_multileg_hedge_target_query_enforces_causal_boundary(self):
+        import inspect
+        source = inspect.getsource(LivePaperInference.run)
+        self.assertIn("MARKET_BAR_AVAILABILITY_SQL", source)
+        self.assertIn("<= :causal_boundary", source)
+
+    def test_execution_target_rejects_missing_or_malformed_cached_timestamp(self):
+        """Verifies that missing, empty, or malformed observed_at in cached mark fails closed."""
+        agent = LivePaperInference.__new__(LivePaperInference)
+        agent.option_paper_enabled = True
+        agent.intraday_short_fallback = True
+        agent.engine = None  # No SQL fallback
+
+        now = datetime(2026, 10, 19, 9, 20, 0, tzinfo=timezone.utc)
+        for bad_ts in [None, "", "   ", "malformed-date", float("nan"), -100]:
+            item = {
+                "instrument_token": "12345",
+                "instrument_id": 1,
+                "instrument_type": "EQ",
+                "symbol": "TATASTEEL",
+                "signal": 1,
+                "session": {"close": Decimal("150.0")},
+                "execution_mark": {
+                    "price": Decimal("152.0"),
+                    "source": "upstox_v3",
+                    "observed_at": bad_ts,
+                },
+            }
+            target = agent._execution_target(item, now)
+            self.assertIsNone(target, f"Expected mark with observed_at={bad_ts!r} to fail closed (return None)")
+
+    def test_execution_target_normalizes_naive_and_ist_cached_timestamps(self):
+        """Verifies that naive UTC and IST timezone-aware cached marks are normalized to UTC and compared properly."""
+        from zoneinfo import ZoneInfo
+        agent = LivePaperInference.__new__(LivePaperInference)
+        agent.option_paper_enabled = True
+        agent.intraday_short_fallback = True
+        agent.engine = None
+
+        # Boundary at 09:20:00 UTC
+        boundary_utc = datetime(2026, 10, 19, 9, 20, 0, tzinfo=timezone.utc)
+
+        # 1. Naive datetime at 09:19:50 (before boundary) should pass and be normalized to UTC aware
+        item_naive = {
+            "instrument_token": "12345",
+            "instrument_id": 1,
+            "instrument_type": "EQ",
+            "symbol": "TATASTEEL",
+            "signal": 1,
+            "session": {"close": Decimal("150.0")},
+            "execution_mark": {
+                "price": Decimal("152.0"),
+                "source": "upstox_v3",
+                "observed_at": datetime(2026, 10, 19, 9, 19, 50),  # naive
+            },
+        }
+        target_naive = agent._execution_target(item_naive, boundary_utc)
+        self.assertIsNotNone(target_naive)
+        self.assertEqual(target_naive["observed_at"], datetime(2026, 10, 19, 9, 19, 50, tzinfo=timezone.utc))
+
+        # 2. IST datetime at 14:49:50 IST (= 09:19:50 UTC, before boundary) should pass and normalize to UTC
+        ist_zone = ZoneInfo("Asia/Kolkata")
+        item_ist = {
+            "instrument_token": "12345",
+            "instrument_id": 1,
+            "instrument_type": "EQ",
+            "symbol": "TATASTEEL",
+            "signal": 1,
+            "session": {"close": Decimal("150.0")},
+            "execution_mark": {
+                "price": Decimal("152.0"),
+                "source": "upstox_v3",
+                "observed_at": datetime(2026, 10, 19, 14, 49, 50, tzinfo=ist_zone),
+            },
+        }
+        target_ist = agent._execution_target(item_ist, boundary_utc)
+        self.assertIsNotNone(target_ist)
+        self.assertEqual(target_ist["observed_at"], datetime(2026, 10, 19, 9, 19, 50, tzinfo=timezone.utc))
+
+        # 3. Naive datetime at 09:20:01 (after boundary) should fail closed
+        item_naive_future = {
+            "instrument_token": "12345",
+            "instrument_id": 1,
+            "instrument_type": "EQ",
+            "symbol": "TATASTEEL",
+            "signal": 1,
+            "session": {"close": Decimal("150.0")},
+            "execution_mark": {
+                "price": Decimal("152.0"),
+                "source": "upstox_v3",
+                "observed_at": datetime(2026, 10, 19, 9, 20, 1),  # naive future
+            },
+        }
+        target_future = agent._execution_target(item_naive_future, boundary_utc)
+        self.assertIsNone(target_future)
 
 
 if __name__=="__main__": unittest.main()

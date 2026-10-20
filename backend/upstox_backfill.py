@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from sqlalchemy import create_engine, text
+from backend.market_data_feed import LIVE_STREAM_SOURCES
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -29,6 +30,7 @@ REST_HISTORY_SOURCE = "upstox_rest_history"
 REST_INTRADAY_SOURCE = "upstox_rest_intraday"
 REST_5M_SOURCE = "upstox_rest_5m"
 REST_1S_PROXY_SOURCE = "upstox_rest_1s_proxy"
+_LIVE_STREAM_SOURCES_SQL = ", ".join(f"'{s}'" for s in sorted(LIVE_STREAM_SOURCES))
 
 PRIORITY_SYMBOLS = (
     "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "SBIN", "LT", "ITC",
@@ -222,9 +224,14 @@ class UpstoxRestBackfill:
         rows = list(bars)
         if not rows:
             return 0
-        conflict = """DO UPDATE SET open_price=EXCLUDED.open_price,high_price=EXCLUDED.high_price,low_price=EXCLUDED.low_price,
+        conflict = (
+            f"""DO UPDATE SET open_price=EXCLUDED.open_price,high_price=EXCLUDED.high_price,low_price=EXCLUDED.low_price,
             close_price=EXCLUDED.close_price,volume=EXCLUDED.volume,open_interest=EXCLUDED.open_interest,source=EXCLUDED.source,
-            exchange_timestamp=EXCLUDED.exchange_timestamp,received_at=CURRENT_TIMESTAMP""" if replace else "DO NOTHING"
+            exchange_timestamp=EXCLUDED.exchange_timestamp,received_at=live_market_bars.received_at
+            WHERE LOWER(COALESCE(live_market_bars.source, '')) NOT IN ({_LIVE_STREAM_SOURCES_SQL})"""
+            if replace
+            else "DO NOTHING"
+        )
         with self.engine.begin() as connection:
             result = connection.execute(text(f"""
                 INSERT INTO live_market_bars(instrument_id,interval,bar_time,open_price,high_price,low_price,close_price,volume,open_interest,source,exchange_timestamp)

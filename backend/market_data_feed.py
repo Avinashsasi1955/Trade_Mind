@@ -36,6 +36,7 @@ _LIVE_STREAM_SOURCES = {
     "live_feed",
     "live",
 }
+LIVE_STREAM_SOURCES = frozenset(_LIVE_STREAM_SOURCES)
 
 _REST_BACKFILL_SOURCES = {
     "upstox_rest_5m",

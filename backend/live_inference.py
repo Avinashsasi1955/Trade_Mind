@@ -10,6 +10,8 @@ import os
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import math
+import time
 from statistics import mean, pstdev
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -41,7 +43,7 @@ from .strategies import (
 
 
 from .market import is_synthetic_market_data_allowed
-from .market_data_feed import validate_market_data_for_entry
+from .market_data_feed import LIVE_STREAM_SOURCES, validate_market_data_for_entry
 
 
 LIVE_BAR_SOURCES = ("zerodha_kite", "kite_gap_backfill", "upstox_v3", "upstox_rest_5m", "upstox_rest_intraday", "gap_repair_finalizer")
@@ -52,6 +54,40 @@ TRADE_BAR_SOURCES = tuple(
 OPTION_UNDERLYING_ALIASES = {"NIFTY 50": "NIFTY", "NIFTY50": "NIFTY", "NIFTY BANK": "BANKNIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
 IST = ZoneInfo("Asia/Kolkata")
 logger = logging.getLogger("nivesh.live_inference")
+
+
+def _normalize_timestamp_utc(ts: Any) -> Optional[datetime]:
+    """Normalize any timestamp (datetime, ISO string, epoch number) to a timezone-aware UTC datetime.
+    Fails closed (returns None) if missing, blank, non-numeric, or malformed."""
+    if ts is None:
+        return None
+    if isinstance(ts, datetime):
+        return ts.astimezone(timezone.utc) if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+    if isinstance(ts, (int, float)):
+        if math.isnan(ts) or math.isinf(ts) or ts <= 0:
+            return None
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(ts, str):
+        s = ts.strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt.astimezone(timezone.utc) if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+MARKET_BAR_AVAILABILITY_SQL = """
+CASE WHEN received_at IS NOT NULL AND received_at >= bar_time AND received_at <= bar_time + INTERVAL '15 minutes'
+     THEN GREATEST(COALESCE(exchange_timestamp, bar_time), received_at)
+     ELSE NULL
+END
+""".strip()
 
 BREAKOUT_KEYWORDS = ("BREAKOUT", "BREAKDOWN", "ORB", "MOMENTUM_EXPANSION")
 FADE_KEYWORDS = (
@@ -367,21 +403,36 @@ class LivePaperInference:
 
     def _watermark(self) -> Optional[datetime]:
         with self.engine.connect() as connection:
+            eligible_sources = [s for s in TRADE_BAR_SOURCES if s in LIVE_STREAM_SOURCES] or list(LIVE_STREAM_SOURCES)
             return connection.execute(
                 text("SELECT MAX(bar_time) FROM live_market_bars WHERE interval='5minute' AND source = ANY(:sources)"),
-                {"sources": list(TRADE_BAR_SOURCES)},
+                {"sources": eligible_sources},
             ).scalar_one_or_none()
 
     def _prepare(self,watermark: datetime) -> List[Dict]:
         with self.engine.connect() as connection:
-            candidates=connection.execute(text("""
+            candidates=connection.execute(text(f"""
                 SELECT DISTINCT ON (i.id) i.id instrument_id,COALESCE(i.instrument_token,k.provider_token) instrument_token,
-                    i.exchange,i.symbol,i.instrument_type,b.bar_time,live1.bar_time latest_1m_bar
+                    i.exchange,i.symbol,i.instrument_type,b.bar_time,b.source bar_source,
+                    live_mark.close_price mark_price, live_mark.source mark_source, live_mark.observed_at mark_observed_at,
+                    live1.bar_time latest_1m_bar
                 FROM live_market_bars b JOIN instrument_master i ON i.id=b.instrument_id
+                JOIN LATERAL (
+                    SELECT close_price, source, bar_time, interval,
+                        {MARKET_BAR_AVAILABILITY_SQL} observed_at
+                    FROM live_market_bars
+                    WHERE instrument_id=i.id AND interval IN ('1second','1minute','5minute')
+                      AND source = ANY(:trade_sources)
+                      AND bar_time<=:watermark+INTERVAL '5 minutes' AND bar_time>:watermark-INTERVAL '10 minutes'
+                      AND close_price IS NOT NULL AND close_price > 0
+                      AND {MARKET_BAR_AVAILABILITY_SQL} <= :watermark + INTERVAL '5 minutes'
+                    ORDER BY observed_at DESC, CASE interval WHEN '1second' THEN 0 WHEN '1minute' THEN 1 ELSE 2 END
+                    LIMIT 1
+                ) live_mark ON TRUE
                 JOIN LATERAL (
                     SELECT bar_time FROM live_market_bars
                     WHERE instrument_id=i.id AND interval='1minute' AND source = ANY(:trade_sources)
-                      AND bar_time<=:watermark+INTERVAL '5 minutes' AND bar_time>:watermark-INTERVAL '3 minutes'
+                      AND bar_time<:watermark+INTERVAL '5 minutes' AND bar_time>:watermark-INTERVAL '3 minutes'
                     ORDER BY bar_time DESC LIMIT 1
                 ) live1 ON TRUE
                 LEFT JOIN instrument_provider_keys k ON k.instrument_id=i.id AND k.provider='upstox_v3' AND k.is_active
@@ -431,11 +482,22 @@ class LivePaperInference:
                          "high":max(x["high"] for x in intraday),"low":min(x["low"] for x in intraday),
                          "close":intraday[-1]["close"],"volume":sum(x["volume"] for x in intraday),
                          "oi":intraday[-1]["oi"]}
+                exec_mark = None
+                if candidate.get("mark_price") and candidate.get("mark_source"):
+                    mark_ts_norm = _normalize_timestamp_utc(candidate.get("mark_observed_at"))
+                    cw_norm = _normalize_timestamp_utc(causal_watermark)
+                    if mark_ts_norm is not None and (cw_norm is None or mark_ts_norm <= cw_norm):
+                        exec_mark = {
+                            "price": Decimal(str(candidate["mark_price"])),
+                            "source": candidate["mark_source"],
+                            "observed_at": mark_ts_norm,
+                        }
                 prepared.append({**dict(candidate),"source_bar_time":candidate["bar_time"],"causal_watermark":causal_watermark,
                                  "daily":daily,"intraday":intraday,"intraday_1m":one_minute,
                                  "intraday_15m":_aggregate_session_bars(one_minute or intraday,15),
                                  "intraday_1h":_aggregate_session_bars(one_minute or intraday,60),
                                  "microstructure":[_bar(row) for row in seconds],
+                                 "execution_mark":exec_mark,
                                  "session":session})
         return prepared
 
@@ -462,33 +524,52 @@ class LivePaperInference:
         item.update({"probability":probability,"signal":signal,"feature_hash":digest})
         return True
 
-    def _nearest_option_target(self,item: Dict,watermark: datetime,option_type: str) -> Optional[Dict]:
+    def _nearest_option_target(self,item: Dict,causal_watermark: datetime,option_type: str) -> Optional[Dict]:
+        """Select nearest option target. causal_watermark MUST be the decision-completion
+        timestamp (e.g. 09:20:00 for the 09:15-09:20 cycle), NOT the bar bucket start."""
         with self.engine.connect() as connection:
-            row=connection.execute(text("""
+            cb = _normalize_timestamp_utc(causal_watermark)
+            if cb is None:
+                cb = _normalize_timestamp_utc(item.get("causal_watermark"))
+            if cb is None:
+                cb = _normalize_timestamp_utc((item.get("session") or {}).get("timestamp"))
+            if cb is None:
+                return None
+            row=connection.execute(text(f"""
                 SELECT i.id instrument_id,COALESCE(i.instrument_token,k.provider_token) instrument_token,
-                    i.lot_size,i.instrument_type,i.expiry,i.strike,b.close_price,b.source,b.bar_time
+                    i.lot_size,i.instrument_type,i.expiry,i.strike,b.close_price,b.source,b.bar_time,b.observed_at
                 FROM instrument_master i JOIN LATERAL(
-                    SELECT close_price, source, bar_time FROM live_market_bars WHERE instrument_id=i.id AND interval='5minute'
-                      AND bar_time<=:watermark AND bar_time>:watermark-INTERVAL '10 minutes'
-                      AND source = ANY(:trade_sources) ORDER BY bar_time DESC LIMIT 1
+                    SELECT close_price, source, bar_time, interval,
+                        {MARKET_BAR_AVAILABILITY_SQL} observed_at
+                    FROM live_market_bars WHERE instrument_id=i.id AND interval IN ('1second','1minute','5minute')
+                      AND bar_time<=:causal_boundary AND bar_time>:causal_boundary-INTERVAL '15 minutes'
+                      AND source = ANY(:trade_sources)
+                      AND close_price IS NOT NULL AND close_price > 0
+                      AND {MARKET_BAR_AVAILABILITY_SQL} <= :causal_boundary
+                    ORDER BY observed_at DESC, CASE interval WHEN '1second' THEN 0 WHEN '1minute' THEN 1 ELSE 2 END LIMIT 1
                 ) b ON TRUE
                 LEFT JOIN instrument_provider_keys k ON k.instrument_id=i.id AND k.provider='upstox_v3' AND k.is_active
                 WHERE i.underlying_symbol=:symbol AND i.exchange IN ('NFO','BFO') AND i.instrument_type=:option_type
-                  AND i.is_active AND i.expiry>=(:watermark AT TIME ZONE 'Asia/Kolkata')::date
+                  AND i.is_active AND i.expiry>=(:causal_boundary AT TIME ZONE 'Asia/Kolkata')::date
                 ORDER BY i.expiry,ABS(i.strike-:spot) LIMIT 1
-            """),{"watermark":watermark,"symbol":OPTION_UNDERLYING_ALIASES.get(str(item["symbol"]).upper(),str(item["symbol"]).upper()),"spot":item["session"]["close"],
+            """),{"causal_boundary":cb,"symbol":OPTION_UNDERLYING_ALIASES.get(str(item["symbol"]).upper(),str(item["symbol"]).upper()),"spot":item["session"]["close"],
                   "option_type":option_type,"trade_sources":list(TRADE_BAR_SOURCES)}).mappings().one_or_none()
-            wm_dt = (watermark.astimezone(IST) if getattr(watermark, "tzinfo", None) else watermark).date() if hasattr(watermark, "date") else watermark
+            wm_dt = cb.astimezone(IST).date()
             if row:
                 price=Decimal(str(row["close_price"]))
                 if self.min_option_price<=price<=self.max_option_price:
                     dte_days = max(1.0, float((row["expiry"] - wm_dt).days)) if row.get("expiry") else 4.0
                     strike_val = float(row["strike"]) if row.get("strike") else 0.0
+                    obs_at = _normalize_timestamp_utc(row.get("observed_at"))
+                    if obs_at is None and "observed_at" not in row:
+                        obs_at = _normalize_timestamp_utc(row.get("bar_time"))
+                    if obs_at is None or obs_at > cb:
+                        return None
                     return {"instrument_token":row["instrument_token"],"instrument_id":row["instrument_id"],"side":item.get("option_side","BUY"),
                             "price":price,"lot_size":int(row["lot_size"] or 100),"kind":row["instrument_type"],
                             "option_strike":strike_val,
                             "expiry":str(row["expiry"]) if row.get("expiry") else None,"dte_days":dte_days,
-                            "source": row["source"], "observed_at": row["bar_time"]}
+                            "source": row["source"], "observed_at": obs_at}
                 return None
             # Real option instrument lookup without live completed bars requirement
             opt_sym = OPTION_UNDERLYING_ALIASES.get(str(item["symbol"]).upper(), str(item["symbol"]).upper())
@@ -499,9 +580,9 @@ class LivePaperInference:
                 FROM instrument_master i
                 LEFT JOIN instrument_provider_keys k ON k.instrument_id=i.id AND k.is_active
                 WHERE i.underlying_symbol=:symbol AND i.exchange IN ('NFO','BFO') AND i.instrument_type=:option_type
-                  AND i.is_active AND i.expiry>=(:watermark AT TIME ZONE 'Asia/Kolkata')::date
+                  AND i.is_active AND i.expiry>=(:causal_boundary AT TIME ZONE 'Asia/Kolkata')::date
                 ORDER BY i.expiry, ABS(i.strike-:spot) LIMIT 1
-            """), {"watermark": watermark, "symbol": opt_sym, "spot": spot_val, "option_type": option_type}).mappings().one_or_none()
+            """), {"causal_boundary": cb, "symbol": opt_sym, "spot": spot_val, "option_type": option_type}).mappings().one_or_none()
             if opt_row and opt_row.get("instrument_token"):
                 try:
                     from backend.greeks_engine import get_live_or_analytical_greeks
@@ -860,40 +941,102 @@ class LivePaperInference:
         return {"stop_loss": stop_loss, "take_profit": take_profit, "basis": "instrument",
                 "source": "underlying_chart_levels", "rr": rr}
 
-    def _execution_target(self,item: Dict,watermark: datetime) -> Optional[Dict]:
+    def _execution_target(self,item: Dict,causal_watermark: Optional[datetime] = None) -> Optional[Dict]:
+        """Select execution target. causal_watermark MUST be the decision-completion
+        timestamp (e.g. 09:20:00 for the 09:15-09:20 cycle), NOT the bar bucket start."""
         requested_option=item.get("option_type") if item.get("option_type") in {"CE","PE"} else None
         option_direction=self._option_route_direction(requested_option,item.get("option_side"))
         is_index = item.get("instrument_type") == "INDEX" or self._underlying_key(item) in {"NIFTY", "BANKNIFTY", "SENSEX"}
 
+        cb = _normalize_timestamp_utc(causal_watermark)
+        if cb is None:
+            cb = _normalize_timestamp_utc(item.get("causal_watermark"))
+        if cb is None:
+            cb = _normalize_timestamp_utc((item.get("session") or {}).get("timestamp"))
+        if cb is None:
+            cb = datetime.now(timezone.utc)
+
         # 1. Index instruments execute via Index Options
         if is_index:
             if self.option_paper_enabled and item.get("option_type") in {"CE","PE"}:
-                return self._nearest_option_target(item,watermark,item["option_type"])
+                return self._nearest_option_target(item,cb,item["option_type"])
             return None
 
         # 2. Equity stocks: route to Options or Intraday Cash Equity
         prefer_cash = item.get("prefer_cash") or item.get("trade_mode") == "INTRADAY"
         if self.option_paper_enabled and item.get("option_type") in {"CE","PE"} and not prefer_cash:
-            option_target=self._nearest_option_target(item,watermark,item["option_type"])
+            option_target=self._nearest_option_target(item,cb,item["option_type"])
             if option_target:
                 return option_target
             if item.get("instrument_type")!="EQ":
                 return None
 
-        # Allow liquid large-cap cash equities >= ₹100 (covers TATASTEEL, BEL, ITC)
-        if item.get("instrument_type") == "EQ" and Decimal(str(item["session"]["close"])) < Decimal("100"):
-            return None
         direction=option_direction if option_direction is not None else item["signal"]
-        eq_source = item.get("source") or (item.get("session") or {}).get("source")
-        eq_observed_at = (item.get("session") or {}).get("timestamp")
+        exec_mark = item.get("execution_mark")
+        # Validate cached execution_mark against causal boundary (fails closed on missing, malformed, or future timestamps)
+        if exec_mark:
+            mark_ts_aware = _normalize_timestamp_utc(exec_mark.get("observed_at"))
+            if mark_ts_aware is None or mark_ts_aware > cb:
+                exec_mark = None
+            else:
+                exec_mark = dict(exec_mark, observed_at=mark_ts_aware)
+        if not exec_mark and item.get("latest_1m_price") and item.get("latest_1m_source"):
+            l1m_ts_aware = _normalize_timestamp_utc(item.get("latest_1m_observed_at"))
+            if l1m_ts_aware is not None and l1m_ts_aware <= cb:
+                exec_mark = {
+                    "price": Decimal(str(item["latest_1m_price"])),
+                    "source": item["latest_1m_source"],
+                    "observed_at": l1m_ts_aware,
+                }
+        if not exec_mark and getattr(self, "engine", None):
+            try:
+                with self.engine.connect() as conn:
+                    row = conn.execute(text(f"""
+                        SELECT close_price, source, bar_time, interval,
+                            {MARKET_BAR_AVAILABILITY_SQL} observed_at
+                        FROM live_market_bars
+                        WHERE instrument_id=:instrument_id AND interval IN ('1second','1minute','5minute')
+                          AND source = ANY(:trade_sources)
+                          AND bar_time<=:causal_boundary AND bar_time>:causal_boundary-INTERVAL '15 minutes'
+                          AND close_price IS NOT NULL AND close_price > 0
+                          AND {MARKET_BAR_AVAILABILITY_SQL} <= :causal_boundary
+                        ORDER BY observed_at DESC, CASE interval WHEN '1second' THEN 0 WHEN '1minute' THEN 1 ELSE 2 END
+                        LIMIT 1
+                    """), {"instrument_id": item["instrument_id"], "causal_boundary": cb, "trade_sources": list(TRADE_BAR_SOURCES)}).mappings().one_or_none()
+                    if row:
+                        obs_at = _normalize_timestamp_utc(row.get("observed_at"))
+                        if obs_at is None and "observed_at" not in row:
+                            obs_at = _normalize_timestamp_utc(row.get("bar_time"))
+                        if obs_at is not None and obs_at <= cb:
+                            exec_mark = {
+                                "price": Decimal(str(row["close_price"])),
+                                "source": row["source"],
+                                "observed_at": obs_at,
+                            }
+            except Exception:
+                exec_mark = None
+
+        if not exec_mark or not exec_mark.get("price") or not exec_mark.get("source") or not exec_mark.get("observed_at"):
+            return None
+
+        price = Decimal(str(exec_mark["price"]))
+        if price <= 0:
+            return None
+
+        # Allow liquid large-cap cash equities >= ₹100 (covers TATASTEEL, BEL, ITC)
+        if item.get("instrument_type") == "EQ" and price < Decimal("100"):
+            return None
+
+        source = exec_mark["source"]
+        observed_at = exec_mark["observed_at"]
         if direction>0:
             return {"instrument_token":item["instrument_token"],"instrument_id":item["instrument_id"],"side":"BUY",
-                    "price":Decimal(str(item["session"]["close"])),"lot_size":1,"kind":"EQ","fallback_from_option":requested_option,
-                    "source": eq_source, "observed_at": eq_observed_at}
+                    "price":price,"lot_size":1,"kind":"EQ","fallback_from_option":requested_option,
+                    "source": source, "observed_at": observed_at}
         if direction<0 and self.intraday_short_fallback:
             return {"instrument_token":item["instrument_token"],"instrument_id":item["instrument_id"],"side":"SELL",
-                    "price":Decimal(str(item["session"]["close"])),"lot_size":1,"kind":"EQ_INTRADAY_SHORT","fallback_from_option":requested_option,
-                    "source": eq_source, "observed_at": eq_observed_at}
+                    "price":price,"lot_size":1,"kind":"EQ_INTRADAY_SHORT","fallback_from_option":requested_option,
+                    "source": source, "observed_at": observed_at}
         return None
 
     def _close_due(self,watermark: datetime) -> int:
@@ -3122,7 +3265,8 @@ class LivePaperInference:
                          "high":max(x["high"] for x in intraday),"low":min(x["low"] for x in intraday),
                          "close":intraday[-1]["close"],"volume":sum(x["volume"] for x in intraday),
                          "oi":intraday[-1]["oi"]}
-                item={**dict(index),"intraday":intraday,"intraday_1m":one_minute,
+                item={**dict(index),"source_bar_time":watermark,"causal_watermark":session["timestamp"],
+                      "intraday":intraday,"intraday_1m":one_minute,
                       "intraday_15m":_aggregate_session_bars(one_minute or intraday,15),
                       "intraday_1h":_aggregate_session_bars(one_minute or intraday,60),
                       "session":session,"signal":signal,
@@ -3320,16 +3464,25 @@ class LivePaperInference:
         return selected
 
     def run(self,watermark: Optional[datetime] = None) -> Dict:
+        t_infer_start = time.perf_counter()
         source_watermark=watermark or self._watermark()
-        if not source_watermark: return {"status":"skipped","reason":"no completed five-minute Kite bars","orders_allowed":False}
-        model=self._model(); prepared=self._prepare(source_watermark)
-        if not prepared: return {"status":"skipped","reason":"no instruments have both live bars and 50 prior daily bars","orders_allowed":False}
+        if not source_watermark:
+            return {"status":"skipped","reason":"no completed five-minute Kite bars","orders_allowed":False,
+                    "timings":{"total_inference_duration_ms":round((time.perf_counter()-t_infer_start)*1000, 2)}}
+        model=self._model()
+        t_prep_start = time.perf_counter()
+        prepared=self._prepare(source_watermark)
+        prep_duration_ms = round((time.perf_counter()-t_prep_start)*1000, 2)
+        if not prepared:
+            return {"status":"skipped","reason":"no instruments have both live bars and 50 prior daily bars","orders_allowed":False,
+                    "timings":{"prepare_duration_ms":prep_duration_ms,"total_inference_duration_ms":round((time.perf_counter()-t_infer_start)*1000, 2)}}
         causal_watermark=max(item["causal_watermark"] for item in prepared)
         provisional_intraday=model["feature_set"].startswith("daily_") and causal_watermark.astimezone(ZoneInfo("Asia/Kolkata")).time()<datetime.strptime("15:30","%H:%M").time()
         allow_shadow_intraday=os.getenv("NIVESH_SHADOW_PAPER_INTRADAY_ENABLED","1")=="1"
         if provisional_intraday and os.getenv("NIVESH_ALLOW_PROVISIONAL_INTRADAY_MODEL","0")!="1" and not allow_shadow_intraday:
             return {"status":"skipped","reason":"active model is daily; intraday train/serve mismatch is forbidden",
-                    "next_eligible_after":"15:30 Asia/Kolkata","orders_allowed":False}
+                    "next_eligible_after":"15:30 Asia/Kolkata","orders_allowed":False,
+                    "timings":{"prepare_duration_ms":prep_duration_ms,"total_inference_duration_ms":round((time.perf_counter()-t_infer_start)*1000, 2)}}
         context=_context(prepared); created=[]; failures=[]; predictions_inserted=0
         threshold=float(os.getenv("NIVESH_ML_DECISION_THRESHOLD", model["payload"].get("decision_threshold",.70))); lower=1-threshold
 
@@ -3373,6 +3526,7 @@ class LivePaperInference:
         except Exception:
             quant_opportunities = {}
 
+        t_scoring_start = time.perf_counter()
         for item in prepared:
             try:
                 features=build_causal_feature_vector(item["exchange"],item["symbol"],item["daily"],item["session"],context,model["feature_set"])
@@ -3438,6 +3592,9 @@ class LivePaperInference:
                 created.append(item)
             except Exception as exc:
                 failures.append({"exchange":item["exchange"],"symbol":item["symbol"],"error":type(exc).__name__})
+        scoring_duration_ms = round((time.perf_counter() - t_scoring_start) * 1000, 2)
+        t_shadow_persist_accum = 0.0
+        validation_stats = {"passed": 0, "rejected": 0, "rejection_reasons": []}
         reconciled=reconcile_shadow_costs(self.engine)
         risk_adjustments=self._manage_open_trade_risk(causal_watermark) if self.active_trade_manager_enabled else {"status":"delegated_to_position_manager"}
         closed=self._close_due(causal_watermark) if self.inference_close_due_enabled else 0
@@ -3662,10 +3819,15 @@ class LivePaperInference:
                 allow_synthetic=is_synthetic_market_data_allowed(),
             )
             if not is_valid_entry_quote:
+                validation_stats["rejected"] += 1
+                if entry_quote_err and entry_quote_err not in validation_stats["rejection_reasons"]:
+                    validation_stats["rejection_reasons"].append(str(entry_quote_err)[:120])
                 logger.warning("Rejected trade entry for %s due to unreliable market data: %s", item.get("symbol"), entry_quote_err)
                 rejected += 1
                 continue
+            validation_stats["passed"] += 1
 
+            t_persist_start = time.perf_counter()
             result=record_shadow_signal(self.engine,self.redis,model["version"],int(target["instrument_token"]),target["side"],quantity,
                                         item["probability"],target["price"],item["session"]["timestamp"],
                                         strategy_note=json.dumps({"strategy":strategy_name,
@@ -3701,6 +3863,7 @@ class LivePaperInference:
                                                                   "probe_trade":bool(item.get("probe_trade")),
                                                                   "learning_only":bool(item.get("probe_trade")),
                                                                   "paper_only":True},default=str))
+            t_shadow_persist_accum += (time.perf_counter() - t_persist_start)
             audits+=int(result["recorded"])
             if result.get("recorded"):
                 try:
@@ -3798,7 +3961,7 @@ class LivePaperInference:
                 if thresholds.get("suppress_fades") and is_fade_strategy(item_strat):
                     rejected += 1
                     continue
-                target=self._execution_target(item,source_watermark)
+                target=self._execution_target(item,item.get("causal_watermark") or (item.get("session") or {}).get("timestamp") or source_watermark)
                 if not target:
                     rejected+=1
                     continue
@@ -3856,9 +4019,14 @@ class LivePaperInference:
                     allow_synthetic=is_synthetic_market_data_allowed(),
                 )
                 if not is_valid_entry_quote:
+                    validation_stats["rejected"] += 1
+                    if entry_quote_err and entry_quote_err not in validation_stats["rejection_reasons"]:
+                        validation_stats["rejection_reasons"].append(str(entry_quote_err)[:120])
                     logger.warning("Rejected option entry for %s due to unreliable option market data: %s", item.get("symbol"), entry_quote_err)
                     rejected += 1
                     continue
+                validation_stats["passed"] += 1
+                t_persist_start = time.perf_counter()
                 result=record_shadow_signal(self.engine,self.redis,model["version"],int(target["instrument_token"]),target["side"],quantity,
                                             item["probability"],target["price"],item["session"]["timestamp"],
                                             strategy_note=json.dumps({"strategy":item.get("chart_gate",{}).get("strategy"),
@@ -3887,6 +4055,7 @@ class LivePaperInference:
                                                                       "effective_thresholds":thresholds,
                                                                       "derivative_ticket":item.get("derivative_ticket"),
                                                                       "paper_only":True},default=str))
+                t_shadow_persist_accum += (time.perf_counter() - t_persist_start)
                 audits+=int(result["recorded"])
                 if result.get("recorded"):
                     # Record paired hedge leg if derivative ticket is multi-leg (e.g. Bull Call Spread, Bear Put Spread, Protective Collar)
@@ -3973,20 +4142,34 @@ class LivePaperInference:
                                         ).mappings().one_or_none()
 
                                     if other_inst and other_inst.get("instrument_token"):
-                                        mark_row = conn.execute(text("""
-                                            SELECT close_price, source, bar_time FROM live_market_bars
-                                            WHERE instrument_id = :id AND interval IN ('1minute', '5minute')
-                                              AND source = ANY(:src) AND bar_time <= :wm
-                                              AND bar_time > :wm - INTERVAL '15 minutes'
-                                            ORDER BY bar_time DESC LIMIT 1
-                                        """), {"id": other_inst["id"], "src": list(TRADE_BAR_SOURCES), "wm": source_watermark}).mappings().one_or_none()
+                                        hb_norm = _normalize_timestamp_utc(source_watermark)
+                                        hedge_boundary = (hb_norm + timedelta(minutes=5)) if hb_norm is not None else None
+                                        if hedge_boundary is None:
+                                            continue
+                                        mark_row = conn.execute(text(f"""
+                                            SELECT close_price, source, bar_time, interval,
+                                                {MARKET_BAR_AVAILABILITY_SQL} observed_at
+                                            FROM live_market_bars
+                                            WHERE instrument_id = :id AND interval IN ('1second', '1minute', '5minute')
+                                              AND source = ANY(:src) AND bar_time <= :causal_boundary
+                                              AND bar_time > :causal_boundary - INTERVAL '15 minutes'
+                                              AND close_price IS NOT NULL AND close_price > 0
+                                              AND {MARKET_BAR_AVAILABILITY_SQL} <= :causal_boundary
+                                            ORDER BY observed_at DESC, CASE interval WHEN '1second' THEN 0 WHEN '1minute' THEN 1 ELSE 2 END LIMIT 1
+                                        """), {"id": other_inst["id"], "src": list(TRADE_BAR_SOURCES), "causal_boundary": hedge_boundary}).mappings().one_or_none()
                                         if not mark_row or mark_row["close_price"] is None or float(mark_row["close_price"]) <= 0:
                                             logger.info("No live mark for hedge leg %s %s strike=%s; skipping", sym_clean, other_otype, other_leg.get("strike"))
                                             continue
                                         other_price = Decimal(str(mark_row["close_price"]))
+                                        other_obs = _normalize_timestamp_utc(mark_row.get("observed_at"))
+                                        if other_obs is None and "observed_at" not in mark_row:
+                                            other_obs = _normalize_timestamp_utc(mark_row.get("bar_time"))
+                                        if other_obs is None or other_obs > hedge_boundary:
+                                            logger.info("No valid point-in-time mark for hedge leg %s %s; skipping", sym_clean, other_otype)
+                                            continue
                                         is_valid_hedge_quote, hedge_quote_err = validate_market_data_for_entry(
                                             price=other_price,
-                                            observed_at=mark_row.get("bar_time"),
+                                            observed_at=other_obs,
                                             source=mark_row.get("source"),
                                             max_age_seconds=float(os.getenv("NIVESH_PRICE_MAX_AGE_SECONDS", "30.0")),
                                             allow_synthetic=is_synthetic_market_data_allowed(),
@@ -4069,6 +4252,17 @@ class LivePaperInference:
             market_intelligence={"status":"error","error":type(exc).__name__,"paper_only":True}
         if audits: reconciled=reconcile_shadow_costs(self.engine)
         return {"status":"success","model_version":model["version"],"watermark":causal_watermark.isoformat(),"candidates":len(prepared),
+                "timings":{
+                    "prepare_duration_ms":prep_duration_ms,
+                    "scoring_duration_ms":scoring_duration_ms,
+                    "shadow_persist_duration_ms":round(t_shadow_persist_accum * 1000, 2),
+                    "total_inference_duration_ms":round((time.perf_counter() - t_infer_start) * 1000, 2),
+                },
+                "execution_validation":{
+                    "passed":validation_stats["passed"],
+                    "rejected":validation_stats["rejected"],
+                    "rejection_reasons":validation_stats["rejection_reasons"][:5],
+                },
                 "predictions_created":predictions_inserted,"candidates_evaluated":len(created),"signals":len(ranked),"policy_enabled":policy_enabled,
                 "no_trade_rejections":sum(not x["policy_candidate"].accepted for x in created) if policy_enabled else 0,
                 "regimes":{name:sum(x["policy_candidate"].regime==name for x in created) for name in {x["policy_candidate"].regime for x in created}},

@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List
 from zoneinfo import ZoneInfo
@@ -332,11 +333,24 @@ def end_of_day_shadow_report() -> Dict:
                  autoretry_for=(OSError,RuntimeError),retry_backoff=True,retry_backoff_max=120,retry_jitter=True)
 def run_live_paper_inference(self) -> Dict:
     global _live_inference
+    task_start_mono = time.perf_counter()
+    task_started_at = datetime.now(timezone.utc).isoformat()
     now=datetime.now(IST)
     if now.weekday()>=5 or not (now.replace(hour=9,minute=15,second=0,microsecond=0)<=now<=now.replace(hour=15,minute=40,second=0,microsecond=0)):
         return {"status":"skipped","reason":"outside configured NSE continuous-market window","orders_allowed":False}
     lock=_acquire_lock("live-paper-inference",240)
-    if not lock: return {"status":"skipped","reason":"another inference worker holds the distributed lock","orders_allowed":False}
+    if not lock:
+        logger.info("live paper inference lock skipped", extra={"context": {
+            "event": "lock_skipped",
+            "lock": "live-paper-inference",
+            "task_started_at": task_started_at,
+        }})
+        return {"status":"skipped","reason":"another inference worker holds the distributed lock","orders_allowed":False}
+    logger.info("live paper inference task started", extra={"context": {
+        "event": "task_started",
+        "lock": "live-paper-inference",
+        "task_started_at": task_started_at,
+    }})
     try:
         if _live_inference is None:
             from backend.live_inference import LivePaperInference
@@ -348,6 +362,19 @@ def run_live_paper_inference(self) -> Dict:
             infer_result["brain_pipeline"] = {k: "ok" for k in (brain_result or {}).keys()}
         except Exception as b_err:
             pass
+        task_end_mono = time.perf_counter()
+        task_duration_ms = round((task_end_mono - task_start_mono) * 1000, 2)
+        task_completed_at = datetime.now(timezone.utc).isoformat()
+        logger.info("live paper inference task completed", extra={"context": {
+            "event": "task_completed",
+            "task_started_at": task_started_at,
+            "task_completed_at": task_completed_at,
+            "total_task_duration_ms": task_duration_ms,
+            "status": infer_result.get("status"),
+            "watermark": infer_result.get("watermark"),
+            "timings": infer_result.get("timings", {}),
+            "execution_validation": infer_result.get("execution_validation", {}),
+        }})
         return infer_result
     finally:
         _release_lock("live-paper-inference",lock)

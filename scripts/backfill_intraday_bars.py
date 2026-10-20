@@ -153,7 +153,7 @@ def save_bars_to_postgres(engine: Any, instrument_id: int, bars: List[Dict[str, 
         ) VALUES (
             :instrument_id, CAST('1minute' AS bar_interval), CAST(:bar_time AS timestamptz),
             :open, :high, :low, :close,
-            :volume, :oi, 'upstox_v3', CAST(:bar_time AS timestamptz)
+            :volume, :oi, 'upstox_rest_intraday', CAST(:bar_time AS timestamptz)
         )
         ON CONFLICT (instrument_id, interval, bar_time) DO NOTHING
     """)

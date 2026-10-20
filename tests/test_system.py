@@ -359,12 +359,12 @@ class NiveshSystemTests(unittest.TestCase):
         self.assertGreaterEqual(len(daily["candles"]), 1)
 
     def test_backtest_uses_chronological_holdout_and_costs(self):
-        report = run_backtest("RELIANCE", "ensemble", 1_000_000)
+        report = run_backtest("RELIANCE", "ensemble", 1_000_000, allow_simulated=True)
         self.assertTrue(report["methodology"]["look_ahead_protection"])
         self.assertEqual(report["methodology"]["costs_bps_per_trade"], 12)
         self.assertGreaterEqual(report["period"]["sessions"], 240)
         self.assertIn("directional_accuracy", report["out_of_sample"])
-        self.assertIn(report["data_mode"], {"simulated", "historical"})
+        self.assertIn(report["data_mode"], {"simulated", "historical", "synthetic_fixture"})
 
     def test_derivative_engine_builds_guarded_multileg_ticket(self):
         plan = build_derivative_plan("RELIANCE", 3000, "bullish", "normal")
