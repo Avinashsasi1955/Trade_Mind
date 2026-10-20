@@ -31,6 +31,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -129,8 +130,9 @@ class TestMarketDataFeedAbstraction:
         class IncompleteFeed(MarketDataFeed):
             pass
 
+        feed_cls: type[Any] = IncompleteFeed
         with pytest.raises(TypeError):
-            IncompleteFeed()
+            feed_cls()
 
     def test_upstox_feed_adapter_lifecycle_and_health(self):
         adapter = UpstoxMarketDataFeed(access_token="mock_token")

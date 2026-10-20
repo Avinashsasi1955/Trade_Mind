@@ -201,7 +201,17 @@ class UpstoxRestBackfill:
                     i.exchange,i.symbol
                 {hard_limit}
             """), {"limit": limit, "include_indices": include_indices, "fno_only": fno_only, "priority": list(PRIORITY_SYMBOLS)}).mappings().all()
-        return [BackfillInstrument(**dict(row)) for row in rows]
+        return [
+            BackfillInstrument(
+                instrument_id=int(row["instrument_id"]),
+                provider_key=str(row["provider_key"]),
+                exchange=str(row["exchange"]),
+                symbol=str(row["symbol"]),
+                instrument_type=str(row["instrument_type"]),
+                is_fno_eligible=bool(row["is_fno_eligible"]),
+            )
+            for row in rows
+        ]
 
     def _get(self, path: str) -> Dict:
         response = requests.get(f"{UPSTOX_API_BASE}{path}", headers=_headers(self.token), timeout=30)
